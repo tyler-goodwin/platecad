@@ -1,0 +1,9 @@
+[package]
+name = "cad-kernel-occ"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-ir.workspace = true
+cad-kernel.workspace = true
