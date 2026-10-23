@@ -1,0 +1,11 @@
+[package]
+name = "cad-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-ir.workspace = true
+rustyscript = { version = "0.12", default-features = false, features = ["web_stub", "console", "url"] }
+thiserror.workspace = true
+serde_json.workspace = true

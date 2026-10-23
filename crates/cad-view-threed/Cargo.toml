@@ -1,0 +1,10 @@
+[package]
+name = "cad-view-threed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-ir.workspace = true
+cad-view.workspace = true
+three-d = { version = "0.19", features = ["egui-gui"] }
