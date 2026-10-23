@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cad-export.workspace = true
 cad-ir.workspace = true
 cad-kernel.workspace = true
 cad-kernel-occ.workspace = true
@@ -16,4 +17,5 @@ clap = { version = "4", features = ["derive", "env"] }
 notify = "8"
 
 [dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"

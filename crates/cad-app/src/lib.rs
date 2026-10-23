@@ -32,6 +32,24 @@ pub struct Args {
     /// Geometry kernel.
     #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Truck)]
     pub kernel: KernelChoice,
+
+    /// Write a 3MF file for slicers instead of opening the viewer.
+    #[arg(long, value_name = "FILE.3mf")]
+    pub export: Option<PathBuf>,
+
+    /// Which view to export.
+    #[arg(long, value_enum, default_value_t = ExportView::Auto, requires = "export")]
+    pub view: ExportView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportView {
+    /// The print layout if the model has one, else the assembled view.
+    Auto,
+    /// The print layout (error if the model has none).
+    Print,
+    /// The model as assembled.
+    Assembled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -172,6 +190,47 @@ impl Pipeline {
             started.elapsed().as_millis()
         );
         SceneUpdate::ok(SceneViews { assembled, print }, message)
+    }
+}
+
+/// Evaluates `model` and writes the chosen view to `out` as 3MF. Returns a
+/// one-line summary. Nothing is left at `out` on failure.
+pub fn export_3mf(
+    pipeline: &mut Pipeline,
+    model: &Path,
+    view: ExportView,
+    out: &Path,
+) -> Result<String, String> {
+    let update = pipeline.evaluate(model);
+    let Some(views) = update.views else {
+        let messages: Vec<&str> = update.diagnostics.iter().map(|d| d.message.as_str()).collect();
+        return Err(messages.join("\n"));
+    };
+    let (label, scene) = match (view, views.print) {
+        (ExportView::Assembled, _) | (ExportView::Auto, None) => ("assembled", views.assembled),
+        (ExportView::Print | ExportView::Auto, Some(print)) => ("print", print),
+        (ExportView::Print, None) => {
+            return Err(format!(
+                "{} has no print view (export {{ assembled, print }} from it, or use --view assembled)",
+                model.display()
+            ));
+        }
+    };
+
+    let write = || -> Result<usize, String> {
+        let file = std::fs::File::create(out)
+            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+        cad_export::write_3mf(&scene, std::io::BufWriter::new(file)).map_err(|e| e.to_string())
+    };
+    match write() {
+        Ok(objects) => Ok(format!(
+            "wrote {} ({label} view, {objects} objects)",
+            out.display()
+        )),
+        Err(e) => {
+            let _ = std::fs::remove_file(out);
+            Err(e)
+        }
     }
 }
 
@@ -450,6 +509,86 @@ mod tests {
         for needle in ["[MODEL]", "--kernel", "CAD_KERNEL", "truck", "occ"] {
             assert!(help.contains(needle), "help is missing {needle}:\n{help}");
         }
+    }
+
+    #[test]
+    fn cli_export_flags() {
+        let args = parse(&["models/bookshelf.ts", "--export", "out.3mf"]).unwrap();
+        assert_eq!(args.export, Some(PathBuf::from("out.3mf")));
+        assert_eq!(args.view, ExportView::Auto);
+
+        let args = parse(&["--export", "out.3mf", "--view", "assembled"]).unwrap();
+        assert_eq!(args.view, ExportView::Assembled);
+
+        // --view only means something for export.
+        let err = parse(&["--view", "print"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// Object names in an exported 3MF, in order.
+    fn exported_objects(path: &Path) -> Vec<String> {
+        use std::io::Read;
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut model = String::new();
+        archive
+            .by_name("3D/3dmodel.model")
+            .unwrap()
+            .read_to_string(&mut model)
+            .unwrap();
+        model
+            .split("<object ")
+            .skip(1)
+            .map(|o| {
+                let name = o.split("name=\"").nth(1).unwrap();
+                name[..name.find('"').unwrap()].to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exports_bookshelf_print_view_by_default() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("shelf.3mf");
+        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
+        let model = repo_root().join("models/bookshelf.ts");
+
+        let summary = export_3mf(&mut pipeline, &model, ExportView::Auto, &out).unwrap();
+        assert!(summary.contains("print view"), "{summary}");
+
+        let names = exported_objects(&out);
+        assert_eq!(names.first().map(String::as_str), Some("left side"));
+        assert_eq!(names.last().map(String::as_str), Some("back panel"));
+        assert!(names.iter().all(|n| n != cad_export::UNNAMED), "{names:?}");
+        assert!(summary.contains(&format!("{} objects", names.len())), "{summary}");
+    }
+
+    #[test]
+    fn export_view_selection() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
+        let cube = repo_root().join("models/cube.ts");
+
+        // A bare-shape model exports its assembled view under auto...
+        let out = out_dir.path().join("cube.3mf");
+        let summary = export_3mf(&mut pipeline, &cube, ExportView::Auto, &out).unwrap();
+        assert!(summary.contains("assembled view, 1 objects"), "{summary}");
+        assert_eq!(exported_objects(&out), [cad_export::UNNAMED]);
+
+        // ...but asking for print is an error, and nothing is written.
+        let missing = out_dir.path().join("cube-print.3mf");
+        let err = export_3mf(&mut pipeline, &cube, ExportView::Print, &missing).unwrap_err();
+        assert!(err.contains("no print view"), "{err}");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn export_reports_model_errors_without_writing() {
+        let project = Project::new(&cube_source(0));
+        let out = project.root().join("broken.3mf");
+        let err = export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, &out)
+            .unwrap_err();
+        assert!(err.contains("must be positive"), "{err}");
+        assert!(!out.exists());
     }
 
     #[test]

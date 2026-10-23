@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cad-app",
+    "crates/cad-export",
     "crates/cad-ir",
     "crates/cad-kernel",
     "crates/cad-kernel-occ",
@@ -17,6 +18,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+cad-export = { path = "crates/cad-export" }
 cad-ir = { path = "crates/cad-ir" }
 cad-kernel = { path = "crates/cad-kernel" }
 cad-kernel-occ = { path = "crates/cad-kernel-occ" }

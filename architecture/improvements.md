@@ -27,8 +27,15 @@ the improvement.
   the bed width, pack in 2D, and spread across plates.
 - **Auto-orient.** Lay a part on its largest planar face automatically
   instead of hand-building print orientations.
-- **Filament mapping.** Merge colors into N filament slots, and put
-  extruder hints in 3MF metadata for Bambu/Orca/Prusa.
+- **Filament mapping.** 3MF export writes core-spec colors only. Merge
+  colors into N filament slots, and add slicer-specific extruder metadata
+  (Bambu/Orca `model_settings.config`, Prusa `Slic3r_PE_model.config`) so
+  parts arrive pre-assigned.
+- **Open surfaces in export.** A 2D `rect` exports as a single-face object,
+  which isn't watertight and slicers will reject. Warn or skip non-closed
+  parts on export.
+- **Export from the viewer.** Export is CLI-only. Add an Export 3MF button
+  to the overlay.
 - **Units in the UI.** Show model dimensions in mm in the overlay, which
   catches cm/inch mistakes early.
 

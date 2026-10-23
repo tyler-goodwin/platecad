@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use cad_app::{Args, Pipeline, project_root, report, resolve_model, watch_and_reload};
+use cad_app::{Args, Pipeline, export_3mf, project_root, report, resolve_model, watch_and_reload};
 use cad_view::{SceneUpdate, ViewportApp};
 use cad_view_threed::ThreeDViewport;
 use clap::Parser;
@@ -26,6 +26,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(out) = &args.export {
+        return match export_3mf(&mut pipeline, &model, args.view, out) {
+            Ok(summary) => {
+                println!("{summary}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let initial = pipeline.evaluate(&model);
     report(&initial);
 

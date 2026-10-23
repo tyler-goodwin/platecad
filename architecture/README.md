@@ -19,6 +19,7 @@ flowchart LR
   kernel -.-> occ["cad-kernel-occ (stub)"]
   truck -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
   update --> view["cad-view-threed (three-d + egui)"]
+  truck -->|"--export"| export["cad-export (3MF)"]
   watch["notify watcher"] -->|"debounced reload"| pipeline
 ```
 
@@ -46,6 +47,7 @@ kernel and renderer can each be swapped without touching the others.
 | `cad-script` | `trait ScriptHost` plus the rustyscript implementation and its sandboxed import loader. |
 | `cad-view` | `SceneUpdate`, `SceneViews`, `ViewMode`/`ViewSelection` (pure view logic) and `trait ViewportApp`. |
 | `cad-view-threed` | three-d window: orbit camera, lighting, edge cylinders, egui overlay. |
+| `cad-export` | `TessellatedScene` to 3MF: one watertight object per part, with base-material colors. |
 | `cad-app` | Binary plus library: CLI, project root discovery, `Pipeline`, watcher. The library half is what the tests drive. |
 
 `dsl/cad.ts` and `models/` are TypeScript, not crates.
@@ -108,8 +110,12 @@ out is a hybrid: keep emitting specs, and add query ops later.
 ## App, CLI and hot reload
 
 ```
-cad-app [MODEL] [--kernel truck|occ]   # MODEL defaults to models/cube.ts; CAD_KERNEL env works too
+cad-app [MODEL] [--kernel truck|occ]                         # open the viewer (CAD_KERNEL env works too)
+cad-app [MODEL] --export out.3mf [--view auto|print|assembled]  # write a 3MF and exit, no window
 ```
+
+MODEL defaults to `models/cube.ts`. `--view auto` exports the print layout
+when the model has one, and the assembled view otherwise.
 
 - The model path is resolved against the cwd and must exist, or the app exits
   with code 2 before opening a window.
@@ -145,6 +151,27 @@ cad-app [MODEL] [--kernel truck|occ]   # MODEL defaults to models/cube.ts; CAD_K
 - The camera frames the shown view when it first appears and when you switch
   views. Reloads keep your camera.
 
+## 3MF export
+
+`cad-export` turns one view's `TessellatedScene` into a 3MF package: a zip
+holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
+
+- **Objects.** There's one object per part name, in first-seen order; a part
+  split into several runs becomes one object. Triangles outside any part go
+  into a trailing `unnamed` object. Every object is a build item, with no
+  transforms, since geometry is already placed. Units are millimeters.
+- **Watertight meshes.** The viewer mesh duplicates corner vertices per face
+  normal. Export welds vertices by position (1e-5 mm), so a box is 8
+  vertices and 12 triangles with manifold edges. Tests check that every edge
+  is shared by exactly two triangles in opposite directions, and that signed
+  volume is positive (outward normals).
+- **Colors.** Distinct colors become one core-spec `basematerials` group with
+  `displaycolor`. Each object points at its first triangle's color, and
+  triangles with a different color carry `p1`. How a slicer maps these to
+  filaments varies.
+- `export_3mf` in `cad-app` evaluates, picks the view, writes the file, and
+  deletes a partial file on failure.
+
 ## Testing
 
 Run `cargo test --workspace`. Verification goes through tests, not by
@@ -165,9 +192,7 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **3MF export.** One object per part with colors, from either view
-   (`--export out.3mf`).
-2. **Booleans.** Union, difference and intersection via truck-shapeops, so
+1. **Booleans.** Union, difference and intersection via truck-shapeops, so
    colored parts can be real non-overlapping bodies and holes become
    possible.
 

@@ -1,0 +1,15 @@
+[package]
+name = "cad-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-ir.workspace = true
+thiserror.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+roxmltree = "0.20"
+cad-kernel.workspace = true
+cad-kernel-truck.workspace = true
