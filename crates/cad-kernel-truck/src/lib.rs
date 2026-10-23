@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use cad_ir::{DEFAULT_COLOR, ModelSpec, Rgb, TessellatedScene};
+use cad_ir::{DEFAULT_COLOR, ModelSpec, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
 use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Vector3, builder};
@@ -17,19 +17,51 @@ impl Kernel for TruckKernel {
 
     fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError> {
         let mut scene = TessellatedScene::default();
-        for (shell, color) in build_shells(spec, DEFAULT_COLOR)? {
-            tessellate_into(&mut scene, &shell, color);
+        for body in build_bodies(spec, &Style::default())? {
+            tessellate_into(&mut scene, &body);
         }
         Ok(scene)
     }
 }
 
-/// Boundaries of the B-rep: a single-face shell per 2D spec, the closed skin per
-/// solid. Each comes with the color of the innermost `Color` node above it
-/// (`color` is the one inherited from the parents).
-fn build_shells(spec: &ModelSpec, color: Rgb) -> Result<Vec<(Shell, Rgb)>, KernelError> {
+/// Presentation inherited down the spec tree. The innermost `Color`/`Part` wins.
+#[derive(Debug, Clone, PartialEq)]
+struct Style {
+    color: Rgb,
+    part: Option<String>,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            color: DEFAULT_COLOR,
+            part: None,
+        }
+    }
+}
+
+/// One B-rep boundary with its style: a single-face shell for 2D specs, the
+/// closed skin for solids.
+struct Body {
+    shell: Shell,
+    style: Style,
+}
+
+impl Body {
+    fn map(self, f: impl FnOnce(&Shell) -> Shell) -> Self {
+        Self {
+            shell: f(&self.shell),
+            style: self.style,
+        }
+    }
+}
+
+fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelError> {
     match spec {
-        ModelSpec::Rect { .. } => Ok(vec![(Shell::from(vec![build_face(spec)?]), color)]),
+        ModelSpec::Rect { .. } => Ok(vec![Body {
+            shell: Shell::from(vec![build_face(spec)?]),
+            style: style.clone(),
+        }]),
         ModelSpec::Extrude { profile, distance } => {
             if !(*distance > 0.0) {
                 return Err(KernelError::Invalid(
@@ -43,11 +75,14 @@ fn build_shells(spec: &ModelSpec, color: Rgb) -> Result<Vec<(Shell, Rgb)>, Kerne
                 .into_iter()
                 .next()
                 .ok_or_else(|| KernelError::Message("extrude produced an empty solid".into()))?;
-            Ok(vec![(shell, profile_color(profile).unwrap_or(color))])
+            Ok(vec![Body {
+                shell,
+                style: profile_style(profile, style.clone()),
+            }])
         }
-        ModelSpec::Translate { offset, shape } => Ok(build_shells(shape, color)?
+        ModelSpec::Translate { offset, shape } => Ok(build_bodies(shape, style)?
             .into_iter()
-            .map(|(shell, color)| (builder::translated(&shell, to_vector(*offset)), color))
+            .map(|body| body.map(|shell| builder::translated(shell, to_vector(*offset))))
             .collect()),
         ModelSpec::Rotate {
             axis,
@@ -56,22 +91,35 @@ fn build_shells(spec: &ModelSpec, color: Rgb) -> Result<Vec<(Shell, Rgb)>, Kerne
             shape,
         } => {
             let rotation = Rotation::new(*axis, *degrees, *origin)?;
-            Ok(build_shells(shape, color)?
+            Ok(build_bodies(shape, style)?
                 .into_iter()
-                .map(|(shell, color)| (rotation.apply(&shell), color))
+                .map(|body| body.map(|shell| rotation.apply(shell)))
                 .collect())
         }
         ModelSpec::Group { children } => {
             if children.is_empty() {
                 return Err(KernelError::Invalid("group needs at least one child".into()));
             }
-            let mut shells = Vec::new();
+            let mut bodies = Vec::new();
             for child in children {
-                shells.extend(build_shells(child, color)?);
+                bodies.extend(build_bodies(child, style)?);
             }
-            Ok(shells)
+            Ok(bodies)
         }
-        ModelSpec::Color { rgb, shape } => build_shells(shape, *rgb),
+        ModelSpec::Color { rgb, shape } => build_bodies(
+            shape,
+            &Style {
+                color: *rgb,
+                ..style.clone()
+            },
+        ),
+        ModelSpec::Part { name, shape } => build_bodies(
+            shape,
+            &Style {
+                part: Some(validate_part_name(name)?),
+                ..style.clone()
+            },
+        ),
         ModelSpec::Arrange { gap, children } => {
             if children.is_empty() {
                 return Err(KernelError::Invalid("arrange needs at least one child".into()));
@@ -82,14 +130,14 @@ fn build_shells(spec: &ModelSpec, color: Rgb) -> Result<Vec<(Shell, Rgb)>, Kerne
             let mut arranged = Vec::new();
             let mut x = 0.0;
             for child in children {
-                let shells = build_shells(child, color)?;
-                let (min, max) = shells_bounds(&shells)
+                let bodies = build_bodies(child, style)?;
+                let (min, max) = bodies_bounds(&bodies)
                     .ok_or_else(|| KernelError::Invalid("arrange child has no geometry".into()))?;
                 let offset = Vector3::new(x - min.x, -min.y, -min.z);
                 arranged.extend(
-                    shells
+                    bodies
                         .into_iter()
-                        .map(|(shell, color)| (builder::translated(&shell, offset), color)),
+                        .map(|body| body.map(|shell| builder::translated(shell, offset))),
                 );
                 x += (max.x - min.x) + gap;
             }
@@ -98,12 +146,20 @@ fn build_shells(spec: &ModelSpec, color: Rgb) -> Result<Vec<(Shell, Rgb)>, Kerne
     }
 }
 
-/// Bounding box of the shells' B-rep vertices. Exact for the planar faces we
+fn validate_part_name(name: &str) -> Result<String, KernelError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(KernelError::Invalid("part name must not be empty".into()));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Bounding box of the bodies' B-rep vertices. Exact for the planar faces we
 /// build today; curved faces would need their surfaces sampled.
-fn shells_bounds(shells: &[(Shell, Rgb)]) -> Option<(Point3, Point3)> {
-    let mut points = shells
+fn bodies_bounds(bodies: &[Body]) -> Option<(Point3, Point3)> {
+    let mut points = bodies
         .iter()
-        .flat_map(|(shell, _)| shell.vertex_iter())
+        .flat_map(|body| body.shell.vertex_iter())
         .map(|v| v.point());
     let first = points.next()?;
     Some(points.fold((first, first), |(min, max), p| {
@@ -114,14 +170,28 @@ fn shells_bounds(shells: &[(Shell, Rgb)]) -> Option<(Point3, Point3)> {
     }))
 }
 
-/// Innermost color set inside a profile, which its extrusion inherits.
-fn profile_color(spec: &ModelSpec) -> Option<Rgb> {
+/// Style set inside a profile (innermost wins), which its extrusion inherits
+/// over `inherited`.
+fn profile_style(spec: &ModelSpec, inherited: Style) -> Style {
     match spec {
-        ModelSpec::Color { rgb, shape } => profile_color(shape).or(Some(*rgb)),
+        ModelSpec::Color { rgb, shape } => profile_style(
+            shape,
+            Style {
+                color: *rgb,
+                ..inherited
+            },
+        ),
+        ModelSpec::Part { name, shape } => profile_style(
+            shape,
+            Style {
+                part: Some(name.trim().to_string()),
+                ..inherited
+            },
+        ),
         ModelSpec::Translate { shape, .. } | ModelSpec::Rotate { shape, .. } => {
-            profile_color(shape)
+            profile_style(shape, inherited)
         }
-        _ => None,
+        _ => inherited,
     }
 }
 
@@ -179,11 +249,15 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
             origin,
             shape,
         } => Ok(Rotation::new(*axis, *degrees, *origin)?.apply(&build_face(shape)?)),
-        // Color is applied by `build_shells` via `profile_color`.
+        // Style is applied by `build_bodies` via `profile_style`.
         ModelSpec::Color { shape, .. } => build_face(shape),
+        ModelSpec::Part { name, shape } => {
+            validate_part_name(name)?;
+            build_face(shape)
+        }
         ModelSpec::Extrude { .. } | ModelSpec::Group { .. } | ModelSpec::Arrange { .. } => {
             Err(KernelError::Invalid(
-                "extrude profile must be a single 2D shape (rect, optionally moved or colored)"
+                "extrude profile must be a single 2D shape (rect, optionally moved, colored or named)"
                     .into(),
             ))
         }
@@ -194,9 +268,14 @@ fn to_vector([x, y, z]: [f64; 3]) -> Vector3 {
     Vector3::new(x, y, z)
 }
 
-/// Appends `shell`'s triangles (all painted `color`) and edges to `scene`.
-fn tessellate_into(scene: &mut TessellatedScene, shell: &Shell, color: Rgb) {
-    let mesh = shell.triangulation(TESSELLATION_TOL).to_polygon();
+/// Appends `body`'s triangles and edges to `scene`, and records its vertex and
+/// index ranges under its part name. A body continuing the previous body's
+/// part extends that range instead of starting a new one.
+fn tessellate_into(scene: &mut TessellatedScene, body: &Body) {
+    let vertex_start = scene.positions.len() as u32;
+    let index_start = scene.indices.len() as u32;
+
+    let mesh = body.shell.triangulation(TESSELLATION_TOL).to_polygon();
     let mesh_positions = mesh.positions();
     let mesh_normals = mesh.normals();
 
@@ -211,7 +290,7 @@ fn tessellate_into(scene: &mut TessellatedScene, shell: &Shell, color: Rgb) {
                 let n = v.nor.map(|i| mesh_normals[i]).unwrap_or(flat);
                 scene.positions.push(to_f32(p.x, p.y, p.z));
                 scene.normals.push(to_f32(n.x, n.y, n.z));
-                scene.colors.push(color);
+                scene.colors.push(body.style.color);
                 (scene.positions.len() - 1) as u32
             });
             scene.indices.push(index);
@@ -219,12 +298,32 @@ fn tessellate_into(scene: &mut TessellatedScene, shell: &Shell, color: Rgb) {
     }
 
     let mut seen = HashSet::new();
-    for edge in shell.edge_iter() {
+    for edge in body.shell.edge_iter() {
         if seen.insert(edge.id()) {
             let a = edge.front().point();
             let b = edge.back().point();
             scene.edges.push(to_f32(a.x, a.y, a.z));
             scene.edges.push(to_f32(b.x, b.y, b.z));
+        }
+    }
+
+    if let Some(name) = &body.style.part {
+        let vertices = vertex_start..scene.positions.len() as u32;
+        let indices = index_start..scene.indices.len() as u32;
+        match scene.parts.last_mut() {
+            Some(last)
+                if &last.name == name
+                    && last.vertices.end == vertices.start
+                    && last.indices.end == indices.start =>
+            {
+                last.vertices.end = vertices.end;
+                last.indices.end = indices.end;
+            }
+            _ => scene.parts.push(ScenePart {
+                name: name.clone(),
+                vertices,
+                indices,
+            }),
         }
     }
 }
@@ -627,6 +726,124 @@ mod tests {
         ] {
             assert!(TruckKernel.build(&spec).is_err(), "{spec:?}");
         }
+    }
+
+    fn part(name: &str, shape: ModelSpec) -> ModelSpec {
+        ModelSpec::Part {
+            name: name.into(),
+            shape: Box::new(shape),
+        }
+    }
+
+    fn part_names(scene: &TessellatedScene) -> Vec<&str> {
+        scene.parts.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Every part's indices stay inside its own vertex range, and ranges don't overlap.
+    fn assert_parts_well_formed(scene: &TessellatedScene) {
+        let mut previous_end = (0, 0);
+        for part in &scene.parts {
+            assert!(part.vertices.start >= previous_end.0 && part.indices.start >= previous_end.1);
+            assert!(part.indices.len() % 3 == 0, "{part:?}");
+            for &i in &scene.indices[part.indices.start as usize..part.indices.end as usize] {
+                assert!(part.vertices.contains(&i), "{} index {i} escapes {:?}", part.name, part.vertices);
+            }
+            previous_end = (part.vertices.end, part.indices.end);
+        }
+    }
+
+    #[test]
+    fn parts_cover_their_own_geometry() {
+        let spec = ModelSpec::Group {
+            children: vec![
+                part("a", unit_box()),
+                unit_box(),
+                translate([3.0, 0.0, 0.0], part("b", unit_box())),
+            ],
+        };
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_eq!(part_names(&scene), ["a", "b"]);
+        assert_parts_well_formed(&scene);
+
+        let one = TruckKernel.build(&unit_box()).unwrap();
+        let (a, b) = (&scene.parts[0], &scene.parts[1]);
+        assert_eq!(a.vertices, 0..one.positions.len() as u32);
+        assert_eq!(a.indices.len(), one.indices.len());
+        // The unnamed middle box sits between them, in no part.
+        assert_eq!(b.vertices.start as usize, 2 * one.positions.len());
+        assert_eq!(b.vertices.end as usize, scene.positions.len());
+        // Part "b" is the translated box.
+        for v in b.vertices.clone() {
+            assert!(scene.positions[v as usize][0] >= 3.0);
+        }
+    }
+
+    #[test]
+    fn unnamed_models_have_no_parts() {
+        let scene = TruckKernel.build(&unit_box()).unwrap();
+        assert!(scene.parts.is_empty());
+    }
+
+    #[test]
+    fn multi_body_part_is_one_range() {
+        let pair = ModelSpec::Group {
+            children: vec![unit_box(), translate([2.0, 0.0, 0.0], unit_box())],
+        };
+        let scene = TruckKernel.build(&part("pair", pair)).unwrap();
+        assert_eq!(part_names(&scene), ["pair"]);
+        assert_eq!(scene.parts[0].vertices, 0..scene.positions.len() as u32);
+        assert_eq!(scene.parts[0].indices, 0..scene.indices.len() as u32);
+    }
+
+    #[test]
+    fn innermost_part_name_wins() {
+        let spec = part(
+            "frame",
+            ModelSpec::Group {
+                children: vec![
+                    unit_box(),
+                    translate([2.0, 0.0, 0.0], part("leg", unit_box())),
+                    translate([4.0, 0.0, 0.0], unit_box()),
+                ],
+            },
+        );
+        let scene = TruckKernel.build(&spec).unwrap();
+        // The inner part splits the outer one into two runs.
+        assert_eq!(part_names(&scene), ["frame", "leg", "frame"]);
+        assert_parts_well_formed(&scene);
+    }
+
+    #[test]
+    fn parts_survive_transforms_color_and_arrange() {
+        let spec = arrange(
+            5.0,
+            vec![
+                paint(RED, part("x", rotate([0.0, 0.0, 1.0], 90.0, [0.0; 3], unit_box()))),
+                part("y", translate([9.0, 9.0, 9.0], sized_box(2.0, 2.0, 2.0))),
+            ],
+        );
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_eq!(part_names(&scene), ["x", "y"]);
+        assert_parts_well_formed(&scene);
+        let x = &scene.parts[0];
+        assert!(x.vertices.clone().all(|v| scene.colors[v as usize] == RED));
+    }
+
+    #[test]
+    fn named_profile_names_its_extrusion() {
+        let scene = TruckKernel
+            .build(&extrude(part("plate", rect(2.0, 2.0)), 1.0))
+            .unwrap();
+        assert_eq!(part_names(&scene), ["plate"]);
+        assert_eq!(scene.parts[0].vertices, 0..scene.positions.len() as u32);
+    }
+
+    #[test]
+    fn part_names_are_trimmed_and_must_not_be_blank() {
+        let scene = TruckKernel.build(&part("  leg  ", unit_box())).unwrap();
+        assert_eq!(part_names(&scene), ["leg"]);
+        assert!(TruckKernel.build(&part("   ", unit_box())).is_err());
+        assert!(TruckKernel.build(&extrude(part("", rect(1.0, 1.0)), 1.0)).is_err());
     }
 
     #[test]

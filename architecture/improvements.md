@@ -49,8 +49,8 @@ the improvement.
   triad, plus the print bed outline in Print view.
 - **Camera presets.** Front, top, iso, and fit-to-view, on keyboard
   shortcuts.
-- **Part list and picking.** After named parts land, add a side panel
-  listing parts with click-to-highlight.
+- **Part picking.** The overlay lists parts, but you can't select one.
+  Add click-to-highlight in the viewport and in the list.
 - **Measurements.** Measure distances and bounds of a selected part.
 - **Wireframe and transparency toggles.**
 

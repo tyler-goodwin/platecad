@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
 /// sRGB color, one byte per channel.
@@ -36,6 +38,9 @@ pub enum ModelSpec {
     Group { children: Vec<ModelSpec> },
     /// Paints `shape`. The innermost `Color` wins; a colored profile colors its extrusion.
     Color { rgb: Rgb, shape: Box<ModelSpec> },
+    /// Names `shape` as a part (for export and part lists). The innermost
+    /// `Part` wins; a named profile names its extrusion.
+    Part { name: String, shape: Box<ModelSpec> },
     /// Lays children out for printing: each is moved so its bounding box sits on
     /// the plate (z = 0, y = 0), side by side along +X with `gap` between them.
     /// Orientation is left to the model.
@@ -85,9 +90,22 @@ pub struct TessellatedScene {
     #[serde(default)]
     pub colors: Vec<Rgb>,
     pub indices: Vec<u32>,
+    /// Named parts, in order. Each covers a contiguous run of vertices and of
+    /// indices, and its indices only reference its own vertices. Geometry
+    /// outside any `Part` isn't listed.
+    #[serde(default)]
+    pub parts: Vec<ScenePart>,
     /// Optional line-list of boundary samples (pairs of points).
     #[serde(default)]
     pub edges: Vec<[f32; 3]>,
+}
+
+/// A named run of a [`TessellatedScene`]'s vertices and triangle indices.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenePart {
+    pub name: String,
+    pub vertices: Range<u32>,
+    pub indices: Range<u32>,
 }
 
 impl TessellatedScene {
@@ -229,6 +247,22 @@ mod tests {
                 axis: [0.0, 0.0, 1.0],
                 degrees: 90.0,
                 origin: [0.0; 3],
+                shape: Box::new(ModelSpec::Rect {
+                    width: 1.0,
+                    height: 1.0
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn part_matches_ts_shape() {
+        let json = r#"{"kind":"Part","name":"leg","shape":{"kind":"Rect","width":1,"height":1}}"#;
+        let spec: ModelSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Part {
+                name: "leg".into(),
                 shape: Box::new(ModelSpec::Rect {
                     width: 1.0,
                     height: 1.0

@@ -632,6 +632,25 @@ mod tests {
     }
 
     #[test]
+    fn bookshelf_names_every_board_in_both_views() {
+        let views = build_bookshelf_views("{ shelves: 2 }");
+        let names = |scene: &cad_ir::TessellatedScene| -> Vec<String> {
+            scene.parts.iter().map(|p| p.name.clone()).collect()
+        };
+        let expected = [
+            "left side", "right side", "bottom", "top", "shelf 1", "shelf 2", "back panel",
+        ];
+        assert_eq!(names(&views.assembled), expected);
+        assert_eq!(names(views.print.as_ref().unwrap()), expected);
+
+        // Parts cover all geometry: every vertex belongs to exactly one board.
+        for scene in [&views.assembled, views.print.as_ref().unwrap()] {
+            let covered: u32 = scene.parts.iter().map(|p| p.vertices.len() as u32).sum();
+            assert_eq!(covered as usize, scene.positions.len());
+        }
+    }
+
+    #[test]
     fn bookshelf_defaults_are_millimeters() {
         // A real bookshelf is around a meter wide; a cm-scale model would be ~100.
         let aabb = build_bookshelf("{}").aabb().unwrap();

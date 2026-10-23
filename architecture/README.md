@@ -63,6 +63,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
+| `Part { name, shape }` | Names a shape as a part, for export and the part list. The innermost name wins; a named profile names its extrusion. |
 | `Arrange { gap, children }` | Print layout: drops each child onto the plate (z = 0, y = 0) and lines them up along +X. |
 
 `ModelViews` is what a model exports: `assembled` (how it looks put together)
@@ -71,7 +72,11 @@ and an optional `print` (parts oriented and arranged for a slicer). A bare
 
 `TessellatedScene` holds GPU-ready triangles: positions, normals and sRGB
 colors (one per vertex, de-indexed so corners stay crisp), plus indices and an
-edge line list taken from the B-rep edges.
+edge line list taken from the B-rep edges. `parts` lists named runs as
+`ScenePart { name, vertices, indices }`. Each run covers a contiguous range,
+and its indices only reference its own vertices, so a part can be cut out as
+its own mesh. Consecutive bodies with the same name share one run; a nested
+part splits its parent into several runs.
 
 ### Why a data IR instead of live kernel calls
 
@@ -135,7 +140,8 @@ cad-app [MODEL] [--kernel truck|occ]   # MODEL defaults to models/cube.ts; CAD_K
 - B-rep edges are drawn as instanced thin cylinders, because GL line width
   isn't portable.
 - The egui overlay has an **Assembled/Print toggle** (Print is disabled when
-  the model has no print view), reload diagnostics and an orbit hint.
+  the model has no print view), a collapsible **part list** for the shown
+  view (name and triangle count), reload diagnostics and an orbit hint.
 - The camera frames the shown view when it first appears and when you switch
   views. Reloads keep your camera.
 
@@ -159,11 +165,9 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Named parts.** A `part("name", shape)` node, kept through tessellation,
-   so export and UI can address parts.
-2. **3MF export.** One object per part with colors, from either view
+1. **3MF export.** One object per part with colors, from either view
    (`--export out.3mf`).
-3. **Booleans.** Union, difference and intersection via truck-shapeops, so
+2. **Booleans.** Union, difference and intersection via truck-shapeops, so
    colored parts can be real non-overlapping bodies and holes become
    possible.
 

@@ -451,6 +451,31 @@ mod tests {
     }
 
     #[test]
+    fn dsl_part_names_shapes() {
+        let spec = eval(
+            r#"import { cube, part } from "./dsl/cad.ts";
+            export default () => part("  leg ", cube(1));"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Part {
+                name: "leg".into(),
+                shape: Box::new(unit_cube()),
+            }
+        );
+
+        for bad in [r#"part("", cube(1))"#, r#"part("  ", cube(1))"#, "part(7, cube(1))"] {
+            let source = format!(
+                r#"import {{ cube, part }} from "./dsl/cad.ts";
+                export default () => {bad};"#
+            );
+            let err = eval(&source).unwrap_err().to_string();
+            assert!(err.contains("part name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"
@@ -483,11 +508,11 @@ mod tests {
     }
 
     /// Bottom-face Z of each board (a translated box) in depth-first order,
-    /// looking through groups and colors.
+    /// looking through groups, colors and part names.
     fn board_z(spec: &ModelSpec) -> Vec<f64> {
         match spec {
             ModelSpec::Group { children } => children.iter().flat_map(board_z).collect(),
-            ModelSpec::Color { shape, .. } => board_z(shape),
+            ModelSpec::Color { shape, .. } | ModelSpec::Part { shape, .. } => board_z(shape),
             ModelSpec::Translate { offset, .. } => vec![offset[2]],
             other => panic!("expected translated board, got {other:?}"),
         }

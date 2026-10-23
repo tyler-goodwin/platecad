@@ -50,6 +50,12 @@ export type ColorSpec = {
   shape: ModelSpec;
 };
 
+export type PartSpec = {
+  kind: "Part";
+  name: string;
+  shape: ModelSpec;
+};
+
 export type ArrangeSpec = {
   kind: "Arrange";
   gap: number;
@@ -57,7 +63,7 @@ export type ArrangeSpec = {
 };
 
 /** 2D shapes that can be swept into solids. */
-export type ProfileSpec = RectSpec | TranslateSpec | RotateSpec | ColorSpec;
+export type ProfileSpec = RectSpec | TranslateSpec | RotateSpec | ColorSpec | PartSpec;
 
 export type ModelSpec =
   | RectSpec
@@ -66,6 +72,7 @@ export type ModelSpec =
   | RotateSpec
   | GroupSpec
   | ColorSpec
+  | PartSpec
   | ArrangeSpec;
 
 /** What a model file exports: how it looks put together, and optionally how it prints. */
@@ -154,6 +161,17 @@ export function parseColor(value: ColorInput): Rgb {
 /** Paints a shape. The innermost color wins; a colored profile colors its extrusion. */
 export function color(shape: ModelSpec, value: ColorInput): ColorSpec {
   return { kind: "Color", rgb: parseColor(value), shape };
+}
+
+/**
+ * Names a shape as a part: it becomes its own object in exports and shows up in
+ * the part list. The innermost name wins.
+ */
+export function part(name: string, shape: ModelSpec): PartSpec {
+  if (typeof name !== "string" || name.trim() === "") {
+    throw new Error(`part name must be a non-empty string (got ${JSON.stringify(name)})`);
+  }
+  return { kind: "Part", name: name.trim(), shape };
 }
 
 /**

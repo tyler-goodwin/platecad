@@ -3,6 +3,7 @@ import {
   box,
   color,
   group,
+  part,
   type ColorInput,
   type Model,
   type ModelSpec,
@@ -43,13 +44,13 @@ type Board = { name: string; size: Vec3; at: Vec3 };
 /** The board where it goes in the assembled shelf. */
 function placed(b: Board): ModelSpec {
   const [width, depth, height] = b.size;
-  return box({ width, depth, height, at: b.at });
+  return part(b.name, box({ width, depth, height, at: b.at }));
 }
 
 /** The same board lying on its largest face, ready to print. */
 function flat(b: Board): ModelSpec {
   const [length, width, thickness] = [...b.size].sort((x, y) => y - x);
-  return box({ width: length, depth: width, height: thickness });
+  return part(b.name, box({ width: length, depth: width, height: thickness }));
 }
 
 function boards(p: BookshelfParams): { frame: Board[]; back: Board } {

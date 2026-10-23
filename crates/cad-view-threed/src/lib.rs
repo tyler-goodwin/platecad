@@ -98,6 +98,18 @@ impl ViewportApp for ThreeDViewport {
                                 );
                             });
                             ui.separator();
+                            if let Some(scene) = state.active() {
+                                if !scene.parts.is_empty() {
+                                    egui::CollapsingHeader::new(format!("Parts ({})", scene.parts.len()))
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            for (name, triangles) in &scene.parts {
+                                                ui.label(format!("{name} ({triangles} triangles)"));
+                                            }
+                                        });
+                                    ui.separator();
+                                }
+                            }
                             for d in &state.diagnostics {
                                 let color = if d.ok {
                                     egui::Color32::from_rgb(120, 200, 120)
@@ -138,6 +150,7 @@ struct GpuScene {
     model: Option<Gm<Mesh, PhysicalMaterial>>,
     edges: Option<Gm<InstancedMesh, ColorMaterial>>,
     aabb: Option<Aabb>,
+    parts: Vec<(String, usize)>,
 }
 
 impl GpuScene {
@@ -146,8 +159,23 @@ impl GpuScene {
             model: build_model(context, scene),
             edges: build_edges(context, scene),
             aabb: scene.aabb(),
+            parts: part_list(scene),
         }
     }
+}
+
+/// Part names with triangle counts, in first-seen order. A part split into
+/// several runs (by a nested part) is listed once.
+fn part_list(scene: &TessellatedScene) -> Vec<(String, usize)> {
+    let mut list: Vec<(String, usize)> = Vec::new();
+    for part in &scene.parts {
+        let triangles = part.indices.len() / 3;
+        match list.iter_mut().find(|(name, _)| *name == part.name) {
+            Some((_, count)) => *count += triangles,
+            None => list.push((part.name.clone(), triangles)),
+        }
+    }
+    list
 }
 
 struct ViewState {
@@ -383,6 +411,24 @@ mod tests {
     fn vertex_colors_absent_or_mismatched_fall_back() {
         assert_eq!(vertex_colors(&scene_with(3, vec![])), None);
         assert_eq!(vertex_colors(&scene_with(3, vec![[1, 2, 3]])), None);
+    }
+
+    #[test]
+    fn part_list_merges_split_runs_in_first_seen_order() {
+        let part = |name: &str, indices: std::ops::Range<u32>| cad_ir::ScenePart {
+            name: name.into(),
+            vertices: 0..0,
+            indices,
+        };
+        let scene = TessellatedScene {
+            parts: vec![part("frame", 0..6), part("leg", 6..42), part("frame", 42..48)],
+            ..Default::default()
+        };
+        assert_eq!(
+            part_list(&scene),
+            vec![("frame".to_string(), 4), ("leg".to_string(), 12)]
+        );
+        assert!(part_list(&TessellatedScene::default()).is_empty());
     }
 
     #[test]
