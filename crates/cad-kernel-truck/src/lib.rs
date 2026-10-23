@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use cad_ir::{DEFAULT_COLOR, ModelSpec, Rgb, TessellatedScene};
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
-use truck_modeling::{Face, Point3, Shell, Vector3, builder};
+use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Vector3, builder};
 
 const TESSELLATION_TOL: f64 = 0.01;
 
@@ -49,6 +49,18 @@ fn build_shells(spec: &ModelSpec, color: Rgb) -> Result<Vec<(Shell, Rgb)>, Kerne
             .into_iter()
             .map(|(shell, color)| (builder::translated(&shell, to_vector(*offset)), color))
             .collect()),
+        ModelSpec::Rotate {
+            axis,
+            degrees,
+            origin,
+            shape,
+        } => {
+            let rotation = Rotation::new(*axis, *degrees, *origin)?;
+            Ok(build_shells(shape, color)?
+                .into_iter()
+                .map(|(shell, color)| (rotation.apply(&shell), color))
+                .collect())
+        }
         ModelSpec::Group { children } => {
             if children.is_empty() {
                 return Err(KernelError::Invalid("group needs at least one child".into()));
@@ -106,8 +118,42 @@ fn shells_bounds(shells: &[(Shell, Rgb)]) -> Option<(Point3, Point3)> {
 fn profile_color(spec: &ModelSpec) -> Option<Rgb> {
     match spec {
         ModelSpec::Color { rgb, shape } => profile_color(shape).or(Some(*rgb)),
-        ModelSpec::Translate { shape, .. } => profile_color(shape),
+        ModelSpec::Translate { shape, .. } | ModelSpec::Rotate { shape, .. } => {
+            profile_color(shape)
+        }
         _ => None,
+    }
+}
+
+/// A validated `Rotate` node: unit axis, finite angle.
+struct Rotation {
+    origin: Point3,
+    axis: Vector3,
+    angle: Rad<f64>,
+}
+
+impl Rotation {
+    fn new(axis: [f64; 3], degrees: f64, origin: [f64; 3]) -> Result<Self, KernelError> {
+        let axis = to_vector(axis);
+        let length = axis.magnitude();
+        if !(length > 1e-12 && length.is_finite()) {
+            return Err(KernelError::Invalid("rotate axis must be a non-zero vector".into()));
+        }
+        if !degrees.is_finite() || !origin.iter().all(|c| c.is_finite()) {
+            return Err(KernelError::Invalid("rotate angle and origin must be finite".into()));
+        }
+        Ok(Self {
+            origin: Point3::new(origin[0], origin[1], origin[2]),
+            axis: axis / length,
+            angle: Rad(degrees.to_radians()),
+        })
+    }
+
+    fn apply<T: truck_modeling::Mapped<Point3, truck_modeling::Curve, truck_modeling::Surface>>(
+        &self,
+        elem: &T,
+    ) -> T {
+        builder::rotated(elem, self.origin, self.axis, self.angle)
     }
 }
 
@@ -127,11 +173,17 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
         ModelSpec::Translate { offset, shape } => {
             Ok(builder::translated(&build_face(shape)?, to_vector(*offset)))
         }
+        ModelSpec::Rotate {
+            axis,
+            degrees,
+            origin,
+            shape,
+        } => Ok(Rotation::new(*axis, *degrees, *origin)?.apply(&build_face(shape)?)),
         // Color is applied by `build_shells` via `profile_color`.
         ModelSpec::Color { shape, .. } => build_face(shape),
         ModelSpec::Extrude { .. } | ModelSpec::Group { .. } | ModelSpec::Arrange { .. } => {
             Err(KernelError::Invalid(
-                "extrude profile must be a single 2D shape (rect, optionally translated or colored)"
+                "extrude profile must be a single 2D shape (rect, optionally moved or colored)"
                     .into(),
             ))
         }
@@ -178,7 +230,6 @@ fn tessellate_into(scene: &mut TessellatedScene, shell: &Shell, color: Rgb) {
 }
 
 fn flat_normal([a, b, c]: [Point3; 3]) -> Vector3 {
-    use truck_modeling::InnerSpace;
     let n = (b - a).cross(c - a);
     if n.magnitude2() > 0.0 {
         n.normalize()
@@ -478,6 +529,104 @@ mod tests {
         assert!(TruckKernel.build(&arrange(-1.0, vec![unit_box()])).is_err());
         assert!(TruckKernel.build(&arrange(f64::NAN, vec![unit_box()])).is_err());
         assert!(TruckKernel.build(&extrude(arrange(1.0, vec![rect(1.0, 1.0)]), 1.0)).is_err());
+    }
+
+    fn rotate(axis: [f64; 3], degrees: f64, origin: [f64; 3], shape: ModelSpec) -> ModelSpec {
+        ModelSpec::Rotate {
+            axis,
+            degrees,
+            origin,
+            shape: Box::new(shape),
+        }
+    }
+
+    #[test]
+    fn rotate_about_z_turns_box_sideways() {
+        let spec = rotate([0.0, 0.0, 1.0], 90.0, [0.0; 3], sized_box(2.0, 1.0, 1.0));
+        let scene = TruckKernel.build(&spec).unwrap();
+        // (x, y) -> (-y, x): the 2-long side now runs along +Y.
+        assert_aabb(&scene, [-1.0, 0.0, 0.0], [0.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn rotate_uses_origin_and_normalizes_axis() {
+        // About +X through (0, 1, 0): (y, z) -> (1 - z, y - 1). The axis is
+        // deliberately not unit length.
+        let spec = rotate([5.0, 0.0, 0.0], 90.0, [0.0, 1.0, 0.0], sized_box(1.0, 1.0, 1.0));
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_aabb(&scene, [0.0, 0.0, -1.0], [1.0, 1.0, 0.0]);
+
+        // Same rotation pivoting at y = 5: (y, z) -> (5 - z, y - 5).
+        let scene2 = TruckKernel
+            .build(&rotate([1.0, 0.0, 0.0], 90.0, [0.0, 5.0, 0.0], sized_box(1.0, 1.0, 1.0)))
+            .unwrap();
+        assert_aabb(&scene2, [0.0, 4.0, -5.0], [1.0, 5.0, -4.0]);
+    }
+
+    #[test]
+    fn rotated_normals_stay_unit_and_follow_faces() {
+        let spec = rotate([0.0, 1.0, 0.0], 90.0, [0.0; 3], unit_box());
+        let scene = TruckKernel.build(&spec).unwrap();
+        for n in &scene.normals {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-4, "{n:?}");
+            assert_eq!(n.iter().filter(|c| c.abs() > 0.999).count(), 1, "{n:?}");
+        }
+    }
+
+    #[test]
+    fn full_turn_is_identity() {
+        // Vertex order isn't guaranteed across transforms, so compare sorted sets.
+        let sorted = |scene: TessellatedScene| {
+            let mut points = scene.positions;
+            for p in &mut points {
+                *p = p.map(|c| (c * 1e3).round() / 1e3 + 0.0);
+            }
+            points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            points
+        };
+        let plain = sorted(TruckKernel.build(&sized_box(3.0, 2.0, 1.0)).unwrap());
+        let turned = sorted(
+            TruckKernel
+                .build(&rotate([1.0, 1.0, 1.0], 360.0, [7.0, -2.0, 4.0], sized_box(3.0, 2.0, 1.0)))
+                .unwrap(),
+        );
+        assert_eq!(plain.len(), turned.len());
+        for (a, b) in plain.iter().zip(&turned) {
+            for i in 0..3 {
+                assert!((a[i] - b[i]).abs() < 1e-4, "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_profile_extrudes_and_keeps_color() {
+        // A rect spun 90 degrees in plane, then extruded: still a box, still red.
+        let profile = rotate([0.0, 0.0, 1.0], 90.0, [0.0; 3], paint(RED, rect(2.0, 1.0)));
+        let scene = TruckKernel.build(&extrude(profile, 3.0)).unwrap();
+        assert_aabb(&scene, [-1.0, 0.0, 0.0], [0.0, 2.0, 3.0]);
+        assert_eq!(color_counts(&scene), vec![(RED, scene.positions.len())]);
+    }
+
+    #[test]
+    fn arrange_lands_rotated_parts_on_plate() {
+        // A standing board (1 x 10 x 20) laid flat by rotating about Y.
+        let standing = sized_box(1.0, 10.0, 20.0);
+        let flat = rotate([0.0, 1.0, 0.0], 90.0, [0.0; 3], standing);
+        let scene = TruckKernel.build(&arrange(0.0, vec![flat])).unwrap();
+        assert_aabb(&scene, [0.0; 3], [20.0, 10.0, 1.0]);
+    }
+
+    #[test]
+    fn rejects_bad_rotations() {
+        for spec in [
+            rotate([0.0; 3], 90.0, [0.0; 3], unit_box()),
+            rotate([0.0, 0.0, 1.0], f64::NAN, [0.0; 3], unit_box()),
+            rotate([0.0, 0.0, 1.0], 90.0, [f64::INFINITY, 0.0, 0.0], unit_box()),
+            rotate([f64::NAN, 0.0, 1.0], 90.0, [0.0; 3], unit_box()),
+        ] {
+            assert!(TruckKernel.build(&spec).is_err(), "{spec:?}");
+        }
     }
 
     #[test]

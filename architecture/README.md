@@ -60,6 +60,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Rect { width, height }` | Planar rectangle in XY, corner at the origin. |
 | `Extrude { profile, distance }` | Sweeps a 2D profile along +Z into a solid. |
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
+| `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
 | `Arrange { gap, children }` | Print layout: drops each child onto the plate (z = 0, y = 0) and lines them up along +X. |
@@ -158,13 +159,11 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Rotation.** `rotate(shape, axis, degrees)`, so print layouts can
-   reorient parts that aren't boxes.
-2. **Named parts.** A `part("name", shape)` node, kept through tessellation,
+1. **Named parts.** A `part("name", shape)` node, kept through tessellation,
    so export and UI can address parts.
-3. **3MF export.** One object per part with colors, from either view
+2. **3MF export.** One object per part with colors, from either view
    (`--export out.3mf`).
-4. **Booleans.** Union, difference and intersection via truck-shapeops, so
+3. **Booleans.** Union, difference and intersection via truck-shapeops, so
    colored parts can be real non-overlapping bodies and holes become
    possible.
 

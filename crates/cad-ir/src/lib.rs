@@ -23,6 +23,15 @@ pub enum ModelSpec {
         offset: [f64; 3],
         shape: Box<ModelSpec>,
     },
+    /// Rotates `shape` by `degrees` (right-hand rule) about the line through
+    /// `origin` along `axis` (any non-zero length). Works on profiles and solids.
+    Rotate {
+        axis: [f64; 3],
+        degrees: f64,
+        #[serde(default)]
+        origin: [f64; 3],
+        shape: Box<ModelSpec>,
+    },
     /// Several independent shapes shown together (no boolean union yet).
     Group { children: Vec<ModelSpec> },
     /// Paints `shape`. The innermost `Color` wins; a colored profile colors its extrusion.
@@ -208,6 +217,24 @@ mod tests {
         let json = r#"{"positions":[],"normals":[],"indices":[]}"#;
         let scene: TessellatedScene = serde_json::from_str(json).unwrap();
         assert!(scene.colors.is_empty());
+    }
+
+    #[test]
+    fn rotate_matches_ts_shape_and_defaults_origin() {
+        let json = r#"{"kind":"Rotate","axis":[0,0,1],"degrees":90,"shape":{"kind":"Rect","width":1,"height":1}}"#;
+        let spec: ModelSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Rotate {
+                axis: [0.0, 0.0, 1.0],
+                degrees: 90.0,
+                origin: [0.0; 3],
+                shape: Box::new(ModelSpec::Rect {
+                    width: 1.0,
+                    height: 1.0
+                }),
+            }
+        );
     }
 
     #[test]

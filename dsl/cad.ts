@@ -31,6 +31,14 @@ export type TranslateSpec = {
   shape: ModelSpec;
 };
 
+export type RotateSpec = {
+  kind: "Rotate";
+  axis: Vec3;
+  degrees: number;
+  origin: Vec3;
+  shape: ModelSpec;
+};
+
 export type GroupSpec = {
   kind: "Group";
   children: ModelSpec[];
@@ -49,12 +57,13 @@ export type ArrangeSpec = {
 };
 
 /** 2D shapes that can be swept into solids. */
-export type ProfileSpec = RectSpec | TranslateSpec | ColorSpec;
+export type ProfileSpec = RectSpec | TranslateSpec | RotateSpec | ColorSpec;
 
 export type ModelSpec =
   | RectSpec
   | ExtrudeSpec
   | TranslateSpec
+  | RotateSpec
   | GroupSpec
   | ColorSpec
   | ArrangeSpec;
@@ -91,6 +100,31 @@ export function translate<T extends ModelSpec>(shape: T, offset: Vec3): Translat
     throw new Error(`translate offset must be finite (got [${offset}])`);
   }
   return { kind: "Translate", offset, shape };
+}
+
+const AXES: Record<"x" | "y" | "z", Vec3> = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
+
+/**
+ * Rotates a shape by `degrees` (right-hand rule: positive is counter-clockwise
+ * looking down the axis) about the line through `origin` (default the world
+ * origin) along `axis`.
+ */
+export function rotate<T extends ModelSpec>(
+  shape: T,
+  opts: { axis: "x" | "y" | "z" | Vec3; degrees: number; origin?: Vec3 },
+): RotateSpec {
+  const axis = typeof opts.axis === "string" ? AXES[opts.axis] : opts.axis;
+  if (!axis || axis.length !== 3 || !axis.every(Number.isFinite) || axis.every((c) => c === 0)) {
+    throw new Error(`rotate axis must be "x", "y", "z" or a non-zero [x, y, z] (got ${JSON.stringify(opts.axis)})`);
+  }
+  if (!Number.isFinite(opts.degrees)) {
+    throw new Error(`rotate degrees must be finite (got ${opts.degrees})`);
+  }
+  const origin = opts.origin ?? [0, 0, 0];
+  if (!origin.every(Number.isFinite)) {
+    throw new Error(`rotate origin must be finite (got [${origin}])`);
+  }
+  return { kind: "Rotate", axis, degrees: opts.degrees, origin, shape };
 }
 
 /** Shows several shapes together. No boolean union: overlapping solids stay separate. */

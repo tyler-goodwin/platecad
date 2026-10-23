@@ -413,6 +413,44 @@ mod tests {
     }
 
     #[test]
+    fn dsl_rotate_accepts_axis_names_and_vectors() {
+        for (axis, want) in [("\"x\"", [1.0, 0.0, 0.0]), ("\"z\"", [0.0, 0.0, 1.0]), ("[1, 1, 0]", [1.0, 1.0, 0.0])] {
+            let source = format!(
+                r#"import {{ cube, rotate }} from "./dsl/cad.ts";
+                export default () => rotate(cube(1), {{ axis: {axis}, degrees: 45, origin: [1, 2, 3] }});"#
+            );
+            assert_eq!(
+                eval(&source).unwrap(),
+                ModelSpec::Rotate {
+                    axis: want,
+                    degrees: 45.0,
+                    origin: [1.0, 2.0, 3.0],
+                    shape: Box::new(unit_cube()),
+                },
+                "{axis}"
+            );
+        }
+    }
+
+    #[test]
+    fn dsl_rotate_rejects_bad_input() {
+        for opts in [
+            r#"{ axis: "w", degrees: 90 }"#,
+            r#"{ axis: [0, 0, 0], degrees: 90 }"#,
+            r#"{ axis: [0, 1], degrees: 90 }"#,
+            r#"{ axis: "z", degrees: NaN }"#,
+            r#"{ axis: "z", degrees: 90, origin: [0, Infinity, 0] }"#,
+        ] {
+            let source = format!(
+                r#"import {{ cube, rotate }} from "./dsl/cad.ts";
+                export default () => rotate(cube(1), {opts});"#
+            );
+            let err = eval(&source).unwrap_err().to_string();
+            assert!(err.contains("rotate"), "{opts}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"
