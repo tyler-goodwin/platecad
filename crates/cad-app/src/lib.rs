@@ -2,6 +2,7 @@
 //! -> `SceneUpdate`, re-run whenever watched sources change. Kept windowless so it
 //! can be tested headless.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -15,7 +16,6 @@ use clap::{Parser, ValueEnum};
 use notify::{EventKind, RecursiveMode, Watcher};
 
 pub const DEFAULT_MODEL: &str = "models/cube.ts";
-pub const WATCH_DIRS: [&str; 2] = ["models", "dsl"];
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
 /// A directory containing this file is a project root (imports and watching are scoped to it).
 pub const PROJECT_MARKER: &str = "dsl/cad.ts";
@@ -64,20 +64,29 @@ pub fn project_root(model: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Directories to watch recursively: the project's `models/` and `dsl/`, plus
-/// the model's own directory when it lives elsewhere.
-pub fn watch_dirs(root: &Path, model: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = WATCH_DIRS
-        .iter()
-        .map(|d| root.join(d))
-        .filter(|d| d.is_dir())
-        .collect();
-    if let Some(dir) = model.parent() {
-        if !dirs.iter().any(|d| dir.starts_with(d)) {
-            dirs.push(dir.to_path_buf());
-        }
+/// Directories to watch so every dependency's changes are seen, mapped to
+/// whether the watch must be recursive.
+///
+/// A file is watched through its folder (non-recursively), not directly:
+/// editors that save via write-temp-then-rename replace the file, which would
+/// drop a watch on the file itself. A dependency whose folder doesn't exist
+/// yet (a missing import) is watched through its nearest existing ancestor,
+/// recursively, so creating the folder and file is still seen.
+pub fn watch_targets(dependencies: &BTreeSet<PathBuf>) -> BTreeMap<PathBuf, bool> {
+    let mut targets: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    for dep in dependencies {
+        let Some(dir) = dep.parent() else { continue };
+        let (dir, recursive) = if dir.is_dir() {
+            (dir, false)
+        } else {
+            match dir.ancestors().find(|d| d.is_dir()) {
+                Some(existing) => (existing, true),
+                None => continue,
+            }
+        };
+        *targets.entry(dir.to_path_buf()).or_default() |= recursive;
     }
-    dirs
+    targets
 }
 
 /// Folds `.` and `..` without touching the filesystem (unlike `canonicalize`,
@@ -96,10 +105,12 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Script host + kernel: one TS file in, one `SceneUpdate` out.
+/// Script host + kernel: one TS file in, one `SceneUpdate` out. Also tracks
+/// which files the model depends on, for the watcher.
 pub struct Pipeline {
     script: RustyScriptHost,
     kernel: Box<dyn Kernel + Send>,
+    dependencies: BTreeSet<PathBuf>,
 }
 
 impl Pipeline {
@@ -109,13 +120,32 @@ impl Pipeline {
             KernelChoice::Occ => Box::new(OccKernel),
         };
         let script = RustyScriptHost::new(root).map_err(|e| e.to_string())?;
-        Ok(Self { script, kernel })
+        Ok(Self {
+            script,
+            kernel,
+            dependencies: BTreeSet::new(),
+        })
+    }
+
+    /// Files the model read on its last successful eval, plus anything a failed
+    /// eval since then touched. Keeping the old set across failures means fixing
+    /// a broken import (which may stop the eval before later imports load)
+    /// still triggers a reload.
+    pub fn dependencies(&self) -> &BTreeSet<PathBuf> {
+        &self.dependencies
     }
 
     pub fn evaluate(&mut self, model: &Path) -> SceneUpdate {
         let started = Instant::now();
         let name = model.file_name().unwrap_or_default().to_string_lossy();
-        let views = match self.script.eval_file(model) {
+        let result = self.script.eval_file(model);
+        let latest = self.script.last_dependencies().iter().cloned();
+        if result.is_ok() {
+            self.dependencies = latest.collect();
+        } else {
+            self.dependencies.extend(latest);
+        }
+        let views = match result {
             Ok(views) => views,
             Err(e) => return SceneUpdate::error(format!("{name}: {e}")),
         };
@@ -155,27 +185,29 @@ pub fn report(update: &SceneUpdate) {
     }
 }
 
-/// Re-evaluates `model` whenever a script in [`watch_dirs`] changes,
+/// Re-evaluates `model` whenever one of its [`Pipeline::dependencies`] changes,
 /// waiting for `DEBOUNCE` of quiet so editor save bursts cause one rebuild.
+/// The watched set follows the model's imports after every eval. `pipeline`
+/// should already have evaluated `model` once (that's what seeds the set).
 /// Returns once the receiving end of `tx` (the viewer) is gone.
 pub fn watch_and_reload(
-    root: &Path,
     model: &Path,
     mut pipeline: Pipeline,
     tx: Sender<SceneUpdate>,
 ) -> notify::Result<()> {
     let (events_tx, events_rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(events_tx)?;
-    for dir in watch_dirs(root, model) {
-        watcher.watch(&dir, RecursiveMode::Recursive)?;
+    let mut watched = WatchSet::new(notify::recommended_watcher(events_tx)?);
+    if pipeline.dependencies().is_empty() {
+        pipeline.evaluate(model);
     }
+    watched.sync(pipeline.dependencies())?;
 
     loop {
-        // Block until something relevant changes (or the watcher goes away).
+        // Block until a dependency changes (or the watcher goes away).
         let Ok(event) = events_rx.recv() else {
             return Ok(());
         };
-        if !is_relevant(&event?) {
+        if !is_relevant(&event?, pipeline.dependencies()) {
             continue;
         }
         // Swallow the rest of the burst.
@@ -189,6 +221,7 @@ pub fn watch_and_reload(
 
         let update = pipeline.evaluate(model);
         report(&update);
+        watched.sync(pipeline.dependencies())?;
         if tx.send(update).is_err() {
             // Viewer closed.
             return Ok(());
@@ -196,14 +229,50 @@ pub fn watch_and_reload(
     }
 }
 
-pub fn is_relevant(event: &notify::Event) -> bool {
+/// A watcher plus the directories it currently watches.
+struct WatchSet<W: Watcher> {
+    watcher: W,
+    current: BTreeMap<PathBuf, bool>,
+}
+
+impl<W: Watcher> WatchSet<W> {
+    fn new(watcher: W) -> Self {
+        Self {
+            watcher,
+            current: BTreeMap::new(),
+        }
+    }
+
+    /// Updates the watches to [`watch_targets`] of `dependencies`.
+    fn sync(&mut self, dependencies: &BTreeSet<PathBuf>) -> notify::Result<()> {
+        let wanted = watch_targets(dependencies);
+        for (dir, recursive) in &self.current {
+            if wanted.get(dir) != Some(recursive) {
+                // The directory may already be gone; nothing to clean up then.
+                let _ = self.watcher.unwatch(dir);
+            }
+        }
+        for (dir, recursive) in &wanted {
+            if self.current.get(dir) != Some(recursive) {
+                let mode = if *recursive {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                };
+                self.watcher.watch(dir, mode)?;
+            }
+        }
+        self.current = wanted;
+        Ok(())
+    }
+}
+
+/// A create/modify/remove (renames count as modify) touching a dependency.
+pub fn is_relevant(event: &notify::Event, dependencies: &BTreeSet<PathBuf>) -> bool {
     matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) && event
-        .paths
-        .iter()
-        .any(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("ts" | "js")))
+    ) && event.paths.iter().any(|p| dependencies.contains(p))
 }
 
 #[cfg(test)]
@@ -256,15 +325,27 @@ mod tests {
             Pipeline::new(self.root(), KernelChoice::Truck).unwrap()
         }
 
+        fn write(&self, relative: &str, source: &str) {
+            let path = self.root().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+
         /// Starts the watcher thread and waits until it is watching.
         fn watch(&self) -> (Receiver<SceneUpdate>, JoinHandle<notify::Result<()>>) {
-            let (tx, rx) = mpsc::channel();
-            let (root, model, pipeline) = (self.root().to_path_buf(), self.model(), self.pipeline());
-            let handle = thread::spawn(move || watch_and_reload(&root, &model, pipeline, tx));
-            // The watcher registers asynchronously; give it a moment before editing.
-            thread::sleep(Duration::from_millis(300));
-            (rx, handle)
+            watch_model(self.model())
         }
+    }
+
+    /// Evaluates `model` once (as main() does), then starts the watcher on it.
+    fn watch_model(model: PathBuf) -> (Receiver<SceneUpdate>, JoinHandle<notify::Result<()>>) {
+        let (tx, rx) = mpsc::channel();
+        let mut pipeline = Pipeline::new(&project_root(&model), KernelChoice::Truck).unwrap();
+        pipeline.evaluate(&model);
+        let handle = thread::spawn(move || watch_and_reload(&model, pipeline, tx));
+        // The watcher registers asynchronously; give it a moment before editing.
+        thread::sleep(Duration::from_millis(300));
+        (rx, handle)
     }
 
     fn cube_source(size: u32) -> String {
@@ -429,17 +510,12 @@ mod tests {
     }
 
     #[test]
-    fn watch_dirs_add_model_dir_only_when_not_covered() {
+    fn first_eval_seeds_dependencies() {
         let project = Project::new(&cube_source(10));
-        let root = project.root();
-        let base = vec![root.join("models"), root.join("dsl")];
-
-        assert_eq!(watch_dirs(root, &project.model()), base);
-        assert_eq!(watch_dirs(root, &root.join("models/parts/leg.ts")), base);
-
-        let mut expected = base.clone();
-        expected.push(root.join("scratch"));
-        assert_eq!(watch_dirs(root, &root.join("scratch/try.ts")), expected);
+        let mut pipeline = project.pipeline();
+        assert!(pipeline.dependencies().is_empty());
+        pipeline.evaluate(&project.model());
+        assert!(pipeline.dependencies().contains(&project.model()));
     }
 
     fn repo_root() -> PathBuf {
@@ -634,24 +710,104 @@ mod tests {
         }
     }
 
-    // --- Event filtering ----------------------------------------------------
+    // --- Dependencies and event filtering -------------------------------------
 
-    #[test]
-    fn script_edits_are_relevant() {
-        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Content));
-        assert!(is_relevant(&event(modify, "models/cube.ts")));
-        assert!(is_relevant(&event(modify, "dsl/cad.js")));
-        assert!(is_relevant(&event(EventKind::Create(CreateKind::File), "models/new.ts")));
-        assert!(is_relevant(&event(EventKind::Remove(notify::event::RemoveKind::File), "dsl/cad.ts")));
+    fn deps(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
     }
 
     #[test]
-    fn other_files_and_reads_are_ignored() {
+    fn dependency_changes_are_relevant() {
+        let deps = deps(&["models/cube.ts", "dsl/cad.ts"]);
         let modify = EventKind::Modify(ModifyKind::Data(DataChange::Content));
-        assert!(!is_relevant(&event(modify, "models/notes.md")));
-        assert!(!is_relevant(&event(modify, "models/.cube.ts.swp")));
-        assert!(!is_relevant(&event(modify, "models/no_extension")));
-        assert!(!is_relevant(&event(EventKind::Access(AccessKind::Any), "models/cube.ts")));
+        assert!(is_relevant(&event(modify, "models/cube.ts"), &deps));
+        assert!(is_relevant(&event(EventKind::Create(CreateKind::File), "dsl/cad.ts"), &deps));
+        assert!(is_relevant(
+            &event(EventKind::Remove(notify::event::RemoveKind::File), "dsl/cad.ts"),
+            &deps
+        ));
+        let rename_onto = EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::To));
+        assert!(is_relevant(&event(rename_onto, "models/cube.ts"), &deps));
+    }
+
+    #[test]
+    fn non_dependencies_and_reads_are_ignored() {
+        let deps = deps(&["models/cube.ts", "dsl/cad.ts"]);
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Content));
+        assert!(!is_relevant(&event(modify, "models/other.ts"), &deps));
+        assert!(!is_relevant(&event(modify, "models/notes.md"), &deps));
+        assert!(!is_relevant(&event(EventKind::Access(AccessKind::Any), "models/cube.ts"), &deps));
+    }
+
+    #[test]
+    fn watch_targets_are_dependency_folders() {
+        let project = Project::new(&cube_source(10));
+        let root = project.root();
+        project.write("lib/a.ts", "");
+        project.write("lib/b.ts", "");
+
+        let targets = watch_targets(&BTreeSet::from([
+            project.model(),
+            root.join("dsl/cad.ts"),
+            root.join("lib/a.ts"),
+            root.join("lib/b.ts"),
+        ]));
+        assert_eq!(
+            targets,
+            BTreeMap::from([
+                (root.join("dsl"), false),
+                (root.join("lib"), false),
+                (root.join("models"), false),
+            ])
+        );
+    }
+
+    #[test]
+    fn missing_folders_are_watched_from_nearest_existing_ancestor() {
+        let project = Project::new(&cube_source(10));
+        let root = project.root();
+        let targets = watch_targets(&BTreeSet::from([
+            project.model(),
+            root.join("parts/new/thing.ts"),
+        ]));
+        assert_eq!(
+            targets,
+            BTreeMap::from([(root.to_path_buf(), true), (root.join("models"), false)])
+        );
+    }
+
+    #[test]
+    fn pipeline_tracks_imports_and_keeps_them_across_failures() {
+        let project = Project::new(
+            "import { box } from \"../lib/parts.ts\";\nexport default () => box();\n",
+        );
+        project.write(
+            "lib/parts.ts",
+            "import { cube } from \"../dsl/cad.ts\";\nexport const box = () => cube(2);\n",
+        );
+        let mut pipeline = project.pipeline();
+        let all = BTreeSet::from([
+            project.model(),
+            project.root().join("lib/parts.ts"),
+            project.root().join("dsl/cad.ts"),
+        ]);
+
+        assert!(pipeline.evaluate(&project.model()).diagnostics[0].ok);
+        assert_eq!(pipeline.dependencies(), &all);
+
+        // Broken lib: the eval stops before reaching dsl/cad.ts, but the old
+        // set is kept so fixing either file triggers a reload.
+        project.write("lib/parts.ts", "export const box = () => {{;\n");
+        assert!(!pipeline.evaluate(&project.model()).diagnostics[0].ok);
+        assert_eq!(pipeline.dependencies(), &all);
+
+        // Success replaces the set: the lib import is gone.
+        project.write_model(&cube_source(1));
+        assert!(pipeline.evaluate(&project.model()).diagnostics[0].ok);
+        assert_eq!(
+            pipeline.dependencies(),
+            &BTreeSet::from([project.model(), project.root().join("dsl/cad.ts")])
+        );
     }
 
     // --- Hot reload (real file watcher, no window) ---------------------------
@@ -735,17 +891,111 @@ mod tests {
         std::fs::create_dir_all(model.parent().unwrap()).unwrap();
         std::fs::write(&model, cube_source(3)).unwrap();
 
-        let (tx, rx) = mpsc::channel();
-        let (root, watched) = (project_root(&model), model.clone());
-        let pipeline = Pipeline::new(&root, KernelChoice::Truck).unwrap();
-        thread::spawn(move || watch_and_reload(&root, &watched, pipeline, tx));
-        thread::sleep(Duration::from_millis(300));
+        let (rx, _handle) = watch_model(model.clone());
 
         std::fs::write(&model, cube_source(4)).unwrap();
 
         let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
         assert_eq!(max_extent(&update), 4.0);
+    }
+
+    /// Model importing `../lib/parts.ts`, which builds a cube of `size`.
+    fn project_with_lib(size: u32) -> Project {
+        let project = Project::new(
+            "import { part } from \"../lib/parts.ts\";\nexport default () => part();\n",
+        );
+        project.write("lib/parts.ts", &lib_source(size));
+        project
+    }
+
+    fn lib_source(size: u32) -> String {
+        format!("import {{ cube }} from \"../dsl/cad.ts\";\nexport const part = () => cube({size});\n")
+    }
+
+    #[test]
+    fn reloads_when_imported_lib_changes() {
+        // lib/ is neither models/ nor dsl/: only import tracking can see it.
+        let project = project_with_lib(2);
+        let (rx, _handle) = project.watch();
+
+        project.write("lib/parts.ts", &lib_source(5));
+
+        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        assert_eq!(max_extent(&update), 5.0);
+    }
+
+    #[test]
+    fn newly_added_import_is_watched() {
+        let project = Project::new(&cube_source(1));
+        project.write("lib/parts.ts", &lib_source(3));
+        let (rx, _handle) = project.watch();
+
+        project.write_model(
+            "import { part } from \"../lib/parts.ts\";\nexport default () => part();\n",
+        );
+        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("reload")), 3.0);
+
+        project.write("lib/parts.ts", &lib_source(4));
+        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("lib reload")), 4.0);
+    }
+
+    #[test]
+    fn unrelated_model_edit_does_not_reload() {
+        let project = Project::new(&cube_source(1));
+        project.write("models/other.ts", &cube_source(2));
+        let (rx, _handle) = project.watch();
+
+        project.write("models/other.ts", &cube_source(3));
+
+        assert!(rx.recv_timeout(QUIET).is_err(), "edit to a non-dependency reloaded");
+    }
+
+    #[test]
+    fn recovers_when_broken_import_is_fixed() {
+        let project = project_with_lib(2);
+        let (rx, _handle) = project.watch();
+
+        project.write("lib/parts.ts", "export const part = ( => ;\n");
+        let broken = rx.recv_timeout(RELOAD_TIMEOUT).expect("error update");
+        assert!(!broken.diagnostics[0].ok);
+
+        project.write("lib/parts.ts", &lib_source(6));
+        let fixed = rx.recv_timeout(RELOAD_TIMEOUT).expect("recovery");
+        assert!(fixed.diagnostics[0].ok, "{:?}", fixed.diagnostics);
+        assert_eq!(max_extent(&fixed), 6.0);
+    }
+
+    #[test]
+    fn reloads_when_missing_import_is_created() {
+        let project = Project::new(
+            "import { part } from \"../parts/new/thing.ts\";\nexport default () => part();\n",
+        );
+        let (rx, _handle) = project.watch();
+
+        project.write("parts/new/thing.ts", &lib_source(7).replace("../dsl", "../../dsl"));
+
+        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
+        assert_eq!(max_extent(&update), 7.0);
+    }
+
+    #[test]
+    fn reloads_on_atomic_rename_save() {
+        let project = Project::new(&cube_source(1));
+        let (rx, _handle) = project.watch();
+
+        // How many editors save: write a temp file, then rename it over the original.
+        let temp = project.root().join("models/.model.ts.tmp");
+        std::fs::write(&temp, cube_source(8)).unwrap();
+        std::fs::rename(&temp, project.model()).unwrap();
+
+        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("reload")), 8.0);
+
+        // The watch survived the replace: a second save still reloads.
+        std::fs::write(&temp, cube_source(9)).unwrap();
+        std::fs::rename(&temp, project.model()).unwrap();
+        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("second reload")), 9.0);
     }
 
     #[test]

@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        if let Err(e) = watch_and_reload(&root, &model, pipeline, tx.clone()) {
+        if let Err(e) = watch_and_reload(&model, pipeline, tx.clone()) {
             let _ = tx.send(SceneUpdate::error(format!("file watcher stopped: {e}")));
         }
     });

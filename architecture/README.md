@@ -109,11 +109,23 @@ cad-app [MODEL] [--kernel truck|occ]   # MODEL defaults to models/cube.ts; CAD_K
   with code 2 before opening a window.
 - The **project root** is the nearest ancestor of the model that contains
   `dsl/cad.ts`, or the model's own folder for a standalone script. It bounds
-  imports and decides what gets watched.
-- **Watching.** `models/`, `dsl/` and the model's own folder are watched
-  recursively. A `.ts`/`.js` create, modify or remove event starts a 150 ms
-  debounce, then one re-evaluation. The watcher thread exits when the viewer
-  drops the channel.
+  what scripts can import.
+- **Import-aware watching.** The script host records every file an eval
+  reads: the model plus its transitive imports, including ones that failed
+  to load. The pipeline keeps this as the model's dependencies. A successful
+  eval replaces the set. A failed one adds to it, so fixing a broken import
+  still reloads even if the failure stopped later imports from loading.
+- After each eval, the watcher re-syncs to the folder of each dependency,
+  watched non-recursively. Watching folders rather than files survives
+  editors that save by writing a temp file and renaming it over the original.
+  For a missing import whose folder doesn't exist yet, the nearest existing
+  ancestor is watched recursively.
+- Only create, modify or remove events (renames count as modify) for an
+  actual dependency start the 150 ms debounce and one re-evaluation. Editing
+  another model doesn't reload this one. The watcher thread exits when the
+  viewer drops the channel.
+- Imports whose bindings are never used are dropped by the TS transpiler and
+  never loaded, so they're correctly not dependencies.
 
 ## Viewer
 
@@ -146,15 +158,13 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Import-aware watching.** Watch the files a model actually imported,
-   not fixed folders.
-2. **Rotation.** `rotate(shape, axis, degrees)`, so print layouts can
+1. **Rotation.** `rotate(shape, axis, degrees)`, so print layouts can
    reorient parts that aren't boxes.
-3. **Named parts.** A `part("name", shape)` node, kept through tessellation,
+2. **Named parts.** A `part("name", shape)` node, kept through tessellation,
    so export and UI can address parts.
-4. **3MF export.** One object per part with colors, from either view
+3. **3MF export.** One object per part with colors, from either view
    (`--export out.3mf`).
-5. **Booleans.** Union, difference and intersection via truck-shapeops, so
+4. **Booleans.** Union, difference and intersection via truck-shapeops, so
    colored parts can be real non-overlapping bodies and holes become
    possible.
 

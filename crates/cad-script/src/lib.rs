@@ -1,4 +1,7 @@
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Once;
 
 use cad_ir::ModelViews;
@@ -36,12 +39,19 @@ impl From<RsError> for ScriptError {
 pub trait ScriptHost {
     fn eval_source(&mut self, filename: &str, source: &str) -> Result<ModelViews, ScriptError>;
     fn eval_file(&mut self, path: &Path) -> Result<ModelViews, ScriptError>;
+
+    /// Files the last eval read or tried to read (the model file and every
+    /// import, including ones that failed to load), whether or not it succeeded.
+    /// This is what hot reload should watch.
+    fn last_dependencies(&self) -> &BTreeSet<PathBuf>;
 }
 
 /// Host-side file reads for relative TS imports (`../dsl/cad.ts`), limited to
 /// files under `root`. The JS sandbox stays closed; only the Rust loader touches disk.
 struct HostFsImports {
     root: PathBuf,
+    /// Every file `import` was asked for during this eval.
+    requested: Rc<RefCell<BTreeSet<PathBuf>>>,
 }
 
 impl HostFsImports {
@@ -85,6 +95,8 @@ impl ImportProvider for HostFsImports {
     ) -> Option<Result<String, ModuleLoaderError>> {
         self.allowed_path(specifier).map(|result| {
             let path = result?;
+            // Record before reading: a missing import should reload once it's created.
+            self.requested.borrow_mut().insert(path.clone());
             std::fs::read_to_string(&path).map_err(|e| {
                 ModuleLoaderError::generic(format!("failed to read {}: {e}", path.display()))
             })
@@ -96,6 +108,7 @@ impl ImportProvider for HostFsImports {
 /// so edited modules are never served from V8's module map (hot reload).
 pub struct RustyScriptHost {
     import_root: PathBuf,
+    dependencies: BTreeSet<PathBuf>,
 }
 
 impl RustyScriptHost {
@@ -106,22 +119,29 @@ impl RustyScriptHost {
             rustyscript::init_platform(0, false);
         });
         let import_root = absolute(import_root.as_ref())?;
-        Ok(Self { import_root })
+        Ok(Self {
+            import_root,
+            dependencies: BTreeSet::new(),
+        })
     }
 
-    fn runtime(&self) -> Result<Runtime, ScriptError> {
-        Ok(Runtime::new(RuntimeOptions {
-            import_provider: Some(Box::new(HostFsImports {
-                root: self.import_root.clone(),
-            })),
-            ..Default::default()
-        })?)
-    }
-
-    fn eval_module(&self, module: &Module) -> Result<ModelViews, ScriptError> {
-        let mut runtime = self.runtime()?;
-        let handle = runtime.load_module(module)?;
-        call_model(&mut runtime, &handle)
+    /// Runs `module`, recording `entry` (the module's own file, if any) and every
+    /// import it requests into `self.dependencies`.
+    fn eval_module(&mut self, module: &Module, entry: Option<PathBuf>) -> Result<ModelViews, ScriptError> {
+        let requested = Rc::new(RefCell::new(BTreeSet::from_iter(entry)));
+        let result = (|| {
+            let mut runtime = Runtime::new(RuntimeOptions {
+                import_provider: Some(Box::new(HostFsImports {
+                    root: self.import_root.clone(),
+                    requested: requested.clone(),
+                })),
+                ..Default::default()
+            })?;
+            let handle = runtime.load_module(module)?;
+            call_model(&mut runtime, &handle)
+        })();
+        self.dependencies = requested.take();
+        result
     }
 }
 
@@ -162,16 +182,25 @@ fn absolute(path: &Path) -> Result<PathBuf, ScriptError> {
 
 impl ScriptHost for RustyScriptHost {
     fn eval_source(&mut self, filename: &str, source: &str) -> Result<ModelViews, ScriptError> {
-        self.eval_module(&Module::new(self.import_root.join(filename), source))
+        let module = Module::new(self.import_root.join(filename), source);
+        self.eval_module(&module, None)
     }
 
     fn eval_file(&mut self, path: &Path) -> Result<ModelViews, ScriptError> {
         let path = absolute(path)?;
-        let module = Module::load(&path).map_err(|source| ScriptError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        self.eval_module(&module)
+        let module = match Module::load(&path) {
+            Ok(module) => module,
+            Err(source) => {
+                // Still a dependency: creating the file should trigger a reload.
+                self.dependencies = BTreeSet::from([path.clone()]);
+                return Err(ScriptError::Io { path, source });
+            }
+        };
+        self.eval_module(&module, Some(path))
+    }
+
+    fn last_dependencies(&self) -> &BTreeSet<PathBuf> {
+        &self.dependencies
     }
 }
 
@@ -554,6 +583,75 @@ mod tests {
             .eval_file(&repo_root().join("models/square.ts"))
             .unwrap_err();
         assert!(err.to_string().contains("is outside"), "{err}");
+    }
+
+    /// Dependencies relative to the repo root, as forward-slash strings.
+    fn relative_deps(host: &RustyScriptHost) -> Vec<String> {
+        let root = absolute(&repo_root()).unwrap();
+        host.last_dependencies()
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap_or_else(|_| panic!("{} outside repo", p.display()))
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn records_model_file_and_its_imports() {
+        let mut host = host();
+        host.eval_file(&repo_root().join("models/bookshelf.ts")).unwrap();
+        assert_eq!(relative_deps(&host), ["dsl/cad.ts", "models/bookshelf.ts"]);
+    }
+
+    #[test]
+    fn records_transitive_imports_from_source() {
+        let mut host = host();
+        host.eval_source(
+            "test_model.ts",
+            r#"import { bookshelf } from "./models/bookshelf.ts";
+            export default () => bookshelf();"#,
+        )
+        .unwrap();
+        // Inline source has no file of its own; bookshelf.ts pulls in the DSL.
+        assert_eq!(relative_deps(&host), ["dsl/cad.ts", "models/bookshelf.ts"]);
+    }
+
+    // Note: TS drops imports whose bindings are never used, so such files are
+    // never loaded and correctly aren't dependencies. The tests below use theirs.
+    #[test]
+    fn records_dependencies_of_failed_evals() {
+        let mut host = host();
+        let err = host
+            .eval_source(
+                "test_model.ts",
+                r#"import { cube } from "./dsl/cad.ts";
+                import { nope } from "./models/does_not_exist.ts";
+                export default () => nope ?? cube(1);"#,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("does_not_exist"), "{err}");
+        let deps = relative_deps(&host);
+        assert!(deps.contains(&"models/does_not_exist.ts".to_string()), "{deps:?}");
+    }
+
+    #[test]
+    fn missing_model_file_is_its_own_dependency() {
+        let mut host = host();
+        let missing = repo_root().join("models/not_yet.ts");
+        assert!(host.eval_file(&missing).is_err());
+        assert_eq!(relative_deps(&host), ["models/not_yet.ts"]);
+    }
+
+    #[test]
+    fn dependencies_reset_between_evals() {
+        let mut host = host();
+        host.eval_file(&repo_root().join("models/bookshelf.ts")).unwrap();
+        host.eval_source("plain.ts", "export default () => ({ kind: 'Rect', width: 1, height: 1 });")
+            .unwrap();
+        assert!(host.last_dependencies().is_empty(), "{:?}", host.last_dependencies());
     }
 
     #[test]
