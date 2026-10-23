@@ -1,0 +1,11 @@
+[package]
+name = "cad-kernel-truck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-ir.workspace = true
+cad-kernel.workspace = true
+truck-meshalgo = "0.4"
+truck-modeling = "0.6"
