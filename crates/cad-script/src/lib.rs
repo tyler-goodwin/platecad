@@ -274,6 +274,7 @@ mod tests {
                     height: 10.0
                 }),
                 distance: 10.0,
+                direction: None,
             }
         );
     }
@@ -297,6 +298,7 @@ mod tests {
                     height: 2.0
                 }),
                 distance: 3.0,
+                direction: None,
             }
         );
     }
@@ -414,6 +416,7 @@ mod tests {
                 height: 1.0,
             }),
             distance: 1.0,
+            direction: None,
         }
     }
 
@@ -572,6 +575,35 @@ mod tests {
             );
             let err = eval(&source).unwrap_err().to_string();
             assert!(err.contains(message), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn dsl_sweeps() {
+        let spec = eval(
+            r#"import { extrude, rect } from "./dsl/cad.ts";
+            export default () => extrude(rect({ width: 1, height: 1 }), { distance: 2, direction: [0, 0, -3] });"#,
+        )
+        .unwrap();
+        assert!(matches!(spec, ModelSpec::Extrude { direction: Some([0.0, 0.0, -3.0]), .. }), "{spec:?}");
+
+        let spec = eval(
+            r#"import { revolve, rect } from "./dsl/cad.ts";
+            export default () => revolve(rect({ width: 1, height: 1 }));"#,
+        )
+        .unwrap();
+        assert!(matches!(spec, ModelSpec::Revolve { degrees, .. } if degrees == 360.0), "{spec:?}");
+
+        for bad in [
+            "extrude(rect({ width: 1, height: 1 }), { distance: 1, direction: [0, 0, 0] })",
+            "revolve(rect({ width: 1, height: 1 }), { degrees: 0 })",
+            "revolve(rect({ width: 1, height: 1 }), { degrees: 400 })",
+        ] {
+            let source = format!(
+                r#"import {{ extrude, revolve, rect }} from "./dsl/cad.ts";
+                export default () => {bad};"#
+            );
+            assert!(eval(&source).is_err(), "{bad} accepted");
         }
     }
 

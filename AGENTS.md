@@ -42,7 +42,7 @@ cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|
 | `crates/cad-view-threed` | three-d + egui window. |
 | `crates/cad-export` | `TessellatedScene` to 3MF (welded, watertight, one object per part). |
 | `crates/cad-app` | Binary plus library: CLI (clap), `Pipeline`, file watcher, `export_3mf`. Most integration tests live here. |
-| `dsl/cad.ts` | The TS DSL: `rect`, `polygon`, `circle`, `cutout`, `extrude`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `color`, `part`, `arrange`. |
+| `dsl/cad.ts` | The TS DSL: `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `color`, `part`, `arrange`. |
 | `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`). The user edits these live. |
 | `printer.toml` | Optional bed size, used by `arrange` in print views. Watched like an import. |
 | `architecture/` | Living design docs. Update them with every change. |
@@ -106,8 +106,12 @@ non-exhaustive `match` error, but not always.
   panics when faces line up exactly, so the kernel wraps it in
   `catch_unwind` and returns a hinted error. Model subtractively, with
   cutters that overshoot the faces they cut through.
-- **Bounds come from sampled edges** (64 segments per curved edge), which
-  is exact for extrusions. Mesh bounds of curved shapes are inscribed
+- **Profiles are wound counter-clockwise about +Z.** Sweeps must face the
+  face along the sweep direction (`facing`), or the solid comes out
+  inside-out with negative volume. The export volume tests catch this.
+- **Bounds come from sampled edges plus tessellation vertices** (64
+  segments per curved edge). That's exact for extrusions and within 0.01 mm
+  for bulging surfaces like a torus. Mesh bounds of curved shapes are inscribed
   polygons, so compare them with the tessellation tolerance (0.01 mm), not
   1e-4. Inscribed holes leave slightly more material: volumes can land a
   little above *or* below the exact value.

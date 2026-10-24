@@ -66,9 +66,18 @@ pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
             outer: boxed(outer),
             holes: all(holes),
         },
-        ModelSpec::Extrude { profile, distance } => ModelSpec::Extrude {
+        ModelSpec::Extrude {
+            profile,
+            distance,
+            direction,
+        } => ModelSpec::Extrude {
             profile: boxed(profile),
             distance,
+            direction,
+        },
+        ModelSpec::Revolve { profile, degrees } => ModelSpec::Revolve {
+            profile: boxed(profile),
+            degrees,
         },
         ModelSpec::Translate { offset, shape } => ModelSpec::Translate {
             offset,

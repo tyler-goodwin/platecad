@@ -22,16 +22,16 @@ the improvement.
   debug build (truck intersecting a curved surface). Fine for export, but
   sluggish for hot reload. Cache results per subtree, or prefer `cutout`
   for straight-through holes.
-- **Sweeps beyond +Z.** Extrude only goes along +Z. Add an extrude
-  direction, revolve and loft.
+- **Loft and sweep-along-path.** Extrude (any direction) and revolve exist.
+  Loft between profiles and sweeping along a curve don't.
 - **Fillets and chamfers.** These are common in printable parts. They're
   hard in truck, so maybe only once there's an OCC backend.
 - **Geometry queries from scripts.** Scripts can't measure anything, which
   is why `arrange` lives in the kernel. A hybrid query op such as
   `bounds(shape)` would let layouts and fits be written in TS.
-- **Curved-surface bounds.** Bounds come from sampled edges, which is
-  exact for extrusions. A revolve or other surface bulging between its
-  edges will need surface sampling.
+- **Cheaper bounds.** Bounds tessellate each shell an extra time (on top
+  of the tessellation for display). Cache that tessellation, or sample
+  surfaces directly.
 
 ## Print workflow
 

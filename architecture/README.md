@@ -63,7 +63,8 @@ kernel and renderer can each be swapped without touching the others.
 | `Circle { radius }` | Planar circle in XY, centered on the origin. It extrudes into a cylinder with smooth side normals. |
 | `Cutout { outer, holes }` | A profile with holes (coplanar profiles, holes inside the outline). Hole wires are oriented against the outline using a Newell normal. No boolean is involved, so lined-up faces never fail. |
 | `Polygon { points }` | Planar simple polygon in XY from its outline. Either winding is normalized to counter-clockwise, and the closing point is implied. Fewer than 3 points, repeated points, self-intersection and zero area are rejected. Non-convex shapes (L, U) tessellate and export correctly. |
-| `Extrude { profile, distance }` | Sweeps a 2D profile along +Z into a solid. |
+| `Extrude { profile, distance, direction? }` | Sweeps a 2D profile `distance` mm along `direction` (normalized, default +Z) into a solid. The face is flipped to point along the sweep (every profile is wound counter-clockwise about +Z), so solids are never inside-out. A direction lying in the profile's plane is an error. |
+| `Revolve { profile, degrees }` | Lathe: the profile is drawn in XY with X as the radius and Y as the height, stood up into XZ, and spun around +Z (default 360°). It must stay at x >= 0; touching the axis is fine (a solid knob). |
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
@@ -91,11 +92,12 @@ the failing cases, so a truck upgrade that fixes them will show up.
 ### Curved edges and bounds
 
 Line edges are their two endpoints. Curved edges (circles, and boolean
-intersection curves) are sampled into 64 segments. Those samples are both
-the viewer's edge lines and the points used for B-rep bounds (`arrange`,
-boolean overlap checks). That's exact wherever a face's extremes lie on its
-edges, which holds for planar faces and extrusion sides; a surface bulging
-between its edges (a future revolve) will need surface sampling. Mesh
+intersection curves) are sampled into 64 segments, which are the viewer's
+edge lines. B-rep bounds (`arrange`, boolean overlap checks) use those
+samples plus the shell's tessellation vertices. The edge samples make
+extrusions exact; the tessellation catches surfaces that bulge between
+their edges (a torus's outer equator isn't an edge), within the tessellation
+tolerance. Mesh
 bounds of curved shapes are within the tessellation tolerance (0.01 mm), so
 tests compare them with that tolerance.
 
@@ -268,8 +270,8 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Extrude direction and revolve,** then geometry queries from scripts
-   (see the Modeling section of improvements.md).
+1. **Geometry queries from scripts** (see the Modeling section of
+   improvements.md).
 
 Out of scope for now: OCC linkage, picking and measurements, constraint
 sketching, per-face painting.

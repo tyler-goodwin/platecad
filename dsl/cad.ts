@@ -31,6 +31,13 @@ export type ExtrudeSpec = {
   kind: "Extrude";
   profile: ProfileSpec;
   distance: number;
+  direction?: Vec3;
+};
+
+export type RevolveSpec = {
+  kind: "Revolve";
+  profile: ProfileSpec;
+  degrees: number;
 };
 
 export type TranslateSpec = {
@@ -95,6 +102,7 @@ export type ModelSpec =
   | CircleSpec
   | CutoutSpec
   | ExtrudeSpec
+  | RevolveSpec
   | TranslateSpec
   | RotateSpec
   | GroupSpec
@@ -161,10 +169,34 @@ export function cutout(outer: ProfileSpec, ...holes: ProfileSpec[]): CutoutSpec 
   return { kind: "Cutout", outer, holes };
 }
 
-/** Sweeps a 2D profile along +Z into a solid. */
-export function extrude(profile: ProfileSpec, opts: { distance: number }): ExtrudeSpec {
+/**
+ * Sweeps a 2D profile into a solid: `distance` mm along `direction`
+ * (default +Z; any length, it's normalized).
+ */
+export function extrude(profile: ProfileSpec, opts: { distance: number; direction?: Vec3 }): ExtrudeSpec {
   positive("extrude distance", opts.distance);
-  return { kind: "Extrude", profile, distance: opts.distance };
+  const spec: ExtrudeSpec = { kind: "Extrude", profile, distance: opts.distance };
+  if (opts.direction) {
+    const d = opts.direction;
+    if (d.length !== 3 || !d.every(Number.isFinite) || d.every((c) => c === 0)) {
+      throw new Error(`extrude direction must be a non-zero [x, y, z] (got ${JSON.stringify(d)})`);
+    }
+    spec.direction = [d[0], d[1], d[2]];
+  }
+  return spec;
+}
+
+/**
+ * Lathe: draw the profile in XY with X as the radius and Y as the height; it
+ * is spun around +Z, so the result stands on the XY plane. Keep the profile
+ * at x >= 0. `degrees` defaults to a full turn.
+ */
+export function revolve(profile: ProfileSpec, opts: { degrees?: number } = {}): RevolveSpec {
+  const degrees = opts.degrees ?? 360;
+  if (!(degrees > 0 && degrees <= 360)) {
+    throw new Error(`revolve degrees must be in (0, 360] (got ${degrees})`);
+  }
+  return { kind: "Revolve", profile, degrees };
 }
 
 /** Moves a shape by `offset`. */

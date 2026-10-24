@@ -27,12 +27,14 @@ fn edge_points(edge: &Edge) -> Vec<Point3> {
         .collect()
 }
 
-/// Points that bound a shell: its edges, sampled. Exact for faces whose
-/// extremes lie on their edges (planar faces, and the sides of extrusions);
-/// a curved surface bulging between its edges (e.g. a future revolve) would
-/// need the surface sampled too.
+/// Points that bound a shell: its sampled edges (exact where a face's
+/// extremes lie on its edges, e.g. extrusions) plus its tessellation's
+/// vertices (within the tessellation tolerance for surfaces that bulge
+/// between their edges, e.g. a torus's outer equator).
 fn shell_points(shell: &Shell) -> impl Iterator<Item = Point3> + '_ {
-    shell.edge_iter().flat_map(|edge| edge_points(&edge))
+    let mesh = shell.triangulation(TESSELLATION_TOL).to_polygon();
+    let surface: Vec<Point3> = mesh.positions().to_vec();
+    shell.edge_iter().flat_map(|edge| edge_points(&edge)).chain(surface)
 }
 
 fn bounds_of(points: impl Iterator<Item = Point3>) -> Option<(Point3, Point3)> {
@@ -113,14 +115,29 @@ fn build_bodies(
             shell: Shell::from(vec![build_face(spec)?]),
             style: style.clone(),
         }]),
-        ModelSpec::Extrude { profile, distance } => {
+        ModelSpec::Extrude {
+            profile,
+            distance,
+            direction,
+        } => {
             if !(*distance > 0.0) {
                 return Err(KernelError::Invalid(
                     "extrude distance must be positive".into(),
                 ));
             }
-            let face = build_face(profile)?;
-            let solid = builder::tsweep(&face, Vector3::new(0.0, 0.0, *distance));
+            let direction = match direction {
+                None => Vector3::new(0.0, 0.0, 1.0),
+                Some(d) => {
+                    let v = to_vector(*d);
+                    let length = v.magnitude();
+                    if !(length > 1e-12 && length.is_finite()) {
+                        return Err(KernelError::Invalid("extrude direction must be a non-zero vector".into()));
+                    }
+                    v / length
+                }
+            };
+            let face = facing(build_face(profile)?, direction)?;
+            let solid = builder::tsweep(&face, direction * *distance);
             let shell = solid
                 .into_boundaries()
                 .into_iter()
@@ -130,6 +147,30 @@ fn build_bodies(
                 shell,
                 style: profile_style(profile, style.clone()),
             }])
+        }
+        ModelSpec::Revolve { profile, degrees } => {
+            if !(*degrees > 0.0 && *degrees <= 360.0) {
+                return Err(KernelError::Invalid("revolve degrees must be in (0, 360]".into()));
+            }
+            let face = build_face(profile)?;
+            let (min, max) = bounds_of(face.boundaries().iter().flat_map(wire_points)).unwrap();
+            if min.z.abs() > 1e-9 || max.z.abs() > 1e-9 {
+                return Err(KernelError::Invalid("revolve profile must lie in the XY plane".into()));
+            }
+            if min.x < -1e-9 {
+                return Err(KernelError::Invalid(
+                    "revolve profile must stay on the x >= 0 side of the axis".into(),
+                ));
+            }
+            // Stand the profile up (its Y becomes Z), then spin it around Z.
+            let origin = Point3::new(0.0, 0.0, 0.0);
+            let upright = builder::rotated(&face, origin, Vector3::new(1.0, 0.0, 0.0), Rad(std::f64::consts::FRAC_PI_2));
+            // Standing up turns the +Z normal into -Y, but on the +X side a
+            // positive turn about Z sweeps toward +Y: face the sweep, or the
+            // solid comes out inside-out.
+            let upright = facing(upright, Vector3::new(0.0, 1.0, 0.0))?;
+            let solid: Solid = builder::rsweep(&upright, origin, Vector3::new(0.0, 0.0, 1.0), Rad(degrees.to_radians()));
+            Ok(bodies_of(solid, &profile_style(profile, style.clone())))
         }
         ModelSpec::Translate { offset, shape } => Ok(build_bodies(shape, style, plates)?
             .into_iter()
@@ -566,6 +607,7 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
             build_face(shape)
         }
         ModelSpec::Extrude { .. }
+        | ModelSpec::Revolve { .. }
         | ModelSpec::Group { .. }
         | ModelSpec::Arrange { .. }
         | ModelSpec::Union { .. }
@@ -641,6 +683,20 @@ fn validate_polygon(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, KernelError> {
         pts.reverse();
     }
     Ok(pts)
+}
+
+/// `face` oriented so its normal points along `direction` (sweeping against
+/// the normal would make an inside-out solid). Every profile `build_face`
+/// makes has its boundary wound counter-clockwise about +Z.
+fn facing(face: Face, direction: Vector3) -> Result<Face, KernelError> {
+    let normal = face.boundaries().first().map(wire_normal).unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+    let along = normal.dot(direction) / normal.magnitude().max(1e-300);
+    if along.abs() < 1e-6 {
+        return Err(KernelError::Invalid(
+            "extrude direction lies in the profile's plane: it would sweep no volume".into(),
+        ));
+    }
+    Ok(if along < 0.0 { face.inverse() } else { face })
 }
 
 fn wire_points(wire: &Wire) -> impl Iterator<Item = Point3> + '_ {
@@ -749,6 +805,7 @@ mod tests {
         ModelSpec::Extrude {
             profile: Box::new(profile),
             distance,
+            direction: None,
         }
     }
 
@@ -1715,6 +1772,80 @@ mod tests {
         assert!(err.contains("inside the outer profile"), "{err}");
         // A cutout is a profile, not a solid.
         assert!(TruckKernel.build(&cutout(extrude(rect(1.0, 1.0), 1.0), vec![circle(0.1)])).is_err());
+    }
+
+    fn extrude_along(profile: ModelSpec, distance: f64, direction: [f64; 3]) -> ModelSpec {
+        ModelSpec::Extrude {
+            profile: Box::new(profile),
+            distance,
+            direction: Some(direction),
+        }
+    }
+
+    fn revolve(profile: ModelSpec, degrees: f64) -> ModelSpec {
+        ModelSpec::Revolve {
+            profile: Box::new(profile),
+            degrees,
+        }
+    }
+
+    #[test]
+    fn extrude_follows_its_direction() {
+        let down = TruckKernel.build(&extrude_along(rect(2.0, 3.0), 4.0, [0.0, 0.0, -1.0])).unwrap();
+        assert_aabb(&down, [0.0, 0.0, -4.0], [2.0, 3.0, 0.0]);
+        // Normalized: length 5 or 1, same result.
+        let slanted = TruckKernel.build(&extrude_along(rect(2.0, 3.0), 4.0, [0.0, 3.0, 4.0])).unwrap();
+        assert_aabb(&slanted, [0.0, 0.0, 0.0], [2.0, 3.0 + 2.4, 3.2]);
+        // A profile stood up (rotated into XZ) extruded along +Y.
+        let standing = rotate([1.0, 0.0, 0.0], 90.0, [0.0; 3], rect(2.0, 3.0));
+        let wall = TruckKernel.build(&extrude_along(standing, 5.0, [0.0, 1.0, 0.0])).unwrap();
+        assert_aabb(&wall, [0.0, 0.0, 0.0], [2.0, 5.0, 3.0]);
+    }
+
+    #[test]
+    fn extrude_rejects_bad_directions() {
+        for (direction, why) in [([0.0; 3], "non-zero"), ([1.0, 0.0, 0.0], "lies in the profile's plane")] {
+            let err = TruckKernel.build(&extrude_along(rect(1.0, 1.0), 1.0, direction)).unwrap_err();
+            assert!(err.to_string().contains(why), "{err}");
+        }
+    }
+
+    #[test]
+    fn revolve_turns_xy_profiles_around_z() {
+        // A 5..10 x 0..20 rect makes a tube standing on the XY plane.
+        let tube = TruckKernel
+            .build(&revolve(translate([5.0, 0.0, 0.0], rect(5.0, 20.0)), 360.0))
+            .unwrap();
+        assert_mesh_bounds(&tube, [-10.0, -10.0, 0.0], [10.0, 10.0, 20.0]);
+        // Inner wall at radius 5.
+        assert!(tube
+            .positions
+            .iter()
+            .any(|p| ((p[0] * p[0] + p[1] * p[1]).sqrt() - 5.0).abs() < 1e-3));
+
+        let quarter = TruckKernel
+            .build(&revolve(translate([5.0, 0.0, 0.0], rect(5.0, 20.0)), 90.0))
+            .unwrap();
+        assert_mesh_bounds(&quarter, [0.0, 0.0, 0.0], [10.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn bounds_include_surfaces_that_bulge_between_edges() {
+        // Torus: the outer equator isn't an edge, but arrange must still see it.
+        let torus = revolve(translate([20.0, 0.0, 0.0], circle(5.0)), 360.0);
+        let scene = TruckKernel.build(&arrange(0.0, vec![torus])).unwrap();
+        assert_mesh_bounds(&scene, [-25.0, -25.0, 0.0], [25.0, 25.0, 10.0]);
+    }
+
+    #[test]
+    fn revolve_rejects_bad_profiles() {
+        let crosses = revolve(translate([-1.0, 0.0, 0.0], rect(2.0, 1.0)), 360.0);
+        assert!(TruckKernel.build(&crosses).unwrap_err().to_string().contains("x >= 0"));
+        let tilted = revolve(rotate([1.0, 0.0, 0.0], 30.0, [0.0; 3], translate([1.0, 0.0, 0.0], rect(1.0, 1.0))), 360.0);
+        assert!(TruckKernel.build(&tilted).unwrap_err().to_string().contains("XY plane"));
+        for degrees in [0.0, -10.0, 361.0, f64::NAN] {
+            assert!(TruckKernel.build(&revolve(translate([1.0, 0.0, 0.0], rect(1.0, 1.0)), degrees)).is_err());
+        }
     }
 
     #[test]

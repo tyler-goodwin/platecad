@@ -282,6 +282,7 @@ mod tests {
         ModelSpec::Extrude {
             profile: Box::new(rect(x, y)),
             distance: z,
+            direction: None,
         }
     }
 
@@ -401,6 +402,7 @@ mod tests {
         let prism = ModelSpec::Extrude {
             profile: Box::new(u),
             distance: 10.0,
+            direction: None,
         };
         let object = &objects(&build(&part("holder", prism)))[0];
         assert!(object.is_closed());
@@ -445,6 +447,7 @@ mod tests {
             ModelSpec::Extrude {
                 profile: Box::new(ModelSpec::Circle { radius: 3.0 }),
                 distance: 6.0,
+                direction: None,
             },
         );
         let spec = ModelSpec::Difference {
@@ -465,6 +468,7 @@ mod tests {
         let extrude = |profile: ModelSpec, distance: f64| ModelSpec::Extrude {
             profile: Box::new(profile),
             distance,
+            direction: None,
         };
         let cutout = |outer: ModelSpec, holes: Vec<ModelSpec>| ModelSpec::Cutout {
             outer: Box::new(outer),
@@ -487,6 +491,50 @@ mod tests {
             let got = signed_volume(object);
             assert!((got - volume).abs() < volume * 0.005, "{name}: {got} vs {volume}");
         }
+    }
+
+    #[test]
+    fn sweeps_export_closed_outward_with_the_right_volume() {
+        use std::f64::consts::PI;
+        let along = |profile: ModelSpec, distance: f64, direction: [f64; 3]| ModelSpec::Extrude {
+            profile: Box::new(profile),
+            distance,
+            direction: Some(direction),
+        };
+        let revolve = |profile: ModelSpec, degrees: f64| ModelSpec::Revolve {
+            profile: Box::new(profile),
+            degrees,
+        };
+        let ring = || translate([5.0, 0.0, 0.0], rect(5.0, 20.0));
+        let cases = [
+            ("extrude down", along(rect(2.0, 3.0), 4.0, [0.0, 0.0, -1.0]), 24.0),
+            // Oblique prism: base area x height along Z (4 * 0.8).
+            ("extrude slanted", along(rect(2.0, 3.0), 4.0, [0.0, 3.0, 4.0]), 6.0 * 3.2),
+            ("tube", revolve(ring(), 360.0), PI * (100.0 - 25.0) * 20.0),
+            ("quarter tube", revolve(ring(), 90.0), PI * (100.0 - 25.0) * 20.0 / 4.0),
+            // Pappus: 2 pi R x area.
+            ("torus", revolve(translate([20.0, 0.0, 0.0], ModelSpec::Circle { radius: 5.0 }), 360.0), 2.0 * PI * 20.0 * PI * 25.0),
+        ];
+        for (name, spec, volume) in cases {
+            let object = &objects(&build(&part(name, spec)))[0];
+            assert!(object.is_closed(), "{name} not watertight");
+            let got = signed_volume(object);
+            assert!((got - volume).abs() < volume * 0.005, "{name}: {got} vs {volume}");
+        }
+    }
+
+    #[test]
+    fn revolving_a_profile_that_touches_the_axis() {
+        use std::f64::consts::PI;
+        // A solid knob drawn from the axis out: rect 0..10 x 0..5.
+        let spec = ModelSpec::Revolve {
+            profile: Box::new(rect(10.0, 5.0)),
+            degrees: 360.0,
+        };
+        let object = &objects(&build(&part("knob", spec)))[0];
+        assert!(object.is_closed());
+        let volume = PI * 100.0 * 5.0;
+        assert!((signed_volume(object) - volume).abs() < volume * 0.005, "{}", signed_volume(object));
     }
 
     #[test]

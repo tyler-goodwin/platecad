@@ -26,10 +26,21 @@ pub enum ModelSpec {
         outer: Box<ModelSpec>,
         holes: Vec<ModelSpec>,
     },
-    /// Sweeps a 2D `profile` along +Z by `distance` into a solid.
+    /// Sweeps a 2D `profile` by `distance` along `direction` (normalized;
+    /// default +Z) into a solid.
     Extrude {
         profile: Box<ModelSpec>,
         distance: f64,
+        #[serde(default)]
+        direction: Option<[f64; 3]>,
+    },
+    /// Lathe: the profile is drawn in XY with X as the radius and Y as the
+    /// height, then spun `degrees` (default a full turn) around +Z. The
+    /// profile must stay on the x >= 0 side of the axis.
+    Revolve {
+        profile: Box<ModelSpec>,
+        #[serde(default = "full_turn")]
+        degrees: f64,
     },
     /// Moves `shape` by `offset` (2D profiles stay profiles; solids stay solids).
     Translate {
@@ -91,6 +102,10 @@ pub struct Bed {
 pub struct Plate {
     pub min: [f32; 2],
     pub size: [f32; 2],
+}
+
+fn full_turn() -> f64 {
+    360.0
 }
 
 /// The ways a model can be shown. `print` is optional: models without one are
@@ -358,6 +373,17 @@ mod tests {
     }
 
     #[test]
+    fn sweeps_match_ts_shape_with_defaults() {
+        let rect = r#"{"kind":"Rect","width":1,"height":1}"#;
+        let json = format!(r#"{{"kind":"Extrude","profile":{rect},"distance":2,"direction":[1,0,0]}}"#);
+        let ModelSpec::Extrude { direction, .. } = serde_json::from_str(&json).unwrap() else { panic!() };
+        assert_eq!(direction, Some([1.0, 0.0, 0.0]));
+        let json = format!(r#"{{"kind":"Revolve","profile":{rect}}}"#);
+        let ModelSpec::Revolve { degrees, .. } = serde_json::from_str(&json).unwrap() else { panic!() };
+        assert_eq!(degrees, 360.0);
+    }
+
+    #[test]
     fn part_matches_ts_shape() {
         let json = r#"{"kind":"Part","name":"leg","shape":{"kind":"Rect","width":1,"height":1}}"#;
         let spec: ModelSpec = serde_json::from_str(json).unwrap();
@@ -464,6 +490,7 @@ mod tests {
                     height: 10.0
                 }),
                 distance: 10.0,
+                direction: None,
             }
         );
     }
