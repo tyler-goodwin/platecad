@@ -37,6 +37,20 @@ pub struct ExportObject {
 }
 
 impl ExportObject {
+    /// Enclosed volume (mm³) via the divergence theorem. Positive when
+    /// triangles wind outward; only meaningful for closed objects.
+    pub fn signed_volume(&self) -> f64 {
+        self.triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| self.vertices[i as usize].map(f64::from));
+                (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                    / 6.0
+            })
+            .sum()
+    }
+
     /// Closed and consistently oriented (what slicers need): every directed
     /// edge appears exactly once and its reverse exactly once. Several
     /// disjoint closed shells in one object are fine.
@@ -335,18 +349,8 @@ mod tests {
         }
     }
 
-    /// Signed volume via the divergence theorem; positive means outward normals.
     fn signed_volume(object: &ExportObject) -> f64 {
-        object
-            .triangles
-            .iter()
-            .map(|t| {
-                let [a, b, c] = t.map(|i| object.vertices[i as usize].map(f64::from));
-                (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
-                    + a[2] * (b[0] * c[1] - b[1] * c[0]))
-                    / 6.0
-            })
-            .sum()
+        object.signed_volume()
     }
 
     #[test]

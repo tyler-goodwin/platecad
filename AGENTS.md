@@ -24,6 +24,9 @@ cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|
 ```
 
 - The first build compiles V8 and takes a while. Later builds are fast.
+- The OCC kernel links a prebuilt static OCCT cached under `target/`. If a
+  build fails in `cadrum`'s build script ("max_headers_size"), follow
+  "Building with OCC" in architecture/README.md.
 - A `LNK4098 libcmt.lib` linker warning on Windows is expected; it comes
   from V8.
 - `cargo test` prints "future incompatibility" notes for `nom`/`quick-xml`.
@@ -34,9 +37,9 @@ cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|
 | Path | Role |
 |---|---|
 | `crates/cad-ir` | Serde IR shared by everything: `ModelSpec`, `Views<T>`/`ModelViews`, `TessellatedScene`, `ScenePart`, `Rgb`. No kernel or renderer types. |
-| `crates/cad-kernel` | `Kernel` trait and `KernelError`. |
+| `crates/cad-kernel` | `Kernel` trait, `KernelError`, and shared `pack` and `validate_polygon`. |
 | `crates/cad-kernel-truck` | The real kernel: spec tree to bodies (`build_bodies`), then tessellation (normals, colors, edges, part ranges). |
-| `crates/cad-kernel-occ` | OpenCascade stub that always returns `Unsupported`. |
+| `crates/cad-kernel-occ` | OpenCascade kernel via cadrum. `tests/conformance.rs` keeps it in step with truck. |
 | `crates/cad-script` | `ScriptHost` trait and the rustyscript host: sandboxed imports and dependency tracking. |
 | `crates/cad-view` | `SceneUpdate`, view selection logic, `ViewportApp` trait (no GPU code). |
 | `crates/cad-view-threed` | three-d + egui window. |
@@ -72,7 +75,8 @@ non-exhaustive `match` error, but not always.
 
 1. `cad-ir`: the variant, with a doc comment, plus a JSON test matching the
    TS shape.
-2. `cad-kernel-truck`:
+2. Both kernels: `cad-kernel-truck` and `cad-kernel-occ` (add a
+   conformance case too). In `cad-kernel-truck`:
    - `build_bodies` (solids and transforms);
    - `build_face` if it can wrap a 2D profile;
    - `profile_style` if it carries style (color or part name) that an

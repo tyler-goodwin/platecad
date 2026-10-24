@@ -43,9 +43,9 @@ kernel and renderer can each be swapped without touching the others.
 | Crate | Role |
 |---|---|
 | `cad-ir` | Serde interchange: `ModelSpec`, `Views<T>`/`ModelViews`, `TessellatedScene`, `Diagnostic`, `Rgb`. No kernel or renderer types. |
-| `cad-kernel` | `trait Kernel { fn build(&mut self, &ModelSpec) -> Result<TessellatedScene> }` and `KernelError`. |
+| `cad-kernel` | `trait Kernel { fn build(&mut self, &ModelSpec) -> Result<TessellatedScene> }`, `KernelError`, and logic every kernel shares: `pack` (arrange layout) and `validate_polygon`. |
 | `cad-kernel-truck` | truck B-rep implementation: builds shells, tessellates, emits normals, colors and edges. |
-| `cad-kernel-occ` | OpenCascade placeholder that returns `Unsupported`, keeping the slot honest. |
+| `cad-kernel-occ` | OpenCascade backend via cadrum (statically linked OCCT 8.0.1). Spike: everything except bare 2D profiles at the top of a view. |
 | `cad-script` | `trait ScriptHost` plus the rustyscript implementation and its sandboxed import loader. |
 | `cad-view` | `SceneUpdate`, `SceneViews`, `ViewMode`/`ViewSelection` (pure view logic) and `trait ViewportApp`. |
 | `cad-view-threed` | three-d window: orbit camera, lighting, edge cylinders, egui overlay. |
@@ -138,6 +138,40 @@ Scripts return a serde document rather than calling the kernel as they run.
 The cost is that scripts can't query geometry (bounding boxes, areas, edge
 picks). That's why `Arrange` is a kernel node rather than DSL code. The way
 out is a hybrid: keep emitting specs, and add query ops later.
+
+## Kernels: truck and OCC
+
+Select one with `--kernel truck|occ` (default `truck`). Both take the same
+IR and produce the same `TessellatedScene` (parts, colors, plates, edges).
+`crates/cad-kernel-occ/tests/conformance.rs` holds them to that: 14 shared
+cases must match on bounds (0.05 mm), volume (0.5%), part names, colors and
+plates, with every exported object closed.
+
+| | truck | OCC (cadrum) |
+|---|---|---|
+| Booleans with lined-up faces | Fail or panic (caught, hinted error) | Work (shared planes, touching solids, flush cutters) |
+| Implicit boolean curves | Can hang tessellation; made explicit right after each boolean | Not an issue |
+| Desk organizer export (debug) | ~1.1 s | ~0.4 s |
+| Coaster set export (debug) | ~0.2 s | ~0.3 s |
+| Bare 2D profile shown on its own | Yes | Not yet (spike gap) |
+| Fillets, chamfers, loft, sweep, STEP | No | Available in cadrum, not exposed yet |
+| Build | Pure Rust | Links a 118 MB prebuilt static OCCT; see below |
+
+**Building with OCC.** cadrum's build script downloads a prebuilt static
+OCCT from the cadrum author's GitHub releases (a third-party binary, not
+Open Cascade's own) and caches it under `target/`. Its HTTP client fails on
+GitHub's redirect ("headers' total size surpassed max_headers_size"). The
+workaround is to fetch the same asset with curl and point the build at it
+once; after that the cache is used until `cargo clean`:
+
+```sh
+curl -fL -o occt.tar.gz https://github.com/lzpel/cadrum/releases/download/occt-8_0_1_rev3/occt-8_0_1_rev3-x86_64_pc_windows_msvc.tar.gz
+CADRUM_PREBUILT_URL=file:///absolute/path/to/occt.tar.gz cargo build
+```
+
+cadrum's `source` feature builds Open Cascade's own sources instead (needs
+CMake, 10 to 30 minutes). OCCT is LGPL-2.1, linked statically: fine for
+local use, but distributing the binary carries relinking obligations.
 
 ## Script host
 

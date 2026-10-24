@@ -33,6 +33,21 @@ the improvement.
   of the tessellation for display). Cache that tessellation, or sample
   surfaces directly.
 
+## OCC kernel (spike follow-ups)
+
+- **Make OCC the default?** It handles everything truck does (conformance
+  suite) plus coplanar booleans, and is faster on curved booleans.
+- **Bare 2D profiles.** OCC rejects a top-level profile (`square.ts`). Build
+  a face from the edge loops and mesh it.
+- **Expose OCC-only features.** Fillets and chamfers (need a way to pick
+  edges in the IR), loft, sweep along a path, shell (hollowing), STEP
+  export.
+- **Reproducible OCCT fetch.** The documented curl workaround is manual.
+  Vendor a fetch script, or switch to cadrum's `source` build (official
+  sources; needs CMake).
+- **Drop truck's workarounds** (explicit curves, coplanar hints) if OCC
+  becomes the only kernel.
+
 ## Print workflow
 
 - **Smarter packing.** `Arrange` packs in input order, row by row, and never

@@ -680,7 +680,12 @@ mod tests {
 
     #[test]
     fn kernel_error_names_the_kernel() {
-        let project = Project::new(&cube_source(10));
+        // A bare 2D rect: the OCC kernel builds solids only (for now).
+        let project = Project::new(
+            "import { rect } from \"../dsl/cad.ts\";
+export default () => rect({ width: 1, height: 1 });
+",
+        );
         let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
         let update = pipeline.evaluate(&project.model());
 
@@ -910,6 +915,32 @@ mod tests {
             }
         }
         assert!(count >= 4, "expected square, cube, bookshelf and coasters; found {count}");
+    }
+
+    #[test]
+    fn every_repo_model_builds_with_occ_or_is_a_known_gap() {
+        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Occ).unwrap();
+        for entry in std::fs::read_dir(repo_root().join("models")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "ts") {
+                continue;
+            }
+            let update = pipeline.evaluate(&path);
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name == "square.ts" {
+                // Spike gap: OCC builds solids only, and square.ts is a bare rect.
+                assert!(update.diagnostics[0].message.contains("solids only"), "{:?}", update.diagnostics);
+                continue;
+            }
+            assert!(update.diagnostics[0].ok, "{name}: {:?}", update.diagnostics);
+            let views = update.views.unwrap();
+            for scene in std::iter::once(&views.assembled).chain(views.print.as_ref()) {
+                for object in cad_export::objects(scene) {
+                    assert!(object.is_closed(), "{name}: {} not closed", object.name);
+                    assert!(object.signed_volume() > 0.0, "{name}: {} inside-out", object.name);
+                }
+            }
+        }
     }
 
     /// Bookshelf views through the real script host and truck kernel.
