@@ -18,14 +18,9 @@ the improvement.
   exist. Add polylines with arcs, rounded rectangles, and slots.
 - **Hide seam edges.** A cylinder shows the seam edges truck puts on its
   side face. Skip edges whose two faces meet smoothly (tangent normals).
-- **Slow curved booleans.** Subtracting a cylinder takes about 3 s in a
-  debug build (truck intersecting a curved surface). Fine for export, but
-  sluggish for hot reload. Cache results per subtree, or prefer `cutout`
-  for straight-through holes.
-- **Loft and sweep-along-path.** Extrude (any direction) and revolve exist.
-  Loft between profiles and sweeping along a curve don't.
-- **Fillets and chamfers.** These are common in printable parts. They're
-  hard in truck, so maybe only once there's an OCC backend.
+- **Slow curved booleans (truck only).** Subtracting a cylinder takes about
+  3 s in a debug build with `--kernel truck`; OCC, the default, does it in
+  milliseconds. Matters only if truck stays around.
 - **Geometry queries from scripts.** Scripts can't measure anything, which
   is why `arrange` lives in the kernel. A hybrid query op such as
   `bounds(shape)` would let layouts and fits be written in TS.

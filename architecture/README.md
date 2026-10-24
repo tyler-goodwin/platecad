@@ -15,11 +15,12 @@ flowchart LR
   ts["models/*.ts + dsl/cad.ts"] --> script["cad-script (rustyscript)"]
   script -->|"ModelViews: assembled + print? (serde IR)"| pipeline["cad-app Pipeline"]
   pipeline -->|"ModelSpec per view"| kernel["Kernel trait"]
-  kernel --> truck["cad-kernel-truck"]
-  kernel -.-> occ["cad-kernel-occ (stub)"]
-  truck -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
+  kernel --> occ["cad-kernel-occ (default, OCCT via cadrum)"]
+  kernel -.->|"--kernel truck, or fallback for bare 2D"| truck["cad-kernel-truck"]
+  occ -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
+  truck --> update
   update --> view["cad-view-threed (three-d + egui)"]
-  truck -->|"--export"| export["cad-export (3MF)"]
+  occ -->|"--export"| export["cad-export (3MF)"]
   watch["notify watcher"] -->|"debounced reload"| pipeline
 ```
 
@@ -304,7 +305,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 |---|---|
 | `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
 | `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
-| `models/rounded_box.ts` | A small open-top box (60 × 40 × 30 mm by default) with rounded vertical corners and even 3 mm walls and floor: a `|Z`-filleted block minus a cavity filleted with the outer radius minus the wall, which overshoots the top. OCC-only. |
+| `models/rounded_box.ts` | An open-top box with rounded vertical corners and even walls and floor (`roundedBox()` defaults: 60 × 40 × 30 mm, 3 mm walls; the file's default export may override them): a `|Z`-filleted block minus a cavity filleted with the outer radius minus the wall, which overshoots the top. OCC-only. |
 | `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). Fillets round the plate's and holder's vertical corners, and a 0.8 mm chamfer on the cup's bottom edge stops the first layer flaring, so it's OCC-only. It prints as three closed parts on one 256 mm plate. |
 | `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a tray with a floor and three walls, open at the front: a box minus an overshooting cutter. Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
 
@@ -331,5 +332,5 @@ land.
 1. **Geometry queries from scripts** (see the Modeling section of
    improvements.md).
 
-Out of scope for now: OCC linkage, picking and measurements, constraint
-sketching, per-face painting.
+Out of scope for now: picking and measurements, constraint sketching,
+per-face painting.
