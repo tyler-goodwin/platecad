@@ -60,6 +60,8 @@ kernel and renderer can each be swapped without touching the others.
 | Node | Meaning |
 |---|---|
 | `Rect { width, height }` | Planar rectangle in XY, corner at the origin. |
+| `Circle { radius }` | Planar circle in XY, centered on the origin. It extrudes into a cylinder with smooth side normals. |
+| `Cutout { outer, holes }` | A profile with holes (coplanar profiles, holes inside the outline). Hole wires are oriented against the outline using a Newell normal. No boolean is involved, so lined-up faces never fail. |
 | `Polygon { points }` | Planar simple polygon in XY from its outline. Either winding is normalized to counter-clockwise, and the closing point is implied. Fewer than 3 points, repeated points, self-intersection and zero area are rejected. Non-convex shapes (L, U) tessellate and export correctly. |
 | `Extrude { profile, distance }` | Sweeps a 2D profile along +Z into a solid. |
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
@@ -85,6 +87,17 @@ a block and subtract cutters that overshoot the faces they cut through. The
 coaster holder is a box minus a cutter poking out of the top and front. A
 caught panic still prints truck's panic message to stderr. Kernel tests pin
 the failing cases, so a truck upgrade that fixes them will show up.
+
+### Curved edges and bounds
+
+Line edges are their two endpoints. Curved edges (circles, and boolean
+intersection curves) are sampled into 64 segments. Those samples are both
+the viewer's edge lines and the points used for B-rep bounds (`arrange`,
+boolean overlap checks). That's exact wherever a face's extremes lie on its
+edges, which holds for planar faces and extrusion sides; a surface bulging
+between its edges (a future revolve) will need surface sampling. Mesh
+bounds of curved shapes are within the tessellation tolerance (0.01 mm), so
+tests compare them with that tolerance.
 
 `TessellatedScene` holds GPU-ready triangles: positions, normals and sRGB
 colors (one per vertex, de-indexed so corners stay crisp), plus indices and an
@@ -213,8 +226,11 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
   into a trailing `unnamed` object. Every object is a build item, with no
   transforms, since geometry is already placed. Units are millimeters.
 - **Watertight meshes.** The viewer mesh duplicates corner vertices per face
-  normal. Export welds vertices by position (1e-5 mm), so a box is 8
-  vertices and 12 triangles with manifold edges. Tests check that every edge
+  normal. Export welds vertices within 1e-5 mm, so a box is 8 vertices and
+  12 triangles with manifold edges. The weld checks neighbouring grid cells,
+  not just rounded keys: boolean output computes shared points twice with
+  float noise, and plain rounding split such pairs across a cell boundary,
+  leaving cracks. Tests check that every edge
   is shared by exactly two triangles in opposite directions, and that signed
   volume is positive (outward normals).
 - **Colors.** Distinct colors become one core-spec `basematerials` group with
@@ -252,9 +268,8 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Profiles with holes and circles,** then bounds for curved shapes,
-   then extrude direction and revolve (see the Modeling section of
-   improvements.md).
+1. **Extrude direction and revolve,** then geometry queries from scripts
+   (see the Modeling section of improvements.md).
 
 Out of scope for now: OCC linkage, picking and measurements, constraint
 sketching, per-face painting.

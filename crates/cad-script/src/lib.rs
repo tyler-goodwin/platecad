@@ -549,6 +549,33 @@ mod tests {
     }
 
     #[test]
+    fn dsl_circle_and_cutout() {
+        let spec = eval(
+            r#"import { circle, cutout } from "./dsl/cad.ts";
+            export default () => cutout(circle(10), circle(2, { at: [3, 4] }));"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Cutout {
+                outer: Box::new(ModelSpec::Circle { radius: 10.0 }),
+                holes: vec![ModelSpec::Translate {
+                    offset: [3.0, 4.0, 0.0],
+                    shape: Box::new(ModelSpec::Circle { radius: 2.0 }),
+                }],
+            }
+        );
+        for (bad, message) in [("circle(0)", "circle radius"), ("cutout(circle(1))", "at least one hole")] {
+            let source = format!(
+                r#"import {{ circle, cutout }} from "./dsl/cad.ts";
+                export default () => {bad};"#
+            );
+            let err = eval(&source).unwrap_err().to_string();
+            assert!(err.contains(message), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"

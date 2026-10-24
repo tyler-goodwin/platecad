@@ -24,6 +24,9 @@ export type PolygonSpec = {
   points: [number, number][];
 };
 
+export type CircleSpec = { kind: "Circle"; radius: number };
+export type CutoutSpec = { kind: "Cutout"; outer: ProfileSpec; holes: ProfileSpec[] };
+
 export type ExtrudeSpec = {
   kind: "Extrude";
   profile: ProfileSpec;
@@ -76,11 +79,21 @@ export type ArrangeSpec = {
 };
 
 /** 2D shapes that can be swept into solids. */
-export type ProfileSpec = RectSpec | PolygonSpec | TranslateSpec | RotateSpec | ColorSpec | PartSpec;
+export type ProfileSpec =
+  | RectSpec
+  | PolygonSpec
+  | CircleSpec
+  | CutoutSpec
+  | TranslateSpec
+  | RotateSpec
+  | ColorSpec
+  | PartSpec;
 
 export type ModelSpec =
   | RectSpec
   | PolygonSpec
+  | CircleSpec
+  | CutoutSpec
   | ExtrudeSpec
   | TranslateSpec
   | RotateSpec
@@ -127,6 +140,25 @@ export function polygon(points: [number, number][]): PolygonSpec {
     }
   }
   return { kind: "Polygon", points: points.map(([x, y]) => [x, y]) };
+}
+
+/** Circle in the XY plane, centered on `at` (default the origin). */
+export function circle(radius: number, opts: { at?: [number, number] } = {}): CircleSpec | TranslateSpec {
+  positive("circle radius", radius);
+  const spec: CircleSpec = { kind: "Circle", radius };
+  return opts.at ? translate(spec, [opts.at[0], opts.at[1], 0]) : spec;
+}
+
+/**
+ * A profile with holes: `outer` minus each hole (all flat in the same plane).
+ * Holes must sit inside the outline without touching each other. Unlike a
+ * 3D difference, this never fails on lined-up faces.
+ */
+export function cutout(outer: ProfileSpec, ...holes: ProfileSpec[]): CutoutSpec {
+  if (holes.length === 0) {
+    throw new Error("cutout needs at least one hole");
+  }
+  return { kind: "Cutout", outer, holes };
 }
 
 /** Sweeps a 2D profile along +Z into a solid. */

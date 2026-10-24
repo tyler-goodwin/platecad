@@ -3,11 +3,48 @@ use std::collections::{HashMap, HashSet};
 use cad_ir::{Bed, DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
-use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Solid, Vector3, Wire, builder};
+use truck_modeling::{
+    BoundedCurve, Curve, Edge, Face, InnerSpace, ParametricCurve, Point3, Rad, Shell, Solid, Vector3,
+    Wire, builder,
+};
 
 const TESSELLATION_TOL: f64 = 0.01;
 /// Geometric tolerance for truck-shapeops, mm.
 const BOOLEAN_TOL: f64 = 0.05;
+/// Segments per curved edge when drawing edges and measuring bounds.
+const CURVE_SEGMENTS: usize = 64;
+
+/// Points along an edge, start to end: its endpoints for a line, samples
+/// along the curve otherwise.
+fn edge_points(edge: &Edge) -> Vec<Point3> {
+    let curve = edge.oriented_curve();
+    if matches!(curve, Curve::Line(_)) {
+        return vec![edge.front().point(), edge.back().point()];
+    }
+    let (t0, t1) = curve.range_tuple();
+    (0..=CURVE_SEGMENTS)
+        .map(|i| curve.subs(t0 + (t1 - t0) * i as f64 / CURVE_SEGMENTS as f64))
+        .collect()
+}
+
+/// Points that bound a shell: its edges, sampled. Exact for faces whose
+/// extremes lie on their edges (planar faces, and the sides of extrusions);
+/// a curved surface bulging between its edges (e.g. a future revolve) would
+/// need the surface sampled too.
+fn shell_points(shell: &Shell) -> impl Iterator<Item = Point3> + '_ {
+    shell.edge_iter().flat_map(|edge| edge_points(&edge))
+}
+
+fn bounds_of(points: impl Iterator<Item = Point3>) -> Option<(Point3, Point3)> {
+    let mut points = points;
+    let first = points.next()?;
+    Some(points.fold((first, first), |(min, max), p| {
+        (
+            Point3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z)),
+            Point3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z)),
+        )
+    }))
+}
 
 #[derive(Debug, Default)]
 pub struct TruckKernel;
@@ -69,7 +106,10 @@ fn build_bodies(
     plates: &mut Vec<Plate>,
 ) -> Result<Vec<Body>, KernelError> {
     match spec {
-        ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } => Ok(vec![Body {
+        ModelSpec::Rect { .. }
+        | ModelSpec::Polygon { .. }
+        | ModelSpec::Circle { .. }
+        | ModelSpec::Cutout { .. } => Ok(vec![Body {
             shell: Shell::from(vec![build_face(spec)?]),
             style: style.clone(),
         }]),
@@ -358,14 +398,7 @@ fn bodies_of(solid: Solid, style: &Style) -> Vec<Body> {
 }
 
 fn solid_bounds(solid: &Solid) -> Option<(Point3, Point3)> {
-    let mut points = solid.boundaries().iter().flat_map(|s| s.vertex_iter()).map(|v| v.point());
-    let first = points.next()?;
-    Some(points.fold((first, first), |(min, max), p| {
-        (
-            Point3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z)),
-            Point3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z)),
-        )
-    }))
+    bounds_of(solid.boundaries().iter().flat_map(shell_points))
 }
 
 /// Whether two solids' bounding boxes overlap with positive volume.
@@ -386,20 +419,9 @@ fn validate_part_name(name: &str) -> Result<String, KernelError> {
     Ok(trimmed.to_string())
 }
 
-/// Bounding box of the bodies' B-rep vertices. Exact for the planar faces we
-/// build today; curved faces would need their surfaces sampled.
+/// Bounding box of the bodies' (sampled) edges; see [`shell_points`].
 fn bodies_bounds(bodies: &[Body]) -> Option<(Point3, Point3)> {
-    let mut points = bodies
-        .iter()
-        .flat_map(|body| body.shell.vertex_iter())
-        .map(|v| v.point());
-    let first = points.next()?;
-    Some(points.fold((first, first), |(min, max), p| {
-        (
-            Point3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z)),
-            Point3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z)),
-        )
-    }))
+    bounds_of(bodies.iter().flat_map(|body| shell_points(&body.shell)))
 }
 
 /// Style set inside a profile (innermost wins), which its extrusion inherits
@@ -423,6 +445,7 @@ fn profile_style(spec: &ModelSpec, inherited: Style) -> Style {
         ModelSpec::Translate { shape, .. } | ModelSpec::Rotate { shape, .. } => {
             profile_style(shape, inherited)
         }
+        ModelSpec::Cutout { outer, .. } => profile_style(outer, inherited),
         _ => inherited,
     }
 }
@@ -483,6 +506,49 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
                 .collect();
             builder::try_attach_plane(&[Wire::from(edges)])
                 .map_err(|e| KernelError::Message(format!("polygon face failed: {e}")))
+        }
+        ModelSpec::Circle { radius } => {
+            if !(*radius > 0.0 && radius.is_finite()) {
+                return Err(KernelError::Invalid("circle radius must be positive".into()));
+            }
+            let start = builder::vertex(Point3::new(*radius, 0.0, 0.0));
+            let wire: Wire = builder::rsweep(
+                &start,
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                Rad(std::f64::consts::TAU),
+            );
+            builder::try_attach_plane(&[wire])
+                .map_err(|e| KernelError::Message(format!("circle face failed: {e}")))
+        }
+        ModelSpec::Cutout { outer, holes } => {
+            if holes.is_empty() {
+                return Err(KernelError::Invalid("cutout needs at least one hole".into()));
+            }
+            let outer_face = build_face(outer)?;
+            let outer_wires = outer_face.boundaries();
+            let Some(outer_wire) = outer_wires.first() else {
+                return Err(KernelError::Invalid("cutout outer profile has no outline".into()));
+            };
+            let normal = wire_normal(outer_wire);
+            let (omin, omax) = bounds_of(outer_wires.iter().flat_map(wire_points)).unwrap();
+            let mut wires = outer_wires.clone();
+            for hole in holes {
+                for wire in build_face(hole)?.boundaries() {
+                    let (hmin, hmax) = bounds_of(wire_points(&wire)).unwrap();
+                    let inside = (0..3).all(|i| hmin[i] >= omin[i] - 1e-9 && hmax[i] <= omax[i] + 1e-9);
+                    if !inside {
+                        return Err(KernelError::Invalid("cutout hole must lie inside the outer profile".into()));
+                    }
+                    // Holes run against the outline.
+                    wires.push(if wire_normal(&wire).dot(normal) > 0.0 { wire.inverse() } else { wire });
+                }
+            }
+            builder::try_attach_plane(&wires).map_err(|e| {
+                KernelError::Invalid(format!(
+                    "cutout failed ({e}): holes must be coplanar with the outline, inside it and not touching"
+                ))
+            })
         }
         ModelSpec::Translate { offset, shape } => {
             Ok(builder::translated(&build_face(shape)?, to_vector(*offset)))
@@ -577,6 +643,22 @@ fn validate_polygon(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, KernelError> {
     Ok(pts)
 }
 
+fn wire_points(wire: &Wire) -> impl Iterator<Item = Point3> + '_ {
+    wire.edge_iter().flat_map(|edge| edge_points(edge))
+}
+
+/// Newell's normal of a closed wire (its orientation, scaled by its area).
+fn wire_normal(wire: &Wire) -> Vector3 {
+    let points: Vec<Point3> = wire_points(wire).collect();
+    let mut n = Vector3::new(0.0, 0.0, 0.0);
+    for (a, b) in points.iter().zip(points.iter().cycle().skip(1)) {
+        n.x += (a.y - b.y) * (a.z + b.z);
+        n.y += (a.z - b.z) * (a.x + b.x);
+        n.z += (a.x - b.x) * (a.y + b.y);
+    }
+    n
+}
+
 fn to_vector([x, y, z]: [f64; 3]) -> Vector3 {
     Vector3::new(x, y, z)
 }
@@ -613,10 +695,11 @@ fn tessellate_into(scene: &mut TessellatedScene, body: &Body) {
     let mut seen = HashSet::new();
     for edge in body.shell.edge_iter() {
         if seen.insert(edge.id()) {
-            let a = edge.front().point();
-            let b = edge.back().point();
-            scene.edges.push(to_f32(a.x, a.y, a.z));
-            scene.edges.push(to_f32(b.x, b.y, b.z));
+            for pair in edge_points(&edge).windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                scene.edges.push(to_f32(a.x, a.y, a.z));
+                scene.edges.push(to_f32(b.x, b.y, b.z));
+            }
         }
     }
 
@@ -1527,6 +1610,111 @@ mod tests {
         assert!(TruckKernel.build(&union(vec![])).is_err());
         assert!(TruckKernel.build(&difference(ten(), vec![])).is_err());
         assert!(TruckKernel.build(&extrude(union(vec![ten()]), 1.0)).is_err());
+    }
+
+    fn circle(radius: f64) -> ModelSpec {
+        ModelSpec::Circle { radius }
+    }
+
+    /// Mesh bounds of curved shapes: tessellated circles are inscribed
+    /// polygons, so allow the tessellation tolerance.
+    fn assert_mesh_bounds(scene: &TessellatedScene, min: [f32; 3], max: [f32; 3]) {
+        let aabb = scene.aabb().unwrap();
+        let tol = TESSELLATION_TOL as f32 + 1e-4;
+        for i in 0..3 {
+            assert!((aabb.min[i] - min[i]).abs() <= tol, "{aabb:?}");
+            assert!((aabb.max[i] - max[i]).abs() <= tol, "{aabb:?}");
+        }
+    }
+
+    fn cutout(outer: ModelSpec, holes: Vec<ModelSpec>) -> ModelSpec {
+        ModelSpec::Cutout {
+            outer: Box::new(outer),
+            holes,
+        }
+    }
+
+    #[test]
+    fn cylinder_has_round_bounds_and_smooth_sides() {
+        let scene = TruckKernel.build(&extrude(circle(10.0), 5.0)).unwrap();
+        assert_mesh_bounds(&scene, [-10.0, -10.0, 0.0], [10.0, 10.0, 5.0]);
+        // Side normals are horizontal and point outward (smooth, not faceted
+        // per triangle): each side vertex's normal is its radial direction.
+        let mut side = 0;
+        for (p, n) in scene.positions.iter().zip(&scene.normals) {
+            if n[2].abs() < 1e-3 {
+                side += 1;
+                let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                assert!((n[0] - p[0] / r).abs() < 1e-2 && (n[1] - p[1] / r).abs() < 1e-2, "{p:?} {n:?}");
+            }
+        }
+        assert!(side > 32, "too few side vertices: {side}");
+    }
+
+    #[test]
+    fn circle_edges_are_drawn_as_round_polylines() {
+        let scene = TruckKernel.build(&extrude(circle(10.0), 5.0)).unwrap();
+        let segments: Vec<_> = scene.edges.chunks_exact(2).collect();
+        let on_rim = |p: [f32; 3]| ((p[0] * p[0] + p[1] * p[1]).sqrt() - 10.0).abs() < 1e-3;
+        let rim = segments.iter().filter(|s| on_rim(s[0]) && on_rim(s[1]) && s[0][2] == s[1][2]).count();
+        // Both rims, finely sampled.
+        assert!(rim >= 2 * 32, "{rim} rim segments");
+    }
+
+    #[test]
+    fn arrange_measures_curved_parts_correctly() {
+        let scene = TruckKernel
+            .build(&arrange(5.0, vec![extrude(circle(10.0), 2.0), extrude(circle(10.0), 2.0)]))
+            .unwrap();
+        // Two 20 mm discs and a 5 mm gap, centered: no overlap. The B-rep
+        // bounds arrange uses are exact (x lands on +-22.5); the mesh is within
+        // tessellation tolerance.
+        assert_mesh_bounds(&scene, [-22.5, -10.0, 0.0], [22.5, 10.0, 2.0]);
+        let xs = scene.positions.iter().map(|p| p[0]);
+        let (lo, hi) = xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        assert!((lo + 22.5).abs() < 1e-4 && (hi - 22.5).abs() < 1e-4, "{lo} {hi}");
+    }
+
+    #[test]
+    fn cutout_profiles_extrude_to_holed_solids() {
+        let washer = TruckKernel.build(&extrude(cutout(circle(10.0), vec![circle(4.0)]), 2.0)).unwrap();
+        assert_mesh_bounds(&washer, [-10.0, -10.0, 0.0], [10.0, 10.0, 2.0]);
+        // Inner wall exists: vertices at radius 4.
+        assert!(washer
+            .positions
+            .iter()
+            .any(|p| ((p[0] * p[0] + p[1] * p[1]).sqrt() - 4.0).abs() < 1e-3));
+
+        let plate = cutout(
+            rect(40.0, 20.0),
+            vec![
+                translate([10.0, 10.0, 0.0], circle(3.0)),
+                polygon(&[[25.0, 5.0], [35.0, 5.0], [30.0, 15.0]]),
+            ],
+        );
+        let scene = TruckKernel.build(&extrude(plate, 3.0)).unwrap();
+        assert_aabb(&scene, [0.0; 3], [40.0, 20.0, 3.0]);
+    }
+
+    #[test]
+    fn cutout_hole_winding_doesnt_matter() {
+        let ccw = polygon(&[[5.0, 5.0], [10.0, 5.0], [10.0, 10.0], [5.0, 10.0]]);
+        let cw = polygon(&[[5.0, 5.0], [5.0, 10.0], [10.0, 10.0], [10.0, 5.0]]);
+        let a = TruckKernel.build(&extrude(cutout(rect(20.0, 20.0), vec![ccw]), 1.0)).unwrap();
+        let b = TruckKernel.build(&extrude(cutout(rect(20.0, 20.0), vec![cw]), 1.0)).unwrap();
+        assert_eq!(a.indices.len(), b.indices.len());
+    }
+
+    #[test]
+    fn rejects_bad_circles_and_cutouts() {
+        assert!(TruckKernel.build(&extrude(circle(0.0), 1.0)).is_err());
+        assert!(TruckKernel.build(&extrude(circle(f64::NAN), 1.0)).is_err());
+        assert!(TruckKernel.build(&extrude(cutout(rect(1.0, 1.0), vec![]), 1.0)).is_err());
+        let outside = cutout(rect(10.0, 10.0), vec![translate([20.0, 0.0, 0.0], circle(1.0))]);
+        let err = TruckKernel.build(&extrude(outside, 1.0)).unwrap_err().to_string();
+        assert!(err.contains("inside the outer profile"), "{err}");
+        // A cutout is a profile, not a solid.
+        assert!(TruckKernel.build(&cutout(extrude(rect(1.0, 1.0), 1.0), vec![circle(0.1)])).is_err());
     }
 
     #[test]

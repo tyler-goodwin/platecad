@@ -18,6 +18,14 @@ pub enum ModelSpec {
     /// Planar simple polygon in the XY plane, from its outline. Either winding;
     /// the closing point is implied.
     Polygon { points: Vec<[f64; 2]> },
+    /// Planar circle in the XY plane, centered on the origin.
+    Circle { radius: f64 },
+    /// A profile with holes: `outer` minus each of `holes`, all coplanar
+    /// profiles. Holes should sit inside `outer` without touching each other.
+    Cutout {
+        outer: Box<ModelSpec>,
+        holes: Vec<ModelSpec>,
+    },
     /// Sweeps a 2D `profile` along +Z by `distance` into a solid.
     Extrude {
         profile: Box<ModelSpec>,
@@ -334,6 +342,19 @@ mod tests {
         assert!(matches!(serde_json::from_str(&json).unwrap(), ModelSpec::Union { .. }));
         let json = format!(r#"{{"kind":"Intersect","children":[{rect}]}}"#);
         assert!(matches!(serde_json::from_str(&json).unwrap(), ModelSpec::Intersect { .. }));
+    }
+
+    #[test]
+    fn circle_and_cutout_match_ts_shape() {
+        let json = r#"{"kind":"Cutout","outer":{"kind":"Circle","radius":10},"holes":[{"kind":"Circle","radius":4}]}"#;
+        let spec: ModelSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Cutout {
+                outer: Box::new(ModelSpec::Circle { radius: 10.0 }),
+                holes: vec![ModelSpec::Circle { radius: 4.0 }],
+            }
+        );
     }
 
     #[test]

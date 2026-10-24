@@ -14,9 +14,14 @@ the improvement.
 - **Quiet boolean panics.** A caught truck panic still prints to stderr.
   A process-wide panic hook that silences panics from the kernel's boolean
   calls would keep the console clean.
-- **More profiles.** `Rect` and `Polygon` exist. Add circles, polylines
-  with arcs, and profiles with holes (truck's `try_attach_plane` takes
-  several wires).
+- **More profiles.** `Rect`, `Polygon`, `Circle` and `Cutout` (holes)
+  exist. Add polylines with arcs, rounded rectangles, and slots.
+- **Hide seam edges.** A cylinder shows the seam edges truck puts on its
+  side face. Skip edges whose two faces meet smoothly (tangent normals).
+- **Slow curved booleans.** Subtracting a cylinder takes about 3 s in a
+  debug build (truck intersecting a curved surface). Fine for export, but
+  sluggish for hot reload. Cache results per subtree, or prefer `cutout`
+  for straight-through holes.
 - **Sweeps beyond +Z.** Extrude only goes along +Z. Add an extrude
   direction, revolve and loft.
 - **Fillets and chamfers.** These are common in printable parts. They're
@@ -24,8 +29,9 @@ the improvement.
 - **Geometry queries from scripts.** Scripts can't measure anything, which
   is why `arrange` lives in the kernel. A hybrid query op such as
   `bounds(shape)` would let layouts and fits be written in TS.
-- **Curved-surface bounds.** `Arrange` measures B-rep vertices, which is
-  exact for planar faces only. Sample surfaces once curved faces exist.
+- **Curved-surface bounds.** Bounds come from sampled edges, which is
+  exact for extrusions. A revolve or other surface bulging between its
+  edges will need surface sampling.
 
 ## Print workflow
 

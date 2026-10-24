@@ -96,9 +96,45 @@ pub fn objects(scene: &TessellatedScene) -> Vec<ExportObject> {
         .collect()
 }
 
+/// Merges positions within [`WELD_TOLERANCE`] of each other. Points are
+/// bucketed on a tolerance-sized grid and matched against the neighbouring
+/// cells too, so two near-equal points straddling a cell boundary still merge
+/// (boolean results compute the same point twice with float noise).
+struct Welder {
+    cells: HashMap<[i64; 3], Vec<u32>>,
+}
+
+impl Welder {
+    fn cell(p: [f32; 3]) -> [i64; 3] {
+        p.map(|c| (c / WELD_TOLERANCE).floor() as i64)
+    }
+
+    fn index(&mut self, vertices: &mut Vec<[f32; 3]>, p: [f32; 3]) -> u32 {
+        let [cx, cy, cz] = Self::cell(p);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &i in self.cells.get(&[cx + dx, cy + dy, cz + dz]).into_iter().flatten() {
+                        let q = vertices[i as usize];
+                        let d2 = (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f32>();
+                        if d2 <= WELD_TOLERANCE * WELD_TOLERANCE {
+                            return i;
+                        }
+                    }
+                }
+            }
+        }
+        vertices.push(p);
+        let i = (vertices.len() - 1) as u32;
+        self.cells.entry([cx, cy, cz]).or_default().push(i);
+        i
+    }
+}
+
 fn weld(scene: &TessellatedScene, name: String, ranges: &[std::ops::Range<usize>]) -> ExportObject {
-    let key = |p: [f32; 3]| p.map(|c| (c / WELD_TOLERANCE).round() as i64);
-    let mut lookup: HashMap<[i64; 3], u32> = HashMap::new();
+    let mut welder = Welder {
+        cells: HashMap::new(),
+    };
     let mut object = ExportObject {
         name,
         vertices: Vec::new(),
@@ -107,13 +143,8 @@ fn weld(scene: &TessellatedScene, name: String, ranges: &[std::ops::Range<usize>
     };
     for range in ranges {
         for tri in scene.indices[range.clone()].chunks_exact(3) {
-            let welded = [tri[0], tri[1], tri[2]].map(|i| {
-                let p = scene.positions[i as usize];
-                *lookup.entry(key(p)).or_insert_with(|| {
-                    object.vertices.push(p);
-                    (object.vertices.len() - 1) as u32
-                })
-            });
+            let welded =
+                [tri[0], tri[1], tri[2]].map(|i| welder.index(&mut object.vertices, scene.positions[i as usize]));
             if welded[0] == welded[1] || welded[1] == welded[2] || welded[0] == welded[2] {
                 continue; // Degenerate after welding.
             }
@@ -318,6 +349,22 @@ mod tests {
     }
 
     #[test]
+    fn welding_merges_near_points_across_grid_cells() {
+        let mut welder = Welder {
+            cells: HashMap::new(),
+        };
+        let mut vertices = Vec::new();
+        // Straddles a cell boundary at x = 0 but is well within tolerance.
+        let a = welder.index(&mut vertices, [-WELD_TOLERANCE * 0.1, 1.0, 1.0]);
+        let b = welder.index(&mut vertices, [WELD_TOLERANCE * 0.1, 1.0, 1.0]);
+        assert_eq!(a, b);
+        // Clearly separate points stay separate.
+        let c = welder.index(&mut vertices, [WELD_TOLERANCE * 3.0, 1.0, 1.0]);
+        assert_ne!(a, c);
+        assert_eq!(vertices.len(), 2);
+    }
+
+    #[test]
     fn is_closed_rejects_open_surfaces() {
         let plate = objects(&build(&part("plate", rect(5.0, 5.0))));
         assert!(!plate[0].is_closed(), "a lone face has open edges");
@@ -386,6 +433,59 @@ mod tests {
             let object = &objects(&build(&part("solid", spec)))[0];
             assert!(object.is_closed());
             assert!((signed_volume(object) - volume).abs() < 1e-2, "{} vs {volume}", signed_volume(object));
+        }
+    }
+
+    #[test]
+    fn round_hole_by_difference_with_a_cylinder() {
+        use std::f64::consts::PI;
+        let plate = translate([0.0; 3], sized_box(20.0, 20.0, 4.0));
+        let cutter = translate(
+            [10.0, 10.0, -1.0],
+            ModelSpec::Extrude {
+                profile: Box::new(ModelSpec::Circle { radius: 3.0 }),
+                distance: 6.0,
+            },
+        );
+        let spec = ModelSpec::Difference {
+            shape: Box::new(plate),
+            tools: vec![cutter],
+        };
+        let object = &objects(&build(&part("plate", spec)))[0];
+        assert!(object.is_closed());
+        let volume = (400.0 - PI * 9.0) * 4.0;
+        let got = signed_volume(object);
+        assert!((got - volume).abs() < volume * 0.005, "{got} vs {volume}");
+    }
+
+    #[test]
+    fn curved_profiles_export_closed_with_the_right_volume() {
+        use std::f64::consts::PI;
+        let circle = |radius: f64| ModelSpec::Circle { radius };
+        let extrude = |profile: ModelSpec, distance: f64| ModelSpec::Extrude {
+            profile: Box::new(profile),
+            distance,
+        };
+        let cutout = |outer: ModelSpec, holes: Vec<ModelSpec>| ModelSpec::Cutout {
+            outer: Box::new(outer),
+            holes,
+        };
+        let cases = [
+            ("cylinder", extrude(circle(10.0), 5.0), PI * 100.0 * 5.0),
+            ("washer", extrude(cutout(circle(10.0), vec![circle(4.0)]), 2.0), PI * (100.0 - 16.0) * 2.0),
+            (
+                "holed plate",
+                extrude(cutout(rect(40.0, 20.0), vec![translate([10.0, 10.0, 0.0], circle(3.0))]), 3.0),
+                (800.0 - PI * 9.0) * 3.0,
+            ),
+        ];
+        for (name, spec, volume) in cases {
+            let object = &objects(&build(&part(name, spec)))[0];
+            assert!(object.is_closed(), "{name} not watertight");
+            // Tessellated circles are inscribed polygons: solids come out a
+            // little small, holes a little small too (so the part a little big).
+            let got = signed_volume(object);
+            assert!((got - volume).abs() < volume * 0.005, "{name}: {got} vs {volume}");
         }
     }
 
