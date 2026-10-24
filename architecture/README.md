@@ -147,7 +147,9 @@ when the model has one, and the assembled view otherwise.
 - three-d physical material, lit by ambient plus key and fill lights. Vertex
   colors multiply a white albedo; uncolored meshes use `DEFAULT_COLOR`.
 - B-rep edges are drawn as instanced thin cylinders, because GL line width
-  isn't portable.
+  isn't portable. They're a slate color between the background and typical
+  face colors, about 0.16% of the model's diagonal wide. Tests pin their
+  contrast against both, and their width next to an 18 mm board.
 - The egui overlay has an **Assembled/Print toggle** (Print is disabled when
   the model has no print view), a collapsible **part list** for the shown
   view (name and triangle count), reload diagnostics and an orbit hint.

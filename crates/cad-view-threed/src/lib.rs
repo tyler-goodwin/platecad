@@ -8,8 +8,13 @@ use three_d::*;
 /// Vertical field of view of the viewport camera.
 const FOV_Y_DEGREES: f32 = 45.0;
 
-/// B-rep edge lines.
-const EDGE_COLOR: [u8; 3] = [25, 30, 40];
+/// Viewport background.
+const BACKGROUND: [u8; 3] = [31, 33, 38];
+/// B-rep edge lines: a slate between the background and typical face colors,
+/// so edges read against both.
+const EDGE_COLOR: [u8; 3] = [72, 80, 96];
+/// Edge line radius as a fraction of the model's bounding diagonal.
+const EDGE_RADIUS_FRACTION: f32 = 0.0008;
 /// Build plate outlines in the print view.
 const PLATE_COLOR: [u8; 3] = [90, 150, 210];
 
@@ -137,7 +142,13 @@ impl ViewportApp for ThreeDViewport {
 
             frame_input
                 .screen()
-                .clear(ClearState::color_and_depth(0.12, 0.13, 0.15, 1.0, 1.0))
+                .clear(ClearState::color_and_depth(
+                    BACKGROUND[0] as f32 / 255.0,
+                    BACKGROUND[1] as f32 / 255.0,
+                    BACKGROUND[2] as f32 / 255.0,
+                    1.0,
+                    1.0,
+                ))
                 .render(&camera, state.objects(), &[&ambient, &key, &fill])
                 .write(|| gui.render())
                 .unwrap();
@@ -400,7 +411,7 @@ fn framing(aabb: Aabb) -> Framing {
         // bookshelf framed from ~2 m vanished behind a 1000 mm far plane).
         z_near: min_distance * 0.05,
         z_far: max_distance + radius * 2.0,
-        edge_radius: (diagonal * 0.002).max(1e-3),
+        edge_radius: (diagonal * EDGE_RADIUS_FRACTION).max(1e-3),
     }
 }
 
@@ -539,6 +550,32 @@ mod tests {
         assert!(ok[1] > ok[0] && ok[1] > ok[2], "ok should read green: {ok:?}");
         assert!(warning[0] > warning[2] && warning[1] > warning[2], "warning should read amber: {warning:?}");
         assert!(error[0] > error[1] && error[0] > error[2], "error should read red: {error:?}");
+    }
+
+    /// Approximate perceived brightness (Rec. 709 weights on sRGB bytes).
+    fn luma([r, g, b]: [u8; 3]) -> f32 {
+        0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+    }
+
+    #[test]
+    fn edges_stand_out_from_background_and_faces() {
+        let edge = luma(EDGE_COLOR);
+        assert!(edge - luma(BACKGROUND) >= 30.0, "edges blend into the background");
+        // Faces: the default color and the bookshelf's wood and backing.
+        for face in [DEFAULT_COLOR, [0xB0, 0x7A, 0x4F], [0xE8, 0xE0, 0xD0]] {
+            assert!(luma(face) - edge >= 40.0, "edges blend into {face:?}");
+        }
+        assert!(luma(PLATE_COLOR) - luma(BACKGROUND) >= 30.0, "plates blend into the background");
+    }
+
+    #[test]
+    fn edges_are_thin_next_to_thin_parts() {
+        // An 18 mm board in a 1 m bookshelf: the line should be well under a
+        // quarter of the board's thickness.
+        let f = framing(aabb([0.0; 3], [1000.0, 300.0, 800.0]));
+        assert!(f.edge_radius * 2.0 < 18.0 / 4.0, "{}", f.edge_radius);
+        // A 10 mm cube still gets a visible line.
+        assert!(framing(aabb([0.0; 3], [10.0; 3])).edge_radius >= 1e-3);
     }
 
     #[test]
