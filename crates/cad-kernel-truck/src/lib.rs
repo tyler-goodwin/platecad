@@ -242,6 +242,9 @@ fn build_bodies(
             }
             Ok(result)
         }
+        ModelSpec::Fillet { .. } | ModelSpec::Chamfer { .. } => Err(KernelError::Unsupported(
+            "fillet and chamfer need the OCC kernel (the default; --kernel occ)".into(),
+        )),
         ModelSpec::Color { rgb, shape } => build_bodies(
             shape,
             &Style {
@@ -551,7 +554,9 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
         | ModelSpec::Arrange { .. }
         | ModelSpec::Union { .. }
         | ModelSpec::Difference { .. }
-        | ModelSpec::Intersect { .. } => {
+        | ModelSpec::Intersect { .. }
+        | ModelSpec::Fillet { .. }
+        | ModelSpec::Chamfer { .. } => {
             Err(KernelError::Invalid(
                 "extrude profile must be a single 2D shape (rect, optionally moved, colored or named)"
                     .into(),
@@ -1642,6 +1647,18 @@ mod tests {
         assert!(TruckKernel.build(&tilted).unwrap_err().to_string().contains("XY plane"));
         for degrees in [0.0, -10.0, 361.0, f64::NAN] {
             assert!(TruckKernel.build(&revolve(translate([1.0, 0.0, 0.0], rect(1.0, 1.0)), degrees)).is_err());
+        }
+    }
+
+    #[test]
+    fn fillet_and_chamfer_need_occ() {
+        for spec in [
+            ModelSpec::Fillet { shape: Box::new(unit_box()), radius: 0.1, edges: vec![] },
+            ModelSpec::Chamfer { shape: Box::new(unit_box()), distance: 0.1, edges: vec![] },
+        ] {
+            let err = TruckKernel.build(&spec).unwrap_err();
+            assert!(matches!(err, KernelError::Unsupported(_)), "{err}");
+            assert!(err.to_string().contains("OCC kernel"), "{err}");
         }
     }
 

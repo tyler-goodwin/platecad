@@ -608,6 +608,30 @@ mod tests {
     }
 
     #[test]
+    fn dsl_fillet_and_chamfer() {
+        use cad_ir::EdgeSelector;
+        let spec = eval(
+            r#"import { chamfer, cube, fillet } from "./dsl/cad.ts";
+            export default () => chamfer(fillet(cube(1), 0.2, { edges: ["|Z", ">Z"] }), 0.1, { edges: "<Z" });"#,
+        )
+        .unwrap();
+        let ModelSpec::Chamfer { shape, distance, edges } = spec else { panic!("{spec:?}") };
+        assert_eq!((distance, edges), (0.1, vec![EdgeSelector::MinZ]));
+        assert!(
+            matches!(*shape, ModelSpec::Fillet { radius, ref edges, .. }
+                if radius == 0.2 && *edges == vec![EdgeSelector::ParallelZ, EdgeSelector::MaxZ]),
+            "{shape:?}"
+        );
+        for bad in ["fillet(cube(1), 0)", "chamfer(cube(1), 1, { edges: \"^Z\" })"] {
+            let source = format!(
+                r#"import {{ chamfer, cube, fillet }} from "./dsl/cad.ts";
+                export default () => {bad};"#
+            );
+            assert!(eval(&source).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"

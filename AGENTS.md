@@ -19,7 +19,7 @@ models/*.ts --(cad-script)--> ModelViews IR --(Kernel)--> TessellatedScene --> v
 
 ```sh
 cargo test --workspace                                # the main way to verify anything
-cargo run -p cad-app -- models/bookshelf.ts           # opens the viewer window
+cargo run -p cad-app -- models/bookshelf.ts           # opens the viewer window (OCC kernel by default)
 cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|assembled]  # headless
 ```
 
@@ -45,7 +45,7 @@ cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|
 | `crates/cad-view-threed` | three-d + egui window. |
 | `crates/cad-export` | `TessellatedScene` to 3MF (welded, watertight, one object per part). |
 | `crates/cad-app` | Binary plus library: CLI (clap), `Pipeline`, file watcher, `export_3mf`. Most integration tests live here. |
-| `dsl/cad.ts` | The TS DSL: `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `color`, `part`, `arrange`. |
+| `dsl/cad.ts` | The TS DSL: `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `fillet`, `chamfer`, `color`, `part`, `arrange`. |
 | `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`, `desk_organizer`). The user edits these live. |
 | `printer.toml` | Optional bed size, used by `arrange` in print views. Watched like an import. |
 | `architecture/` | Living design docs. Update them with every change. |
@@ -110,7 +110,11 @@ non-exhaustive `match` error, but not always.
   implicit intersection curves can hang tessellation after a transform.
   Never keep `Curve::IntersectionCurve` around, and build anything that
   could hang under a timeout in tests (`build_within`).
-- **Booleans fail on coplanar faces.** truck-shapeops returns `None` or
+- **OCC is the default kernel.** truck can't fillet, and its booleans fail
+  on coplanar faces. Any new IR node needs a conformance case in
+  `crates/cad-kernel-occ/tests/conformance.rs` if both kernels support it,
+  or an "unsupported" error in truck if only OCC does.
+- **Booleans fail on coplanar faces (truck).** truck-shapeops returns `None` or
   panics when faces line up exactly, so the kernel wraps it in
   `catch_unwind` and returns a hinted error. Model subtractively, with
   cutters that overshoot the faces they cut through.

@@ -1,4 +1,4 @@
-use cad_ir::{Bed, ModelSpec, Plate, TessellatedScene};
+use cad_ir::{Bed, EdgeSelector, ModelSpec, Plate, TessellatedScene};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,6 +15,44 @@ pub trait Kernel {
     fn name(&self) -> &'static str;
 
     fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError>;
+}
+
+/// What [`edge_selected`] needs to know about an edge.
+pub struct EdgeShape<'a> {
+    /// Points along the edge, start to end (at least the two endpoints).
+    pub points: &'a [[f64; 3]],
+    /// Unit tangents at the start and end.
+    pub tangents: [[f64; 3]; 2],
+}
+
+/// Whether any of `selectors` (empty = all) picks `edge` of a solid whose
+/// bounds are `min`..`max`.
+pub fn edge_selected(selectors: &[EdgeSelector], edge: &EdgeShape, min: [f64; 3], max: [f64; 3]) -> bool {
+    if selectors.is_empty() {
+        return true;
+    }
+    let size = (0..3).map(|i| max[i] - min[i]).fold(0.0, f64::max);
+    let tol = (size * 1e-7).max(1e-6);
+    let (first, last) = (edge.points[0], edge.points[edge.points.len() - 1]);
+    let chord: [f64; 3] = std::array::from_fn(|i| last[i] - first[i]);
+    let chord_len = chord.iter().map(|c| c * c).sum::<f64>().sqrt();
+    // Straight: tangents both run along the chord.
+    let along = |t: [f64; 3]| (0..3).map(|i| t[i] * chord[i]).sum::<f64>().abs() / chord_len.max(1e-300);
+    let straight = chord_len > tol && edge.tangents.iter().all(|t| (along(*t) - 1.0).abs() < 1e-6);
+    let parallel = |axis: usize| straight && (chord[axis].abs() / chord_len - 1.0).abs() < 1e-6;
+    let at = |axis: usize, value: f64| edge.points.iter().all(|p| (p[axis] - value).abs() <= tol);
+    selectors.iter().any(|s| match s {
+        EdgeSelector::All => true,
+        EdgeSelector::ParallelX => parallel(0),
+        EdgeSelector::ParallelY => parallel(1),
+        EdgeSelector::ParallelZ => parallel(2),
+        EdgeSelector::MaxX => at(0, max[0]),
+        EdgeSelector::MinX => at(0, min[0]),
+        EdgeSelector::MaxY => at(1, max[1]),
+        EdgeSelector::MinY => at(1, min[1]),
+        EdgeSelector::MaxZ => at(2, max[2]),
+        EdgeSelector::MinZ => at(2, min[2]),
+    })
 }
 
 // --- Shared by every kernel: arrange layout and profile validation. ---
@@ -182,6 +220,54 @@ pub fn validate_polygon(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, KernelErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line(a: [f64; 3], b: [f64; 3]) -> (Vec<[f64; 3]>, [[f64; 3]; 2]) {
+        let d: [f64; 3] = std::array::from_fn(|i| b[i] - a[i]);
+        let len = d.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let t = d.map(|c| c / len);
+        (vec![a, b], [t, t])
+    }
+
+    fn picks(selectors: &[EdgeSelector], (points, tangents): &(Vec<[f64; 3]>, [[f64; 3]; 2])) -> bool {
+        let edge = EdgeShape {
+            points,
+            tangents: *tangents,
+        };
+        edge_selected(selectors, &edge, [0.0; 3], [10.0; 3])
+    }
+
+    #[test]
+    fn edge_selectors_on_a_cube() {
+        use EdgeSelector::*;
+        let vertical = line([10.0, 0.0, 0.0], [10.0, 0.0, 10.0]);
+        let top_front = line([0.0, 0.0, 10.0], [10.0, 0.0, 10.0]);
+        let bottom_left = line([0.0, 0.0, 0.0], [0.0, 10.0, 0.0]);
+
+        assert!(picks(&[], &vertical) && picks(&[All], &bottom_left));
+        assert!(picks(&[ParallelZ], &vertical) && !picks(&[ParallelZ], &top_front));
+        assert!(picks(&[ParallelX], &top_front) && picks(&[ParallelY], &bottom_left));
+        assert!(picks(&[MaxZ], &top_front) && !picks(&[MaxZ], &vertical));
+        assert!(picks(&[MinZ], &bottom_left) && picks(&[MinX], &bottom_left));
+        assert!(picks(&[MaxX], &vertical) && !picks(&[MaxX], &bottom_left));
+        // Union.
+        assert!(picks(&[MaxZ, ParallelZ], &vertical) && picks(&[MaxZ, ParallelZ], &top_front));
+        assert!(!picks(&[MaxZ, ParallelZ], &bottom_left));
+    }
+
+    #[test]
+    fn curved_edges_are_never_parallel_but_can_sit_at_an_extreme() {
+        use EdgeSelector::*;
+        // A circle of radius 5 on the top face, sampled.
+        let points: Vec<[f64; 3]> = (0..=16)
+            .map(|i| {
+                let a = i as f64 / 16.0 * std::f64::consts::TAU;
+                [5.0 + 5.0 * a.cos(), 5.0 + 5.0 * a.sin(), 10.0]
+            })
+            .collect();
+        let circle = (points, [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
+        assert!(!picks(&[ParallelX], &circle) && !picks(&[ParallelY], &circle));
+        assert!(picks(&[MaxZ], &circle) && !picks(&[MinZ], &circle));
+    }
 
     fn bed(width: f64, depth: f64) -> Bed {
         Bed {

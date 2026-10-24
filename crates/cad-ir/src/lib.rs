@@ -69,6 +69,21 @@ pub enum ModelSpec {
     },
     /// Keeps the volume common to all children.
     Intersect { children: Vec<ModelSpec> },
+    /// Rounds the selected edges of every solid in `shape` (OCC kernel only).
+    Fillet {
+        shape: Box<ModelSpec>,
+        radius: f64,
+        /// Union of selectors; empty means every edge.
+        #[serde(default)]
+        edges: Vec<EdgeSelector>,
+    },
+    /// Bevels the selected edges by `distance` (OCC kernel only).
+    Chamfer {
+        shape: Box<ModelSpec>,
+        distance: f64,
+        #[serde(default)]
+        edges: Vec<EdgeSelector>,
+    },
     /// Paints `shape`. The innermost `Color` wins; a colored profile colors its extrusion.
     Color { rgb: Rgb, shape: Box<ModelSpec> },
     /// Names `shape` as a part (for export and part lists). The innermost
@@ -85,6 +100,33 @@ pub enum ModelSpec {
         #[serde(default)]
         bed: Option<Bed>,
     },
+}
+
+/// Picks edges of a solid, CadQuery style. `|Z` is a straight edge parallel
+/// to Z; `>Z` / `<Z` is an edge lying entirely at the solid's max / min Z
+/// (likewise for X and Y). Several selectors select their union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeSelector {
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "|X")]
+    ParallelX,
+    #[serde(rename = "|Y")]
+    ParallelY,
+    #[serde(rename = "|Z")]
+    ParallelZ,
+    #[serde(rename = ">X")]
+    MaxX,
+    #[serde(rename = "<X")]
+    MinX,
+    #[serde(rename = ">Y")]
+    MaxY,
+    #[serde(rename = "<Y")]
+    MinY,
+    #[serde(rename = ">Z")]
+    MaxZ,
+    #[serde(rename = "<Z")]
+    MinZ,
 }
 
 /// A printer's build volume, mm. Unknown keys are rejected so typos in
@@ -381,6 +423,20 @@ mod tests {
         let json = format!(r#"{{"kind":"Revolve","profile":{rect}}}"#);
         let ModelSpec::Revolve { degrees, .. } = serde_json::from_str(&json).unwrap() else { panic!() };
         assert_eq!(degrees, 360.0);
+    }
+
+    #[test]
+    fn fillet_and_chamfer_match_ts_shape() {
+        let rect = r#"{"kind":"Rect","width":1,"height":1}"#;
+        let json = format!(r#"{{"kind":"Fillet","shape":{rect},"radius":2,"edges":["|Z",">Z","all"]}}"#);
+        let ModelSpec::Fillet { radius, edges, .. } = serde_json::from_str(&json).unwrap() else { panic!() };
+        assert_eq!(radius, 2.0);
+        assert_eq!(edges, vec![EdgeSelector::ParallelZ, EdgeSelector::MaxZ, EdgeSelector::All]);
+        let json = format!(r#"{{"kind":"Chamfer","shape":{rect},"distance":1}}"#);
+        let ModelSpec::Chamfer { edges, .. } = serde_json::from_str(&json).unwrap() else { panic!() };
+        assert!(edges.is_empty());
+        let bad = format!(r#"{{"kind":"Chamfer","shape":{rect},"distance":1,"edges":["^Z"]}}"#);
+        assert!(serde_json::from_str::<ModelSpec>(&bad).is_err());
     }
 
     #[test]

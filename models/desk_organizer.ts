@@ -1,11 +1,13 @@
 import {
   arrange,
   box,
+  chamfer,
   circle,
   color,
   cutout,
   difference,
   extrude,
+  fillet,
   group,
   part,
   polygon,
@@ -25,6 +27,9 @@ import {
  * - Card holder: a base block fused with a back rest leaning at `lean`
  *   degrees (a slanted extrude), with slanted card slots cut into the base.
  * - Base plate: a plate with round holes for press-fit magnets (a cutout).
+ *
+ * Fillets round the plate's and holder's corners, and a small chamfer on
+ * the cup's bottom edge keeps the first layer from flaring (OCC kernel).
  *
  * Booleans need faces that cross rather than line up, so the back rest
  * starts inside the base block and stops short of its sides, and the slot
@@ -77,7 +82,7 @@ function cup(p: OrganizerParams): ModelSpec {
     [r - w, w],
     [0, w],
   ]);
-  return revolve(section);
+  return chamfer(revolve(section), 0.8, { edges: "<Z" });
 }
 
 /** Direction leaning back (toward +Y) by `degrees` from vertical. */
@@ -104,7 +109,7 @@ function cardHolder(p: OrganizerParams): ModelSpec {
     translate(extrude(rect({ width: w - 6, height: 3 }), { distance: 20, direction }), [3, 8 + i * 10, h - 6]),
   );
 
-  return difference(union(base, rest), ...cutters);
+  return fillet(difference(union(base, rest), ...cutters), 3, { edges: "|Z" });
 }
 
 function basePlate(p: OrganizerParams, width: number, depth: number): ModelSpec {
@@ -115,7 +120,8 @@ function basePlate(p: OrganizerParams, width: number, depth: number): ModelSpec 
     [inset, depth - inset],
     [width - inset, depth - inset],
   ].map(([x, y]) => circle(p.magnet / 2, { at: [x, y] }));
-  return extrude(cutout(rect({ width, height: depth }), ...holes), { distance: PLATE_THICKNESS });
+  const plate = extrude(cutout(rect({ width, height: depth }), ...holes), { distance: PLATE_THICKNESS });
+  return fillet(plate, 6, { edges: "|Z" });
 }
 
 export function organizer(overrides: Partial<OrganizerParams> = {}): Model {

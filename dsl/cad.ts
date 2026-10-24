@@ -58,6 +58,15 @@ export type UnionSpec = { kind: "Union"; children: ModelSpec[] };
 export type DifferenceSpec = { kind: "Difference"; shape: ModelSpec; tools: ModelSpec[] };
 export type IntersectSpec = { kind: "Intersect"; children: ModelSpec[] };
 
+/**
+ * Picks edges, CadQuery style: `|Z` straight edges parallel to Z; `>Z` / `<Z`
+ * edges lying at the shape's max / min Z (likewise X, Y); `all`.
+ */
+export type EdgeSelector = "all" | "|X" | "|Y" | "|Z" | ">X" | "<X" | ">Y" | "<Y" | ">Z" | "<Z";
+
+export type FilletSpec = { kind: "Fillet"; shape: ModelSpec; radius: number; edges: EdgeSelector[] };
+export type ChamferSpec = { kind: "Chamfer"; shape: ModelSpec; distance: number; edges: EdgeSelector[] };
+
 export type GroupSpec = {
   kind: "Group";
   children: ModelSpec[];
@@ -109,6 +118,8 @@ export type ModelSpec =
   | UnionSpec
   | DifferenceSpec
   | IntersectSpec
+  | FilletSpec
+  | ChamferSpec
   | ColorSpec
   | PartSpec
   | ArrangeSpec;
@@ -321,6 +332,36 @@ export function difference(shape: ModelSpec, ...tools: ModelSpec[]): DifferenceS
     throw new Error("difference needs at least one tool");
   }
   return { kind: "Difference", shape, tools };
+}
+
+const EDGE_SELECTORS: EdgeSelector[] = ["all", "|X", "|Y", "|Z", ">X", "<X", ">Y", "<Y", ">Z", "<Z"];
+
+function edgeSelectors(name: string, edges: EdgeSelector | EdgeSelector[] | undefined): EdgeSelector[] {
+  const list = edges === undefined ? [] : Array.isArray(edges) ? edges : [edges];
+  for (const e of list) {
+    if (!EDGE_SELECTORS.includes(e)) {
+      throw new Error(`${name} edges must be one of ${EDGE_SELECTORS.join(", ")} (got ${JSON.stringify(e)})`);
+    }
+  }
+  return [...list];
+}
+
+/**
+ * Rounds edges of a solid with `radius` mm: every edge, or those picked by
+ * `edges` (e.g. "|Z" for corners seen from above). OCC kernel only.
+ */
+export function fillet(shape: ModelSpec, radius: number, opts: { edges?: EdgeSelector | EdgeSelector[] } = {}): FilletSpec {
+  positive("fillet radius", radius);
+  return { kind: "Fillet", shape, radius, edges: edgeSelectors("fillet", opts.edges) };
+}
+
+/**
+ * Bevels edges of a solid by `distance` mm (e.g. "<Z" for a first-layer
+ * chamfer). OCC kernel only.
+ */
+export function chamfer(shape: ModelSpec, distance: number, opts: { edges?: EdgeSelector | EdgeSelector[] } = {}): ChamferSpec {
+  positive("chamfer distance", distance);
+  return { kind: "Chamfer", shape, distance, edges: edgeSelectors("chamfer", opts.edges) };
 }
 
 /** Keeps the volume common to all shapes. */

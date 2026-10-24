@@ -35,13 +35,15 @@ the improvement.
 
 ## OCC kernel (spike follow-ups)
 
-- **Make OCC the default?** It handles everything truck does (conformance
-  suite) plus coplanar booleans, and is faster on curved booleans.
-- **Bare 2D profiles.** OCC rejects a top-level profile (`square.ts`). Build
-  a face from the edge loops and mesh it.
-- **Expose OCC-only features.** Fillets and chamfers (need a way to pick
-  edges in the IR), loft, sweep along a path, shell (hollowing), STEP
-  export.
+- **Bare 2D profiles in OCC.** These fall back to truck. cadrum can't build
+  a planar face from edge loops or mesh a lone face; that needs OCCT's
+  `BRepBuilderAPI_MakeFace` exposed.
+- **More OCC features.** Loft, sweep along a path, shell (hollowing) and
+  STEP export are in cadrum but not exposed.
+- **Smarter edge selection.** Selectors can't tell a seam edge (a
+  cylinder's side seam, a revolve's profile edge) from a real one, and
+  can't pick by length, by face, or by index. OCC errors on filleting a
+  seam; the error says so.
 - **Reproducible OCCT fetch.** The documented curl workaround is manual.
   Vendor a fetch script, or switch to cadrum's `source` build (official
   sources; needs CMake).

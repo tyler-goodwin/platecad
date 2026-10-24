@@ -71,6 +71,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
 | `Union { children }`, `Difference { shape, tools }`, `Intersect { children }` | Booleans via truck-shapeops, on closed solids. The result keeps the first operand's color and part name. A difference skips tools whose bounds miss the shape. |
+| `Fillet { shape, radius, edges }`, `Chamfer { shape, distance, edges }` | Round or bevel the selected edges of each solid (OCC only; truck reports "needs the OCC kernel"). `edges` are CadQuery-style selectors, unioned; empty means all. `\|X/\|Y/\|Z` picks straight edges parallel to an axis. `>Z/<Z` (and X, Y) picks edges lying at the solid's max/min, measured from its sampled edges because OCC's bounding box is padded. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
 | `Part { name, shape }` | Names a shape as a part, for export and the part list. The innermost name wins; a named profile names its extrusion. |
 | `Arrange { gap, children, bed? }` | Print layout: drops each child onto the plate (z = 0), moving it as a unit and never rotating it. Rows wrap at the bed width and spill onto more plates, which sit in a grid, and each plate's parts are centered on it. With no bed, rows wrap into a roughly square block centered on the origin. |
@@ -141,7 +142,11 @@ out is a hybrid: keep emitting specs, and add query ops later.
 
 ## Kernels: truck and OCC
 
-Select one with `--kernel truck|occ` (default `truck`). Both take the same
+Select one with `--kernel occ|truck` (default **`occ`**). With OCC, a
+view it reports as unsupported (today only a bare 2D profile like
+`square.ts`) is built by truck instead. The status line says so ("OK via
+truck (fallback: occ can't build this view)"). Other OCC errors don't fall
+back. Both take the same
 IR and produce the same `TessellatedScene` (parts, colors, plates, edges).
 `crates/cad-kernel-occ/tests/conformance.rs` holds them to that: 14 shared
 cases must match on bounds (0.05 mm), volume (0.5%), part names, colors and
@@ -153,8 +158,9 @@ plates, with every exported object closed.
 | Implicit boolean curves | Can hang tessellation; made explicit right after each boolean | Not an issue |
 | Desk organizer export (debug) | ~1.1 s | ~0.4 s |
 | Coaster set export (debug) | ~0.2 s | ~0.3 s |
-| Bare 2D profile shown on its own | Yes | Not yet (spike gap) |
-| Fillets, chamfers, loft, sweep, STEP | No | Available in cadrum, not exposed yet |
+| Bare 2D profile shown on its own | Yes | Falls back to truck |
+| Fillets, chamfers | No | Yes, with edge selectors |
+| Loft, sweep, shell, STEP | No | Available in cadrum, not exposed yet |
 | Build | Pure Rust | Links a 118 MB prebuilt static OCCT; see below |
 
 **Building with OCC.** cadrum's build script downloads a prebuilt static
@@ -187,7 +193,7 @@ local use, but distributing the binary carries relinking obligations.
 ## App, CLI and hot reload
 
 ```
-cad-app [MODEL] [--kernel truck|occ]                         # open the viewer (CAD_KERNEL env works too)
+cad-app [MODEL] [--kernel occ|truck]                         # open the viewer (default occ; CAD_KERNEL env works too)
 cad-app [MODEL] --export out.3mf [--view auto|print|assembled]  # write a 3MF and exit, no window
 ```
 
@@ -298,7 +304,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 |---|---|
 | `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
 | `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
-| `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). It prints as three closed parts on one 256 mm plate. |
+| `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). Fillets round the plate's and holder's vertical corners, and a 0.8 mm chamfer on the cup's bottom edge stops the first layer flaring, so it's OCC-only. It prints as three closed parts on one 256 mm plate. |
 | `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a tray with a floor and three walls, open at the front: a box minus an overshooting cutter. Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
 
 ## Testing

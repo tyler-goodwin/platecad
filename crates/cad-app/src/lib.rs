@@ -98,6 +98,16 @@ pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
             rgb,
             shape: boxed(shape),
         },
+        ModelSpec::Fillet { shape, radius, edges } => ModelSpec::Fillet {
+            shape: boxed(shape),
+            radius,
+            edges,
+        },
+        ModelSpec::Chamfer { shape, distance, edges } => ModelSpec::Chamfer {
+            shape: boxed(shape),
+            distance,
+            edges,
+        },
         ModelSpec::Part { name, shape } => ModelSpec::Part {
             name,
             shape: boxed(shape),
@@ -186,7 +196,7 @@ pub struct Args {
     pub model: PathBuf,
 
     /// Geometry kernel.
-    #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Truck)]
+    #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
 
     /// Write a 3MF file for slicers instead of opening the viewer.
@@ -210,9 +220,10 @@ pub enum ExportView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum KernelChoice {
-    /// truck B-rep kernel (pure Rust).
+    /// truck B-rep kernel (pure Rust; no fillets, fragile booleans).
     Truck,
-    /// OpenCascade (stub: not wired yet).
+    /// OpenCascade via cadrum (default). Views it can't build yet (a bare 2D
+    /// profile) fall back to truck.
     Occ,
 }
 
@@ -285,20 +296,23 @@ pub struct Pipeline {
     root: PathBuf,
     script: RustyScriptHost,
     kernel: Box<dyn Kernel + Send>,
+    /// Builds views the main kernel reports as unsupported (OCC: bare 2D profiles).
+    fallback: Option<Box<dyn Kernel + Send>>,
     dependencies: BTreeSet<PathBuf>,
 }
 
 impl Pipeline {
     pub fn new(root: &Path, kernel: KernelChoice) -> Result<Self, String> {
-        let kernel: Box<dyn Kernel + Send> = match kernel {
-            KernelChoice::Truck => Box::new(TruckKernel),
-            KernelChoice::Occ => Box::new(OccKernel),
+        let (kernel, fallback): (Box<dyn Kernel + Send>, Option<Box<dyn Kernel + Send>>) = match kernel {
+            KernelChoice::Truck => (Box::new(TruckKernel), None),
+            KernelChoice::Occ => (Box::new(OccKernel), Some(Box::new(TruckKernel))),
         };
         let script = RustyScriptHost::new(root).map_err(|e| e.to_string())?;
         Ok(Self {
             root: normalize(&std::path::absolute(root).map_err(|e| e.to_string())?),
             script,
             kernel,
+            fallback,
             dependencies: BTreeSet::new(),
         })
     }
@@ -336,15 +350,20 @@ impl Pipeline {
             None => views.print,
         };
         let kernel = self.kernel.name();
-        let assembled = match self.kernel.build(&views.assembled) {
+        let mut fell_back = false;
+        let assembled = match self.build(&views.assembled, &mut fell_back) {
             Ok(scene) => scene,
             Err(e) => return SceneUpdate::error(format!("{name}: {kernel} kernel: {e}")),
         };
-        let print = match print_spec.map(|spec| self.kernel.build(&spec)).transpose() {
+        let print = match print_spec.map(|spec| self.build(&spec, &mut fell_back)).transpose() {
             Ok(scene) => scene,
             Err(e) => {
                 return SceneUpdate::error(format!("{name}: {kernel} kernel (print view): {e}"));
             }
+        };
+        let kernel = match (&self.fallback, fell_back) {
+            (Some(fallback), true) => format!("{} (fallback: {kernel} can't build this view)", fallback.name()),
+            _ => kernel.to_string(),
         };
 
         let triangles = |scene: &cad_ir::TessellatedScene| scene.indices.len() / 3;
@@ -421,6 +440,27 @@ pub fn export_3mf(
         Err(e) => {
             let _ = std::fs::remove_file(out);
             Err(e)
+        }
+    }
+}
+
+impl Pipeline {
+    /// Builds with the main kernel; if it reports the spec unsupported, with
+    /// the fallback (setting `fell_back`). If both fail, the main kernel's
+    /// error is the one that explains.
+    fn build(&mut self, spec: &ModelSpec, fell_back: &mut bool) -> Result<TessellatedScene, cad_kernel::KernelError> {
+        match self.kernel.build(spec) {
+            Err(e @ cad_kernel::KernelError::Unsupported(_)) => match &mut self.fallback {
+                Some(fallback) => match fallback.build(spec) {
+                    Ok(scene) => {
+                        *fell_back = true;
+                        Ok(scene)
+                    }
+                    Err(_) => Err(e),
+                },
+                None => Err(e),
+            },
+            other => other,
         }
     }
 }
@@ -680,10 +720,11 @@ mod tests {
 
     #[test]
     fn kernel_error_names_the_kernel() {
-        // A bare 2D rect: the OCC kernel builds solids only (for now).
+        // A fillet radius bigger than the part: OCC can't build it, and it's
+        // not "unsupported", so there's no fallback.
         let project = Project::new(
-            "import { rect } from \"../dsl/cad.ts\";
-export default () => rect({ width: 1, height: 1 });
+            "import { cube, fillet } from \"../dsl/cad.ts\";
+export default () => fillet(cube(2), 5);
 ",
         );
         let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
@@ -709,13 +750,49 @@ export default () => rect({ width: 1, height: 1 });
     }
 
     #[test]
-    fn cli_defaults_to_cube_on_truck() {
+    fn cli_defaults_to_cube_on_occ() {
         let args = parse(&[]).unwrap();
         assert_eq!(args.model, PathBuf::from(DEFAULT_MODEL));
         // A CAD_KERNEL in the developer's shell legitimately changes the default.
         if std::env::var_os("CAD_KERNEL").is_none() {
-            assert_eq!(args.kernel, KernelChoice::Truck);
+            assert_eq!(args.kernel, KernelChoice::Occ);
         }
+    }
+
+    fn occ_project(model: &str) -> (Project, Pipeline) {
+        let project = Project::new(model);
+        let pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
+        (project, pipeline)
+    }
+
+    #[test]
+    fn occ_falls_back_to_truck_for_bare_profiles_and_says_so() {
+        let (project, mut pipeline) =
+            occ_project("import { rect } from \"../dsl/cad.ts\";\nexport default () => rect({ width: 3, height: 2 });\n");
+        let update = pipeline.evaluate(&project.model());
+        let d = &update.diagnostics[0];
+        assert!(d.ok, "{:?}", update.diagnostics);
+        assert!(d.message.contains("OK via truck (fallback: occ can't build this view)"), "{}", d.message);
+        assert_eq!(max_extent(&update), 3.0);
+    }
+
+    #[test]
+    fn solids_on_occ_dont_mention_fallback() {
+        let (project, mut pipeline) = occ_project(&cube_source(4));
+        let update = pipeline.evaluate(&project.model());
+        assert!(update.diagnostics[0].message.contains("OK via occ ("), "{:?}", update.diagnostics);
+    }
+
+    #[test]
+    fn fillet_models_need_occ_and_say_so_on_truck() {
+        let source = "import { cube, fillet } from \"../dsl/cad.ts\";\nexport default () => fillet(cube(10), 1, { edges: \"|Z\" });\n";
+        let (project, mut occ) = occ_project(source);
+        let update = occ.evaluate(&project.model());
+        assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
+
+        let update = project.pipeline().evaluate(&project.model());
+        assert!(update.views.is_none());
+        assert!(update.diagnostics[0].message.contains("need the OCC kernel"), "{:?}", update.diagnostics);
     }
 
     #[test]
@@ -896,14 +973,24 @@ export default () => rect({ width: 1, height: 1 });
     }
 
     #[test]
-    fn every_repo_model_builds() {
+    fn every_repo_model_builds_with_truck_or_asks_for_occ() {
         let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
         let mut count = 0;
         for entry in std::fs::read_dir(repo_root().join("models")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "ts") {
                 let update = pipeline.evaluate(&path);
-                assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
+                if !update.diagnostics[0].ok {
+                    // Models using fillets/chamfers are OCC-only; truck must say so.
+                    assert!(
+                        update.diagnostics[0].message.contains("need the OCC kernel"),
+                        "{}: {:?}",
+                        path.display(),
+                        update.diagnostics
+                    );
+                    count += 1;
+                    continue;
+                }
                 let views = update.views.unwrap();
                 assert!(!views.assembled.is_empty(), "{}", path.display());
                 if let Some(print) = &views.print {
@@ -918,7 +1005,7 @@ export default () => rect({ width: 1, height: 1 });
     }
 
     #[test]
-    fn every_repo_model_builds_with_occ_or_is_a_known_gap() {
+    fn every_repo_model_builds_with_occ() {
         let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Occ).unwrap();
         for entry in std::fs::read_dir(repo_root().join("models")).unwrap() {
             let path = entry.unwrap().path();
@@ -927,12 +1014,13 @@ export default () => rect({ width: 1, height: 1 });
             }
             let update = pipeline.evaluate(&path);
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if name == "square.ts" {
-                // Spike gap: OCC builds solids only, and square.ts is a bare rect.
-                assert!(update.diagnostics[0].message.contains("solids only"), "{:?}", update.diagnostics);
-                continue;
-            }
             assert!(update.diagnostics[0].ok, "{name}: {:?}", update.diagnostics);
+            // square.ts is a bare rect: OCC hands it to truck, and says so.
+            let fell_back = update.diagnostics[0].message.contains("fallback");
+            assert_eq!(fell_back, name == "square.ts", "{name}: {:?}", update.diagnostics);
+            if fell_back {
+                continue; // A flat face: not a solid, nothing to check for closure.
+            }
             let views = update.views.unwrap();
             for scene in std::iter::once(&views.assembled).chain(views.print.as_ref()) {
                 for object in cad_export::objects(scene) {
@@ -1426,8 +1514,49 @@ export default () => organizer();
         let source = std::fs::read_to_string(repo_root().join("models/desk_organizer.ts")).unwrap();
         project.write("models/desk_organizer.ts", &source);
         project.write("printer.toml", &bed_toml(256, 256, 256));
-        let update = project.pipeline().evaluate(&project.model());
+        let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
+        let update = pipeline.evaluate(&project.model());
         (update.views.expect("organizer builds"), update.diagnostics)
+    }
+
+    fn part_vertices<'a>(scene: &'a cad_ir::TessellatedScene, name: &str) -> Vec<&'a [f32; 3]> {
+        scene
+            .parts
+            .iter()
+            .filter(|p| p.name == name)
+            .flat_map(|p| &scene.positions[p.vertices.start as usize..p.vertices.end as usize])
+            .collect()
+    }
+
+    #[test]
+    fn organizer_corners_are_rounded_and_cup_is_chamfered() {
+        let (views, _) = organizer_views();
+        let scene = &views.assembled;
+
+        // Plate and holder: no vertex sits on their bounding-box corners any more.
+        for name in ["base plate", "card holder"] {
+            let (min, max) = part_bounds(scene, name);
+            for [x, y] in [[min[0], min[1]], [max[0], min[1]], [min[0], max[1]]] {
+                let sharp = part_vertices(scene, name)
+                    .iter()
+                    .any(|p| (p[0] - x).abs() < 1e-3 && (p[1] - y).abs() < 1e-3);
+                assert!(!sharp, "{name} still has a sharp corner at ({x}, {y})");
+            }
+        }
+
+        // Cup: 0.8 mm first-layer chamfer, so its footprint is 34.2 mm in radius
+        // while its wall is the full 35 mm.
+        let cup = part_vertices(scene, "pen cup");
+        let (min, max) = part_bounds(scene, "pen cup");
+        let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+        let radius_at = |z: f32| {
+            cup.iter()
+                .filter(|p| (p[2] - z).abs() < 1e-3)
+                .map(|p| ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt())
+                .fold(0.0f32, f32::max)
+        };
+        assert!((radius_at(min[2]) - 34.2).abs() < 0.02, "footprint radius {}", radius_at(min[2]));
+        assert!((radius_at(max[2]) - 35.0).abs() < 0.02, "rim radius {}", radius_at(max[2]));
     }
 
     #[test]

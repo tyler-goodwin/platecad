@@ -6,7 +6,7 @@
 //! meshes solids.
 
 use cad_ir::{DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
-use cad_kernel::{Kernel, KernelError, pack, validate_polygon};
+use cad_kernel::{EdgeShape, Kernel, KernelError, edge_selected, pack, validate_polygon};
 use cadrum::{Boolean, DVec3, Edge, Solid, Tessellation};
 
 /// Absolute chord tolerance (mm), matching the truck kernel's tessellation.
@@ -261,6 +261,41 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             },
             plates,
         ),
+        ModelSpec::Fillet { shape, radius, edges } | ModelSpec::Chamfer { shape, distance: radius, edges } => {
+            let fillet = matches!(spec, ModelSpec::Fillet { .. });
+            let (op, size) = if fillet { ("fillet", "radius") } else { ("chamfer", "distance") };
+            if !(*radius > 0.0 && radius.is_finite()) {
+                return Err(invalid(format!("{op} {size} must be positive")));
+            }
+            let mut result = Vec::new();
+            for (solid, body_style) in build_solids(shape, style, plates)? {
+                let (min, max) = edge_bounds(&solid);
+                let picked: Vec<&Edge> = solid
+                    .iter_edge()
+                    .filter(|e| {
+                        let points = edge_points(e);
+                        let tangents = [unit_or_zero(e.start_tangent()), unit_or_zero(e.end_tangent())];
+                        edge_selected(edges, &EdgeShape { points: &points, tangents }, min, max)
+                    })
+                    .collect();
+                if picked.is_empty() {
+                    return Err(invalid(format!("{op}: no edges match {edges:?}")));
+                }
+                let rounded = if fillet {
+                    solid.fillet_edges(*radius, picked)
+                } else {
+                    solid.chamfer_edges(*radius, picked)
+                };
+                let rounded = rounded.map_err(|e| {
+                    KernelError::Message(format!(
+                        "{op} failed in OpenCascade: {e}. The {size} may be too large for the selected edges, \
+                         or a selector picked a cylinder's seam edge"
+                    ))
+                })?;
+                result.push((rounded, body_style));
+            }
+            Ok(result)
+        }
         ModelSpec::Union { children } | ModelSpec::Intersect { children } => {
             let op = if matches!(spec, ModelSpec::Union { .. }) { "union" } else { "intersect" };
             let mut operands = Vec::new();
@@ -330,6 +365,31 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             Ok(arranged)
         }
     }
+}
+
+fn edge_points(edge: &Edge) -> Vec<[f64; 3]> {
+    edge.approximation_segments(TESSELLATION)
+        .into_iter()
+        .map(|p| p.to_array())
+        .collect()
+}
+
+fn unit_or_zero(v: DVec3) -> [f64; 3] {
+    v.normalize_or_zero().to_array()
+}
+
+/// Extremes of a solid's edges. Exact for selecting edges at the solid's
+/// max/min, unlike OCC's bounding box, which is padded by a tolerance.
+fn edge_bounds(solid: &Solid) -> ([f64; 3], [f64; 3]) {
+    let mut min = [f64::MAX; 3];
+    let mut max = [f64::MIN; 3];
+    for p in solid.iter_edge().flat_map(edge_points) {
+        for i in 0..3 {
+            min[i] = min[i].min(p[i]);
+            max[i] = max[i].max(p[i]);
+        }
+    }
+    (min, max)
 }
 
 fn bounds(bodies: &Bodies) -> Option<(DVec3, DVec3)> {
