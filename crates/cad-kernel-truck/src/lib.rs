@@ -4,8 +4,8 @@ use cad_ir::{Bed, DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedSc
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
 use truck_modeling::{
-    BoundedCurve, Curve, Edge, Face, InnerSpace, ParametricCurve, Point3, Rad, Shell, Solid, Vector3,
-    Wire, builder,
+    BSplineCurve, BoundedCurve, Curve, Edge, Face, InnerSpace, KnotVec, Line, ParametricCurve, Point3,
+    Rad, Shell, Solid, Vector3, Wire, builder,
 };
 
 const TESSELLATION_TOL: f64 = 0.01;
@@ -419,12 +419,47 @@ fn build_operands(
 }
 
 /// Runs a truck-shapeops operation, turning its failures (and panics, which it
-/// raises on some coplanar inputs) into an error with a hint.
+/// raises on some coplanar inputs) into an error with a hint. The result's
+/// edges are made explicit (see [`explicit_curves`]).
 fn boolean(op: &str, hint: &str, run: impl FnOnce() -> Option<Solid>) -> Result<Solid, KernelError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-        Ok(Some(solid)) if !solid.boundaries().is_empty() => Ok(solid),
+        Ok(Some(solid)) if !solid.boundaries().is_empty() => Ok(explicit_curves(&solid)),
         _ => Err(KernelError::Invalid(format!("{op} failed: {hint}"))),
     }
+}
+
+/// Replaces the implicit intersection curves a boolean leaves on its new edges
+/// with explicit ones: a line when the curve is straight, else a fine
+/// polyline. truck evaluates intersection curves numerically, and after some
+/// transforms (e.g. arrange moving a part to (83, 140.2)) that evaluation
+/// never converges and tessellation hangs. Sampling right after the boolean,
+/// before anything moves, is reliable.
+fn explicit_curves(solid: &Solid) -> Solid {
+    solid.mapped(
+        |p| *p,
+        |curve| match curve {
+            Curve::IntersectionCurve(_) => {
+                let (t0, t1) = curve.range_tuple();
+                let points: Vec<Point3> = (0..=CURVE_SEGMENTS)
+                    .map(|i| curve.subs(t0 + (t1 - t0) * i as f64 / CURVE_SEGMENTS as f64))
+                    .collect();
+                let (first, last) = (points[0], points[CURVE_SEGMENTS]);
+                let chord = last - first;
+                let straight = points.iter().all(|p| {
+                    let d = *p - first;
+                    let off_line = d - chord * (d.dot(chord) / chord.magnitude2().max(1e-300));
+                    off_line.magnitude() < 1e-7
+                });
+                if straight && chord.magnitude() > 1e-12 {
+                    Curve::Line(Line(first, last))
+                } else {
+                    Curve::BSplineCurve(BSplineCurve::new(KnotVec::uniform_knot(1, CURVE_SEGMENTS), points))
+                }
+            }
+            other => other.clone(),
+        },
+        |surface| surface.clone(),
+    )
 }
 
 fn bodies_of(solid: Solid, style: &Style) -> Vec<Body> {
@@ -1594,8 +1629,11 @@ mod tests {
         let spec = difference(ten(), vec![cuboid([3.0, 3.0, -1.0], [4.0, 4.0, 12.0])]);
         let scene = TruckKernel.build(&spec).unwrap();
         assert_aabb(&scene, [0.0; 3], [10.0; 3]);
-        // The hole's four walls are inside the outline: some vertex sits at x = 3.
-        assert!(scene.positions.iter().any(|p| (p[0] - 3.0).abs() < 1e-4 && p[1] > 3.0 && p[1] < 7.0));
+        // The hole's corners exist on both faces (a plain box has none there).
+        let has = |q: [f32; 3]| scene.positions.iter().any(|p| (0..3).all(|i| (p[i] - q[i]).abs() < 1e-4));
+        for corner in [[3.0, 3.0, 0.0], [7.0, 7.0, 0.0], [3.0, 7.0, 10.0], [7.0, 3.0, 10.0]] {
+            assert!(has(corner), "hole corner {corner:?} missing");
+        }
     }
 
     #[test]
@@ -1622,6 +1660,49 @@ mod tests {
             .build(&intersect(vec![ten(), cuboid([20.0, 0.0, 0.0], [1.0; 3])]))
             .unwrap_err();
         assert!(err.to_string().contains("don't overlap"), "{err}");
+    }
+
+    /// Card holder from models/desk_organizer.ts: a base fused with a leaning
+    /// back rest, minus two leaning slots.
+    fn card_holder() -> ModelSpec {
+        let a = 20f64.to_radians();
+        let lean = |p: ModelSpec, d: f64| ModelSpec::Extrude {
+            profile: Box::new(p),
+            distance: d,
+            direction: Some([0.0, a.sin(), a.cos()]),
+        };
+        let fused = union(vec![
+            sized_box(90.0, 50.0, 12.0),
+            translate([5.0, 34.0, 2.0], lean(rect(80.0, 4.0), 70.0)),
+        ]);
+        difference(
+            fused,
+            vec![
+                translate([3.0, 8.0, 6.0], lean(rect(84.0, 3.0), 20.0)),
+                translate([3.0, 18.0, 6.0], lean(rect(84.0, 3.0), 20.0)),
+            ],
+        )
+    }
+
+    /// Builds on a thread so a hang fails the test instead of stalling it.
+    fn build_within(spec: ModelSpec, seconds: u64) -> TessellatedScene {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(TruckKernel.build(&spec));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(seconds))
+            .expect("build hung")
+            .unwrap()
+    }
+
+    #[test]
+    fn moved_boolean_results_tessellate_quickly_and_consistently() {
+        // (83, 140.2) used to hang forever on truck's intersection curves.
+        let counts: Vec<usize> = [[0.0; 3], [90.0, 10.0, 5.0], [83.0, 140.2, 0.0], [12.345, 6.789, 0.0]]
+            .into_iter()
+            .map(|offset| build_within(translate(offset, card_holder()), 10).indices.len())
+            .collect();
+        assert!(counts.iter().all(|c| *c == counts[0]), "same shape, different meshes: {counts:?}");
     }
 
     #[test]

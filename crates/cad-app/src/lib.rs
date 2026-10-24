@@ -1350,6 +1350,47 @@ mod tests {
         }
     }
 
+    // --- Desk organizer (shows booleans, revolve, cutout, slanted extrude) -----
+
+    fn organizer_views() -> (SceneViews, Vec<Diagnostic>) {
+        let project = Project::new("import { organizer } from \"./desk_organizer.ts\";
+export default () => organizer();
+");
+        let source = std::fs::read_to_string(repo_root().join("models/desk_organizer.ts")).unwrap();
+        project.write("models/desk_organizer.ts", &source);
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+        let update = project.pipeline().evaluate(&project.model());
+        (update.views.expect("organizer builds"), update.diagnostics)
+    }
+
+    #[test]
+    fn organizer_prints_on_one_plate_as_three_closed_parts() {
+        let (views, diagnostics) = organizer_views();
+        assert!(diagnostics.iter().all(|d| d.ok && !d.warning), "{diagnostics:?}");
+        let print = views.print.unwrap();
+        assert_eq!(print.plates.len(), 1);
+        let objects = cad_export::objects(&print);
+        let names: Vec<&str> = objects.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["base plate", "pen cup", "card holder"]);
+        for object in &objects {
+            assert!(object.is_closed(), "{} is not watertight", object.name);
+        }
+    }
+
+    #[test]
+    fn organizer_pieces_sit_on_the_plate_when_assembled() {
+        let (views, _) = organizer_views();
+        let scene = &views.assembled;
+        let (_, plate_max) = part_bounds(scene, "base plate");
+        for piece in ["pen cup", "card holder"] {
+            let (min, _) = part_bounds(scene, piece);
+            assert!((min[2] - plate_max[2]).abs() < 1e-3, "{piece} floats or sinks: {min:?}");
+        }
+        // The cup is round: as wide as it is deep, 70 mm across.
+        let (min, max) = part_bounds(scene, "pen cup");
+        assert!(((max[0] - min[0]) - 70.0).abs() < 0.05 && ((max[1] - min[1]) - 70.0).abs() < 0.05);
+    }
+
     #[test]
     fn bookshelf_defaults_are_millimeters() {
         // A real bookshelf is around a meter wide; a cm-scale model would be ~100.

@@ -89,6 +89,15 @@ coaster holder is a box minus a cutter poking out of the top and front. A
 caught panic still prints truck's panic message to stderr. Kernel tests pin
 the failing cases, so a truck upgrade that fixes them will show up.
 
+**Booleans leave implicit intersection curves** on their new edges, which
+truck evaluates numerically. After some transforms (arrange moving the
+desk organizer's card holder to (83, 140.2)), that evaluation never
+converged, so tessellation hung and the app never opened its window. Every
+boolean result is therefore made explicit right away, while the curves
+still evaluate reliably: a `Line` when the samples are straight, a 64-segment
+polyline B-spline otherwise. A kernel test moves the card holder to that
+offset under a timeout.
+
 ### Curved edges and bounds
 
 Line edges are their two endpoints. Curved edges (circles, and boolean
@@ -248,6 +257,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 |---|---|
 | `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
 | `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
+| `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). It prints as three closed parts on one 256 mm plate. |
 | `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a tray with a floor and three walls, open at the front: a box minus an overshooting cutter. Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
 
 ## Testing
