@@ -36,6 +36,24 @@ pub struct ExportObject {
     pub triangle_colors: Vec<Rgb>,
 }
 
+impl ExportObject {
+    /// Closed and consistently oriented (what slicers need): every directed
+    /// edge appears exactly once and its reverse exactly once. Several
+    /// disjoint closed shells in one object are fine.
+    pub fn is_closed(&self) -> bool {
+        let mut edges: HashMap<(u32, u32), usize> = HashMap::new();
+        for [a, b, c] in &self.triangles {
+            for edge in [(*a, *b), (*b, *c), (*c, *a)] {
+                *edges.entry(edge).or_default() += 1;
+            }
+        }
+        !edges.is_empty()
+            && edges
+                .iter()
+                .all(|(&(from, to), &count)| count == 1 && edges.get(&(to, from)) == Some(&1))
+    }
+}
+
 /// Splits `scene` into one welded object per part name (first-seen order; a
 /// part split into several runs becomes one object), then [`UNNAMED`] for any
 /// triangles outside parts.
@@ -300,6 +318,17 @@ mod tests {
     }
 
     #[test]
+    fn is_closed_rejects_open_surfaces() {
+        let plate = objects(&build(&part("plate", rect(5.0, 5.0))));
+        assert!(!plate[0].is_closed(), "a lone face has open edges");
+        let block = objects(&build(&part("block", sized_box(1.0, 1.0, 1.0))));
+        assert!(block[0].is_closed());
+        // Two disjoint boxes in one part are still closed.
+        let pair = group(vec![sized_box(1.0, 1.0, 1.0), translate([3.0, 0.0, 0.0], sized_box(1.0, 1.0, 1.0))]);
+        assert!(objects(&build(&part("pair", pair)))[0].is_closed());
+    }
+
+    #[test]
     fn box_part_exports_as_closed_outward_mesh() {
         let scene = build(&part("block", sized_box(2.0, 3.0, 4.0)));
         let objects = objects(&scene);
@@ -310,6 +339,7 @@ mod tests {
         assert_eq!(block.vertices.len(), 8, "corners must be welded");
         assert_eq!(block.triangles.len(), 12);
         assert_watertight(block);
+        assert!(block.is_closed());
         assert!((signed_volume(block) - 24.0).abs() < 1e-3, "{}", signed_volume(block));
     }
 

@@ -210,6 +210,14 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 - `export_3mf` in `cad-app` evaluates, picks the view, writes the file, and
   deletes a partial file on failure.
 
+## Example models
+
+| Model | Shows |
+|---|---|
+| `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
+| `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
+| `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one), stacked when assembled and packed four to a 256 mm plate for print. It exports as 8 closed objects in 3 colors. |
+
 ## Testing
 
 Run `cargo test --workspace`. Verification goes through tests, not by

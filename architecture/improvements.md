@@ -35,8 +35,8 @@ the improvement.
   (Bambu/Orca `model_settings.config`, Prusa `Slic3r_PE_model.config`) so
   parts arrive pre-assigned.
 - **Open surfaces in export.** A 2D `rect` exports as a single-face object,
-  which isn't watertight and slicers will reject. Warn or skip non-closed
-  parts on export.
+  which isn't watertight and slicers will reject. `ExportObject::is_closed()`
+  already detects this, so warn on or skip non-closed parts at export.
 - **Export from the viewer.** Export is CLI-only. Add an Export 3MF button
   to the overlay.
 - **Units in the UI.** Show model dimensions in mm in the overlay, which

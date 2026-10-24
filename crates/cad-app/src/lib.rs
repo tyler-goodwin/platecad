@@ -850,7 +850,7 @@ mod tests {
                 count += 1;
             }
         }
-        assert!(count >= 3, "expected square, cube and bookshelf; found {count}");
+        assert!(count >= 4, "expected square, cube, bookshelf and coasters; found {count}");
     }
 
     /// Bookshelf views through the real script host and truck kernel.
@@ -1153,6 +1153,108 @@ mod tests {
             export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, &out).unwrap();
         assert!(summary.contains("\nwarning: 1 part doesn't fit"), "{summary}");
         assert!(out.exists());
+    }
+
+    // --- Coaster set (the printable example) ----------------------------------
+
+    /// Temp project with the repo's coasters.ts, a 256 mm bed, and a model
+    /// calling `coasters(params)`.
+    fn coaster_project(params: &str) -> Project {
+        let project = Project::new(&format!(
+            "import {{ coasters }} from \"./coasters.ts\";\nexport default () => coasters({params});\n"
+        ));
+        let source = std::fs::read_to_string(repo_root().join("models/coasters.ts")).unwrap();
+        project.write("models/coasters.ts", &source);
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+        project
+    }
+
+    fn coaster_views(params: &str) -> (SceneViews, Vec<Diagnostic>) {
+        let project = coaster_project(params);
+        let update = project.pipeline().evaluate(&project.model());
+        (update.views.expect("coasters build"), update.diagnostics)
+    }
+
+    fn part_bounds(scene: &TessellatedScene, name: &str) -> ([f32; 3], [f32; 3]) {
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
+        let mut found = false;
+        for part in scene.parts.iter().filter(|p| p.name == name) {
+            found = true;
+            for p in &scene.positions[part.vertices.start as usize..part.vertices.end as usize] {
+                for i in 0..3 {
+                    min[i] = min[i].min(p[i]);
+                    max[i] = max[i].max(p[i]);
+                }
+            }
+        }
+        assert!(found, "no part {name:?}");
+        (min, max)
+    }
+
+    #[test]
+    fn coasters_fit_four_to_a_plate_without_warnings() {
+        for (count, plates) in [(4, 1), (6, 2), (9, 3)] {
+            let (views, diagnostics) = coaster_views(&format!("{{ count: {count} }}"));
+            assert!(diagnostics.iter().all(|d| d.ok && !d.warning), "{diagnostics:?}");
+            assert_eq!(views.print.unwrap().plates.len(), plates, "{count} coasters");
+        }
+    }
+
+    #[test]
+    fn coaster_inlay_sits_on_its_base_inside_the_margin() {
+        let (views, _) = coaster_views("{ count: 2, size: 95, base: 4, inlay: 1, margin: 8 }");
+        for scene in [&views.assembled, views.print.as_ref().unwrap()] {
+            for n in 1..=2 {
+                let (base_min, base_max) = part_bounds(scene, &format!("coaster {n} base"));
+                let (inlay_min, inlay_max) = part_bounds(scene, &format!("coaster {n} inlay"));
+                assert!((inlay_min[2] - base_max[2]).abs() < 1e-3, "inlay {n} not on its base");
+                assert!((inlay_max[2] - inlay_min[2] - 1.0).abs() < 1e-3);
+                for i in 0..2 {
+                    assert!(inlay_min[i] >= base_min[i] + 8.0 - 1e-3, "coaster {n} margin");
+                    assert!(inlay_max[i] <= base_max[i] - 8.0 + 1e-3, "coaster {n} margin");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coasters_stack_when_assembled_and_lie_flat_for_print() {
+        let (views, _) = coaster_views("{ count: 4, base: 4, inlay: 1 }");
+        let assembled = views.assembled.aabb().unwrap();
+        assert!((assembled.max[2] - 4.0 * 5.0).abs() < 1e-3, "{assembled:?}");
+        let print = views.print.unwrap().aabb().unwrap();
+        assert!((print.max[2] - 5.0).abs() < 1e-3 && print.min[2].abs() < 1e-3, "{print:?}");
+    }
+
+    #[test]
+    fn coasters_export_as_closed_multi_material_objects() {
+        let (views, _) = coaster_views("{ count: 4, inlayColors: [\"#e8b04f\", \"#4fa3a5\"] }");
+        let objects = cad_export::objects(views.print.as_ref().unwrap());
+        assert_eq!(objects.len(), 8, "a base and an inlay per coaster");
+        for object in &objects {
+            assert!(object.is_closed(), "{} is not watertight", object.name);
+            assert_ne!(object.name, cad_export::UNNAMED);
+        }
+        let mut colors: Vec<_> = objects.iter().flat_map(|o| o.triangle_colors.clone()).collect();
+        colors.sort();
+        colors.dedup();
+        assert_eq!(colors.len(), 3, "base + two inlay colors = three filaments");
+    }
+
+    #[test]
+    fn coaster_params_are_validated() {
+        for (params, message) in [
+            ("{ count: 0 }", "count must be"),
+            ("{ stripes: 2.5 }", "stripes must be"),
+            ("{ size: 10, margin: 8 }", "leaves no room"),
+            ("{ inlayColors: [] }", "at least one color"),
+        ] {
+            let project = coaster_project(params);
+            let update = project.pipeline().evaluate(&project.model());
+            assert!(update.views.is_none(), "{params} accepted");
+            assert!(update.diagnostics[0].message.contains(message), "{params}: {:?}", update.diagnostics);
+        }
     }
 
     #[test]
