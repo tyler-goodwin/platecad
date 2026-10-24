@@ -23,8 +23,11 @@ the improvement.
 
 ## Print workflow
 
-- **Bed-aware arrange.** `Arrange` makes a single row along X. Wrap rows at
-  the bed width, pack in 2D, and spread across plates.
+- **Smarter packing.** `Arrange` packs in input order, row by row, and never
+  rotates parts. It could try turning a part 90 degrees to fit, sort parts
+  by size, or use a real 2D bin-packing algorithm.
+- **Multi-plate 3MF.** Export puts every plate's parts into one coordinate
+  space. Bambu/Orca/Prusa have their own metadata for separate plates.
 - **Auto-orient.** Lay a part on its largest planar face automatically
   instead of hand-building print orientations.
 - **Filament mapping.** 3MF export writes core-spec colors only. Merge

@@ -56,10 +56,14 @@ export type PartSpec = {
   shape: ModelSpec;
 };
 
+/** A printer's build volume, mm. */
+export type Bed = { width: number; depth: number; height: number };
+
 export type ArrangeSpec = {
   kind: "Arrange";
   gap: number;
   children: ModelSpec[];
+  bed?: Bed;
 };
 
 /** 2D shapes that can be swept into solids. */
@@ -175,11 +179,14 @@ export function part(name: string, shape: ModelSpec): PartSpec {
 }
 
 /**
- * Print layout: puts each part on the plate (its lowest point at z = 0) and lines
- * them up along +X with `gap` mm between bounding boxes. Orient parts yourself
- * first (e.g. build boards lying flat); this only moves them.
+ * Print layout: puts each part on the plate (its lowest point at z = 0), in
+ * rows `gap` mm apart. Orient parts yourself first (e.g. build boards lying
+ * flat); this only moves them.
+ *
+ * Rows wrap at the bed width and spill onto more plates when the bed fills.
+ * The bed comes from `printer.toml` at the project root unless given here.
  */
-export function arrange(parts: ModelSpec[], opts: { gap?: number } = {}): ArrangeSpec {
+export function arrange(parts: ModelSpec[], opts: { gap?: number; bed?: Bed } = {}): ArrangeSpec {
   const gap = opts.gap ?? 10;
   if (parts.length === 0) {
     throw new Error("arrange needs at least one part");
@@ -187,7 +194,15 @@ export function arrange(parts: ModelSpec[], opts: { gap?: number } = {}): Arrang
   if (!(gap >= 0)) {
     throw new Error(`arrange gap must be >= 0 (got ${gap})`);
   }
-  return { kind: "Arrange", gap, children: parts };
+  const spec: ArrangeSpec = { kind: "Arrange", gap, children: parts };
+  if (opts.bed) {
+    const { width, depth, height } = opts.bed;
+    if (![width, depth, height].every((d) => d > 0 && Number.isFinite(d))) {
+      throw new Error(`arrange bed sizes must be positive (got ${JSON.stringify(opts.bed)})`);
+    }
+    spec.bed = { width, depth, height };
+  }
+  return spec;
 }
 
 /**

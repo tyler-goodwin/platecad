@@ -66,7 +66,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Group { children }` | Shapes shown together. Not a boolean union. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
 | `Part { name, shape }` | Names a shape as a part, for export and the part list. The innermost name wins; a named profile names its extrusion. |
-| `Arrange { gap, children }` | Print layout: drops each child onto the plate (z = 0, y = 0) and lines them up along +X. |
+| `Arrange { gap, children, bed? }` | Print layout: drops each child onto the plate (z = 0), moving it as a unit and never rotating it. Rows wrap at the bed width and spill onto more plates, which sit in a grid. With no bed, rows wrap into a roughly square block. |
 
 `ModelViews` is what a model exports: `assembled` (how it looks put together)
 and an optional `print` (parts oriented and arranged for a slicer). A bare
@@ -78,7 +78,10 @@ edge line list taken from the B-rep edges. `parts` lists named runs as
 `ScenePart { name, vertices, indices }`. Each run covers a contiguous range,
 and its indices only reference its own vertices, so a part can be cut out as
 its own mesh. Consecutive bodies with the same name share one run; a nested
-part splits its parent into several runs.
+part splits its parent into several runs. `plates` holds the footprints of the
+build plates an `Arrange` with a bed used. These are recorded in the
+arrange's own frame, so an arrange belongs at the root of a print view, not
+inside a transform.
 
 ### Why a data IR instead of live kernel calls
 
@@ -148,11 +151,41 @@ when the model has one, and the assembled view otherwise.
 - The egui overlay has an **Assembled/Print toggle** (Print is disabled when
   the model has no print view), a collapsible **part list** for the shown
   view (name and triangle count), reload diagnostics and an orbit hint.
+- In Print view, build plates are outlined in blue at z = 0, and framing
+  includes them.
 - The camera frames the shown view when it first appears and when you switch
   views. Reloads keep your camera. Framing also sets the clip planes from the
   model's size, so anything from a 1 mm part to a 10 m assembly stays visible
   across the whole orbit range. Fixed planes once clipped the 1 m bookshelf
   entirely.
+
+## Printer config
+
+`printer.toml` at the project root holds printer limits (mm):
+
+```toml
+[bed]
+width = 256
+depth = 256
+height = 256
+```
+
+- **Optional.** Without it, print views pack into a square-ish block with
+  no plates.
+- **Applied to unset beds.** The pipeline fills it into every `Arrange` in
+  the print view that doesn't set its own `bed`. A model's
+  `arrange(parts, { bed })` wins.
+- **Watched for edits.** It's always one of the model's dependencies, even
+  before it exists, so editing or creating it re-lays out the print view
+  live.
+- **Strictly checked.** Unknown keys, missing fields and non-positive sizes
+  are errors that name the file, and the last good meshes stay on screen.
+- **Size warnings.** After building, any part bigger than the bed as
+  oriented (width, depth or height) produces one warning listing all such
+  parts. Without a config, the plate size from an explicit bed is used,
+  minus the height check. Warnings keep the meshes, show in amber in the
+  overlay, print as `warning:` on the CLI, and are appended to the export
+  summary.
 
 ## 3MF export
 

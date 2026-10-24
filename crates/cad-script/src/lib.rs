@@ -338,6 +338,7 @@ mod tests {
             Some(ModelSpec::Arrange {
                 gap: 3.0,
                 children: vec![unit_cube()],
+                bed: None,
             })
         );
     }
@@ -349,6 +350,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(views, ModelViews::assembled_only(unit_cube()));
+    }
+
+    #[test]
+    fn dsl_arrange_accepts_an_explicit_bed() {
+        let views = eval_views(
+            r#"import { arrange, cube } from "./dsl/cad.ts";
+            export default () => ({
+                assembled: cube(1),
+                print: arrange([cube(1)], { bed: { width: 180, depth: 180, height: 180 } }),
+            });"#,
+        )
+        .unwrap();
+        let Some(ModelSpec::Arrange { bed, .. }) = views.print else {
+            panic!("{views:?}")
+        };
+        assert_eq!(
+            bed,
+            Some(cad_ir::Bed {
+                width: 180.0,
+                depth: 180.0,
+                height: 180.0
+            })
+        );
     }
 
     #[test]
@@ -370,7 +394,11 @@ mod tests {
             "{views:?}"
         );
 
-        for bad in ["arrange([])", "arrange([cube(1)], { gap: -1 })"] {
+        for bad in [
+            "arrange([])",
+            "arrange([cube(1)], { gap: -1 })",
+            "arrange([cube(1)], { bed: { width: 0, depth: 1, height: 1 } })",
+        ] {
             let source = format!(
                 r#"import {{ arrange, cube }} from "./dsl/cad.ts";
                 export default () => {bad};"#

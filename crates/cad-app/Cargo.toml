@@ -15,6 +15,8 @@ cad-view.workspace = true
 cad-view-threed.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 notify = "8"
+serde = { workspace = true }
+toml = "0.8"
 
 [dev-dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }

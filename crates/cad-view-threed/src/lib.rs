@@ -1,12 +1,17 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use cad_ir::{Aabb, DEFAULT_COLOR, Diagnostic, TessellatedScene};
+use cad_ir::{Aabb, DEFAULT_COLOR, Diagnostic, Plate, TessellatedScene};
 use cad_view::{SceneUpdate, ViewError, ViewMode, ViewSelection, ViewportApp};
 use three_d::egui;
 use three_d::*;
 
 /// Vertical field of view of the viewport camera.
 const FOV_Y_DEGREES: f32 = 45.0;
+
+/// B-rep edge lines.
+const EDGE_COLOR: [u8; 3] = [25, 30, 40];
+/// Build plate outlines in the print view.
+const PLATE_COLOR: [u8; 3] = [90, 150, 210];
 
 /// three-d window with an orbit camera and an egui status overlay.
 pub struct ThreeDViewport {
@@ -114,12 +119,8 @@ impl ViewportApp for ThreeDViewport {
                                 }
                             }
                             for d in &state.diagnostics {
-                                let color = if d.ok {
-                                    egui::Color32::from_rgb(120, 200, 120)
-                                } else {
-                                    egui::Color32::from_rgb(230, 100, 100)
-                                };
-                                ui.colored_label(color, &d.message);
+                                let [r, g, b] = diagnostic_color(d);
+                                ui.colored_label(egui::Color32::from_rgb(r, g, b), &d.message);
                             }
                             if state.disconnected {
                                 ui.label("Reload thread stopped.");
@@ -152,18 +153,60 @@ impl ViewportApp for ThreeDViewport {
 struct GpuScene {
     model: Option<Gm<Mesh, PhysicalMaterial>>,
     edges: Option<Gm<InstancedMesh, ColorMaterial>>,
+    plates: Option<Gm<InstancedMesh, ColorMaterial>>,
     aabb: Option<Aabb>,
     parts: Vec<(String, usize)>,
 }
 
 impl GpuScene {
     fn new(context: &Context, scene: &TessellatedScene) -> Self {
+        let aabb = view_bounds(scene);
+        let radius = aabb.map(|b| framing(b).edge_radius).unwrap_or(1.0);
+        let edges = scene.edges.chunks_exact(2).map(|pair| (pair[0], pair[1]));
         Self {
             model: build_model(context, scene),
-            edges: build_edges(context, scene),
-            aabb: scene.aabb(),
+            edges: build_lines(context, edges, radius, EDGE_COLOR),
+            plates: build_lines(context, plate_segments(&scene.plates), radius, PLATE_COLOR),
+            aabb,
             parts: part_list(scene),
         }
+    }
+}
+
+/// What the camera should frame: the geometry plus any build plates.
+fn view_bounds(scene: &TessellatedScene) -> Option<Aabb> {
+    let corners = scene.plates.iter().flat_map(|p| {
+        let [x, y] = p.min;
+        let [w, d] = p.size;
+        [[x, y, 0.0], [x + w, y + d, 0.0]]
+    });
+    let points: Vec<[f32; 3]> = scene.positions.iter().copied().chain(corners).collect();
+    TessellatedScene {
+        positions: points,
+        ..Default::default()
+    }
+    .aabb()
+}
+
+/// Outline segments of each plate, at z = 0.
+fn plate_segments(plates: &[Plate]) -> Vec<([f32; 3], [f32; 3])> {
+    plates
+        .iter()
+        .flat_map(|p| {
+            let [x0, y0] = p.min;
+            let [x1, y1] = [x0 + p.size[0], y0 + p.size[1]];
+            let c = [[x0, y0, 0.0], [x1, y0, 0.0], [x1, y1, 0.0], [x0, y1, 0.0]];
+            (0..4).map(move |i| (c[i], c[(i + 1) % 4]))
+        })
+        .collect()
+}
+
+/// Overlay text color: green for OK, amber for warnings, red for errors.
+fn diagnostic_color(d: &Diagnostic) -> [u8; 3] {
+    match (d.ok, d.warning) {
+        (true, false) => [120, 200, 120],
+        (true, true) => [235, 180, 70],
+        (false, _) => [230, 100, 100],
     }
 }
 
@@ -230,6 +273,9 @@ impl ViewState {
             if let Some(edges) = &scene.edges {
                 objects.push(edges);
             }
+            if let Some(plates) = &scene.plates {
+                objects.push(plates);
+            }
         }
         objects
     }
@@ -282,13 +328,16 @@ fn vertex_colors(scene: &TessellatedScene) -> Option<Vec<Srgba>> {
     })
 }
 
-/// Draws the B-rep edge list as thin cylinders (GL line width isn't portable).
-fn build_edges(context: &Context, scene: &TessellatedScene) -> Option<Gm<InstancedMesh, ColorMaterial>> {
-    let framing = framing(scene.aabb()?);
-    let transformations: Vec<Mat4> = scene
-        .edges
-        .chunks_exact(2)
-        .filter_map(|pair| edge_transform(to_vec3(pair[0]), to_vec3(pair[1])))
+/// Draws line segments as thin cylinders (GL line width isn't portable).
+fn build_lines(
+    context: &Context,
+    segments: impl IntoIterator<Item = ([f32; 3], [f32; 3])>,
+    radius: f32,
+    [r, g, b]: [u8; 3],
+) -> Option<Gm<InstancedMesh, ColorMaterial>> {
+    let transformations: Vec<Mat4> = segments
+        .into_iter()
+        .filter_map(|(a, b)| edge_transform(to_vec3(a), to_vec3(b)))
         .collect();
     if transformations.is_empty() {
         return None;
@@ -296,14 +345,14 @@ fn build_edges(context: &Context, scene: &TessellatedScene) -> Option<Gm<Instanc
 
     let mut cylinder = CpuMesh::cylinder(8);
     cylinder
-        .transform(Mat4::from_nonuniform_scale(1.0, framing.edge_radius, framing.edge_radius))
+        .transform(Mat4::from_nonuniform_scale(1.0, radius, radius))
         .ok()?;
     let instances = Instances {
         transformations,
         ..Default::default()
     };
     let material = ColorMaterial {
-        color: Srgba::new(25, 30, 40, 255),
+        color: Srgba::new(r, g, b, 255),
         ..Default::default()
     };
     Some(Gm::new(InstancedMesh::new(context, &instances, &cylinder), material))
@@ -442,6 +491,54 @@ mod tests {
             vec![("frame".to_string(), 4), ("leg".to_string(), 12)]
         );
         assert!(part_list(&TessellatedScene::default()).is_empty());
+    }
+
+    fn plate(min: [f32; 2], size: [f32; 2]) -> Plate {
+        Plate { min, size }
+    }
+
+    #[test]
+    fn plate_outlines_are_closed_rectangles_on_the_bed() {
+        let segments = plate_segments(&[plate([0.0, 0.0], [256.0, 200.0]), plate([300.0, 0.0], [256.0, 200.0])]);
+        assert_eq!(segments.len(), 8);
+        for chunk in segments.chunks(4) {
+            for i in 0..4 {
+                assert_eq!(chunk[i].1, chunk[(i + 1) % 4].0, "outline must close");
+                assert_eq!((chunk[i].0[2], chunk[i].1[2]), (0.0, 0.0));
+            }
+        }
+        assert_eq!(segments[4].0, [300.0, 0.0, 0.0]);
+        assert_eq!(segments[5].1, [556.0, 200.0, 0.0]);
+    }
+
+    #[test]
+    fn view_bounds_include_plates() {
+        let scene = TessellatedScene {
+            positions: vec![[10.0, 10.0, 0.0], [20.0, 20.0, 5.0]],
+            plates: vec![plate([0.0, 0.0], [256.0, 256.0])],
+            ..Default::default()
+        };
+        let b = view_bounds(&scene).unwrap();
+        assert_eq!((b.min, b.max), ([0.0, 0.0, 0.0], [256.0, 256.0, 5.0]));
+
+        let bare = TessellatedScene {
+            positions: vec![[1.0, 2.0, 3.0]],
+            ..Default::default()
+        };
+        assert_eq!(view_bounds(&bare), bare.aabb());
+        assert_eq!(view_bounds(&TessellatedScene::default()), None);
+    }
+
+    #[test]
+    fn diagnostics_are_green_amber_red() {
+        let [ok, warning, error] = [
+            diagnostic_color(&Diagnostic::ok("")),
+            diagnostic_color(&Diagnostic::warning("")),
+            diagnostic_color(&Diagnostic::error("")),
+        ];
+        assert!(ok[1] > ok[0] && ok[1] > ok[2], "ok should read green: {ok:?}");
+        assert!(warning[0] > warning[2] && warning[1] > warning[2], "warning should read amber: {warning:?}");
+        assert!(error[0] > error[1] && error[0] > error[2], "error should read red: {error:?}");
     }
 
     #[test]

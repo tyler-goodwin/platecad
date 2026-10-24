@@ -1,0 +1,12 @@
+# Printer limits for print views (millimeters).
+#
+# arrange() in a model's print view packs parts onto plates of this size,
+# and the viewer warns about parts that don't fit. Edits hot-reload.
+# A model can override this with arrange(parts, { bed: { ... } }).
+
+# Build volume. 256 x 256 x 256 matches Bambu Lab X1/P1/A1; Prusa MK4 is
+# 250 x 210 x 220.
+[bed]
+width = 256
+depth = 256
+height = 256

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use cad_ir::{DEFAULT_COLOR, ModelSpec, Rgb, ScenePart, TessellatedScene};
+use cad_ir::{Bed, DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
 use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Vector3, builder};
@@ -17,9 +17,11 @@ impl Kernel for TruckKernel {
 
     fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError> {
         let mut scene = TessellatedScene::default();
-        for body in build_bodies(spec, &Style::default())? {
+        let mut plates = Vec::new();
+        for body in build_bodies(spec, &Style::default(), &mut plates)? {
             tessellate_into(&mut scene, &body);
         }
+        scene.plates = plates;
         Ok(scene)
     }
 }
@@ -56,7 +58,14 @@ impl Body {
     }
 }
 
-fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelError> {
+/// `plates` collects build plates from `Arrange` nodes with a bed. They're in
+/// the arrange's own frame: an arrange is expected at (or near) the root of a
+/// print view, not inside a transform.
+fn build_bodies(
+    spec: &ModelSpec,
+    style: &Style,
+    plates: &mut Vec<Plate>,
+) -> Result<Vec<Body>, KernelError> {
     match spec {
         ModelSpec::Rect { .. } => Ok(vec![Body {
             shell: Shell::from(vec![build_face(spec)?]),
@@ -80,7 +89,7 @@ fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelErro
                 style: profile_style(profile, style.clone()),
             }])
         }
-        ModelSpec::Translate { offset, shape } => Ok(build_bodies(shape, style)?
+        ModelSpec::Translate { offset, shape } => Ok(build_bodies(shape, style, plates)?
             .into_iter()
             .map(|body| body.map(|shell| builder::translated(shell, to_vector(*offset))))
             .collect()),
@@ -91,7 +100,7 @@ fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelErro
             shape,
         } => {
             let rotation = Rotation::new(*axis, *degrees, *origin)?;
-            Ok(build_bodies(shape, style)?
+            Ok(build_bodies(shape, style, plates)?
                 .into_iter()
                 .map(|body| body.map(|shell| rotation.apply(shell)))
                 .collect())
@@ -102,7 +111,7 @@ fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelErro
             }
             let mut bodies = Vec::new();
             for child in children {
-                bodies.extend(build_bodies(child, style)?);
+                bodies.extend(build_bodies(child, style, plates)?);
             }
             Ok(bodies)
         }
@@ -112,6 +121,7 @@ fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelErro
                 color: *rgb,
                 ..style.clone()
             },
+            plates,
         ),
         ModelSpec::Part { name, shape } => build_bodies(
             shape,
@@ -119,30 +129,133 @@ fn build_bodies(spec: &ModelSpec, style: &Style) -> Result<Vec<Body>, KernelErro
                 part: Some(validate_part_name(name)?),
                 ..style.clone()
             },
+            plates,
         ),
-        ModelSpec::Arrange { gap, children } => {
+        ModelSpec::Arrange { gap, children, bed } => {
             if children.is_empty() {
                 return Err(KernelError::Invalid("arrange needs at least one child".into()));
             }
-            if !(*gap >= 0.0) {
+            if !(*gap >= 0.0 && gap.is_finite()) {
                 return Err(KernelError::Invalid("arrange gap must be >= 0".into()));
             }
-            let mut arranged = Vec::new();
-            let mut x = 0.0;
+            if let Some(bed) = bed {
+                let dims = [bed.width, bed.depth, bed.height];
+                if !dims.iter().all(|d| *d > 0.0 && d.is_finite()) {
+                    return Err(KernelError::Invalid("bed width, depth and height must be positive".into()));
+                }
+            }
+
+            let mut built = Vec::new();
+            let mut footprints = Vec::new();
             for child in children {
-                let bodies = build_bodies(child, style)?;
+                let bodies = build_bodies(child, style, plates)?;
                 let (min, max) = bodies_bounds(&bodies)
                     .ok_or_else(|| KernelError::Invalid("arrange child has no geometry".into()))?;
-                let offset = Vector3::new(x - min.x, -min.y, -min.z);
+                footprints.push([max.x - min.x, max.y - min.y]);
+                built.push((bodies, min));
+            }
+
+            let packing = pack(&footprints, *gap, bed.as_ref());
+            plates.extend(packing.plates);
+            let mut arranged = Vec::new();
+            for ((bodies, min), [x, y]) in built.into_iter().zip(packing.positions) {
+                let offset = Vector3::new(x - min.x, y - min.y, -min.z);
                 arranged.extend(
                     bodies
                         .into_iter()
                         .map(|body| body.map(|shell| builder::translated(shell, offset))),
                 );
-                x += (max.x - min.x) + gap;
             }
             Ok(arranged)
         }
+    }
+}
+
+/// Where `arrange` puts each child (the min corner of its XY footprint) and
+/// which build plates that uses.
+#[derive(Debug, Clone, PartialEq)]
+struct Packing {
+    positions: Vec<[f64; 2]>,
+    plates: Vec<Plate>,
+}
+
+/// Tolerance so parts that exactly fill the bed still fit.
+const FIT_EPSILON: f64 = 1e-6;
+
+/// Next-fit row packing, keeping children in order. Rows wrap at the bed width
+/// (or, without a bed, at a width that makes the block roughly square). With a
+/// bed, a new plate starts when the next row would overrun the bed depth, and
+/// plates are laid out in a near-square grid. A part bigger than the bed still
+/// gets a spot (alone at the start of a row or plate); callers warn about it.
+fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
+    let wrap = match bed {
+        Some(bed) => bed.width,
+        None => {
+            let area: f64 = footprints.iter().map(|[w, d]| (w + gap) * (d + gap)).sum();
+            let widest = footprints.iter().map(|[w, _]| *w).fold(0.0, f64::max);
+            widest.max(area.sqrt() * 1.3)
+        }
+    };
+
+    // Plate-local placement.
+    let mut local = Vec::with_capacity(footprints.len());
+    let (mut plate, mut x, mut y, mut row_depth) = (0usize, 0.0, 0.0, 0.0f64);
+    for &[w, d] in footprints {
+        if x > 0.0 && x + w > wrap + FIT_EPSILON {
+            x = 0.0;
+            y += row_depth + gap;
+            row_depth = 0.0;
+        }
+        if let Some(bed) = bed {
+            if y > 0.0 && y + d > bed.depth + FIT_EPSILON {
+                plate += 1;
+                (x, y, row_depth) = (0.0, 0.0, 0.0);
+            }
+        }
+        local.push((plate, x, y));
+        x += w + gap;
+        row_depth = row_depth.max(d);
+    }
+
+    let Some(bed) = bed else {
+        return Packing {
+            positions: local.into_iter().map(|(_, x, y)| [x, y]).collect(),
+            plates: Vec::new(),
+        };
+    };
+
+    // Plates in a grid. Cells grow if an oversize part hangs off its plate, so
+    // neighbouring plates never overlap.
+    let count = plate + 1;
+    let columns = (count as f64).sqrt().ceil() as usize;
+    let mut cell = [bed.width, bed.depth];
+    for (&(_, x, y), [w, d]) in local.iter().zip(footprints) {
+        cell = [cell[0].max(x + w), cell[1].max(y + d)];
+    }
+    let plate_gap = (bed.width.min(bed.depth) * 0.1).max(gap);
+    let origin = |k: usize| {
+        [
+            (k % columns) as f64 * (cell[0] + plate_gap),
+            (k / columns) as f64 * (cell[1] + plate_gap),
+        ]
+    };
+    Packing {
+        positions: local
+            .into_iter()
+            .map(|(k, x, y)| {
+                let [ox, oy] = origin(k);
+                [ox + x, oy + y]
+            })
+            .collect(),
+        plates: (0..count)
+            .map(|k| {
+                let [ox, oy] = origin(k);
+                Plate {
+                    min: [ox as f32, oy as f32],
+                    size: [bed.width as f32, bed.depth as f32],
+                }
+            })
+            .collect(),
     }
 }
 
@@ -547,7 +660,27 @@ mod tests {
     }
 
     fn arrange(gap: f64, children: Vec<ModelSpec>) -> ModelSpec {
-        ModelSpec::Arrange { gap, children }
+        ModelSpec::Arrange {
+            gap,
+            children,
+            bed: None,
+        }
+    }
+
+    fn arrange_on(bed: Bed, gap: f64, children: Vec<ModelSpec>) -> ModelSpec {
+        ModelSpec::Arrange {
+            gap,
+            children,
+            bed: Some(bed),
+        }
+    }
+
+    fn bed(width: f64, depth: f64) -> Bed {
+        Bed {
+            width,
+            depth,
+            height: 250.0,
+        }
     }
 
     fn sized_box(x: f64, y: f64, z: f64) -> ModelSpec {
@@ -573,7 +706,9 @@ mod tests {
     #[test]
     fn arrange_puts_children_on_plate_in_a_row() {
         // Children start floating, below the plate, and overlapping each other.
-        let spec = arrange(
+        // The bed is wide enough that they share one row.
+        let spec = arrange_on(
+            bed(1000.0, 1000.0),
             5.0,
             vec![
                 translate([100.0, 50.0, 20.0], sized_box(10.0, 20.0, 2.0)),
@@ -596,6 +731,124 @@ mod tests {
                 assert!((got.min[i] - min[i]).abs() < 1e-4, "{got:?}");
                 assert!((got.max[i] - max[i]).abs() < 1e-4, "{got:?}");
             }
+        }
+    }
+
+    fn assert_positions(got: &[[f64; 2]], want: &[[f64; 2]]) {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g[0] - w[0]).abs() < 1e-9 && (g[1] - w[1]).abs() < 1e-9, "{got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn pack_without_bed_makes_a_roughly_square_block() {
+        let packing = pack(&[[10.0, 10.0]; 4], 0.0, None);
+        assert_positions(&packing.positions, &[[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]]);
+        assert!(packing.plates.is_empty());
+    }
+
+    #[test]
+    fn pack_wraps_rows_at_bed_width_and_fills_plates() {
+        // 90 mm coasters, 10 mm gap, 256 mm bed: 2 per row, 2 rows per plate.
+        let packing = pack(&[[90.0, 90.0]; 6], 10.0, Some(&bed(256.0, 256.0)));
+        let second_plate = 256.0 + 25.6;
+        assert_positions(
+            &packing.positions,
+            &[
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [0.0, 100.0],
+                [100.0, 100.0],
+                [second_plate, 0.0],
+                [second_plate + 100.0, 0.0],
+            ],
+        );
+        assert_eq!(packing.plates.len(), 2);
+        assert_eq!(packing.plates[1].min, [second_plate as f32, 0.0]);
+        assert_eq!(packing.plates[1].size, [256.0, 256.0]);
+    }
+
+    #[test]
+    fn pack_exact_fit_shares_a_row() {
+        let packing = pack(&[[123.0, 50.0], [123.0, 50.0]], 10.0, Some(&bed(256.0, 256.0)));
+        assert_positions(&packing.positions, &[[0.0, 0.0], [133.0, 0.0]]);
+        assert_eq!(packing.plates.len(), 1);
+    }
+
+    #[test]
+    fn pack_lays_many_plates_out_in_a_grid() {
+        // One 200 mm square per 256 mm plate: 5 plates -> 3 columns, 2 rows.
+        let packing = pack(&[[200.0, 200.0]; 5], 10.0, Some(&bed(256.0, 256.0)));
+        let mins: Vec<[f32; 2]> = packing.plates.iter().map(|p| p.min).collect();
+        let step = 256.0 + 25.6;
+        assert_eq!(
+            mins,
+            [[0.0, 0.0], [step, 0.0], [2.0 * step, 0.0], [0.0, step], [step, step]]
+        );
+    }
+
+    #[test]
+    fn pack_gives_oversize_parts_their_own_spot_without_overlap() {
+        let parts = [[300.0, 300.0], [300.0, 300.0], [50.0, 50.0]];
+        let packing = pack(&parts, 10.0, Some(&bed(256.0, 256.0)));
+        assert_eq!(packing.plates.len(), 3, "{packing:?}");
+        assert_no_overlap(&parts, &packing.positions);
+        // Plates are spaced by the oversize footprint, so they don't collide either.
+        assert!(packing.plates[1].min[0] >= 300.0);
+    }
+
+    fn assert_no_overlap(parts: &[[f64; 2]], positions: &[[f64; 2]]) {
+        for i in 0..parts.len() {
+            for j in i + 1..parts.len() {
+                let (a, b) = (positions[i], positions[j]);
+                let apart = a[0] + parts[i][0] <= b[0] + 1e-9
+                    || b[0] + parts[j][0] <= a[0] + 1e-9
+                    || a[1] + parts[i][1] <= b[1] + 1e-9
+                    || b[1] + parts[j][1] <= a[1] + 1e-9;
+                assert!(apart, "parts {i} and {j} overlap: {positions:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pack_keeps_fitting_parts_on_their_plate_without_overlap() {
+        let parts: Vec<[f64; 2]> = [
+            [120.0, 40.0], [30.0, 200.0], [80.0, 80.0], [250.0, 20.0], [10.0, 10.0],
+            [100.0, 150.0], [60.0, 60.0], [200.0, 100.0], [45.0, 45.0], [256.0, 256.0],
+        ]
+        .to_vec();
+        let bed = bed(256.0, 256.0);
+        let packing = pack(&parts, 5.0, Some(&bed));
+        assert_no_overlap(&parts, &packing.positions);
+        for ([w, d], [x, y]) in parts.iter().zip(&packing.positions) {
+            // Plates are f32 (281.6 becomes 281.6000061), so allow f32 rounding.
+            let on_a_plate = packing.plates.iter().any(|p| {
+                let (px, py) = (p.min[0] as f64, p.min[1] as f64);
+                *x >= px - 1e-3
+                    && *y >= py - 1e-3
+                    && x + w <= px + bed.width + 1e-3
+                    && y + d <= py + bed.depth + 1e-3
+            });
+            assert!(on_a_plate, "{w}x{d} at {x},{y} not inside any plate");
+        }
+    }
+
+    #[test]
+    fn arrange_with_bed_records_plates_in_the_scene() {
+        let coaster = sized_box(90.0, 90.0, 4.0);
+        let scene = TruckKernel
+            .build(&arrange_on(bed(256.0, 256.0), 10.0, vec![coaster; 5]))
+            .unwrap();
+        assert_eq!(scene.plates.len(), 2);
+        let without_bed = TruckKernel.build(&arrange(10.0, vec![unit_box(); 3])).unwrap();
+        assert!(without_bed.plates.is_empty());
+    }
+
+    #[test]
+    fn rejects_bad_beds() {
+        for bad in [bed(0.0, 256.0), bed(256.0, f64::NAN), bed(-1.0, 1.0)] {
+            assert!(TruckKernel.build(&arrange_on(bad, 1.0, vec![unit_box()])).is_err());
         }
     }
 

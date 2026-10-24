@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use cad_ir::{Bed, Diagnostic, ModelSpec, TessellatedScene};
 use cad_kernel::Kernel;
 use cad_kernel_occ::OccKernel;
 use cad_kernel_truck::TruckKernel;
@@ -19,6 +20,138 @@ pub const DEFAULT_MODEL: &str = "models/cube.ts";
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
 /// A directory containing this file is a project root (imports and watching are scoped to it).
 pub const PROJECT_MARKER: &str = "dsl/cad.ts";
+/// Optional printer limits at the project root.
+pub const PRINTER_CONFIG: &str = "printer.toml";
+
+/// Contents of [`PRINTER_CONFIG`].
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrinterConfig {
+    pub bed: Bed,
+}
+
+/// Reads `root/printer.toml`. `Ok(None)` if there isn't one; an error (naming
+/// the file) if it's unreadable, malformed or has non-positive sizes.
+pub fn load_printer_config(root: &Path) -> Result<Option<PrinterConfig>, String> {
+    let text = match std::fs::read_to_string(root.join(PRINTER_CONFIG)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{PRINTER_CONFIG}: {e}")),
+    };
+    let config: PrinterConfig =
+        toml::from_str(&text).map_err(|e| format!("{PRINTER_CONFIG}: {}", e.message()))?;
+    let Bed {
+        width,
+        depth,
+        height,
+    } = config.bed;
+    if ![width, depth, height].iter().all(|d| *d > 0.0 && d.is_finite()) {
+        return Err(format!("{PRINTER_CONFIG}: bed width, depth and height must be positive"));
+    }
+    Ok(Some(config))
+}
+
+/// `spec` with `bed` filled in on every `Arrange` that doesn't set its own.
+pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
+    let boxed = |shape: Box<ModelSpec>| Box::new(with_default_bed(*shape, bed));
+    let all = |children: Vec<ModelSpec>| {
+        children
+            .into_iter()
+            .map(|c| with_default_bed(c, bed))
+            .collect()
+    };
+    match spec {
+        ModelSpec::Rect { .. } => spec,
+        ModelSpec::Extrude { profile, distance } => ModelSpec::Extrude {
+            profile: boxed(profile),
+            distance,
+        },
+        ModelSpec::Translate { offset, shape } => ModelSpec::Translate {
+            offset,
+            shape: boxed(shape),
+        },
+        ModelSpec::Rotate {
+            axis,
+            degrees,
+            origin,
+            shape,
+        } => ModelSpec::Rotate {
+            axis,
+            degrees,
+            origin,
+            shape: boxed(shape),
+        },
+        ModelSpec::Color { rgb, shape } => ModelSpec::Color {
+            rgb,
+            shape: boxed(shape),
+        },
+        ModelSpec::Part { name, shape } => ModelSpec::Part {
+            name,
+            shape: boxed(shape),
+        },
+        ModelSpec::Group { children } => ModelSpec::Group {
+            children: all(children),
+        },
+        ModelSpec::Arrange {
+            gap,
+            children,
+            bed: own,
+        } => ModelSpec::Arrange {
+            gap,
+            children: all(children),
+            bed: own.or(Some(bed)),
+        },
+    }
+}
+
+/// Parts of a print scene that don't fit `bed` as oriented, as one warning.
+/// `bed.height` of infinity skips the height check.
+pub fn oversize_warning(scene: &TessellatedScene, bed: Bed) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    for part in &scene.parts {
+        if !names.contains(&part.name.as_str()) {
+            names.push(&part.name);
+        }
+    }
+    const SLACK: f32 = 1e-3;
+    let too_big: Vec<String> = names
+        .into_iter()
+        .filter_map(|name| {
+            let positions = scene
+                .parts
+                .iter()
+                .filter(|p| p.name == name)
+                .flat_map(|p| &scene.positions[p.vertices.start as usize..p.vertices.end as usize]);
+            let mut min = [f32::MAX; 3];
+            let mut max = [f32::MIN; 3];
+            for p in positions {
+                for i in 0..3 {
+                    min[i] = min[i].min(p[i]);
+                    max[i] = max[i].max(p[i]);
+                }
+            }
+            let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+            let fits = size[0] <= bed.width as f32 + SLACK
+                && size[1] <= bed.depth as f32 + SLACK
+                && size[2] <= bed.height as f32 + SLACK;
+            (!fits).then(|| format!("{name} ({:.0} × {:.0} × {:.0})", size[0], size[1], size[2]))
+        })
+        .collect();
+    if too_big.is_empty() {
+        return None;
+    }
+    let bed_text = if bed.height.is_finite() {
+        format!("{:.0} × {:.0} × {:.0} mm", bed.width, bed.depth, bed.height)
+    } else {
+        format!("{:.0} × {:.0} mm", bed.width, bed.depth)
+    };
+    let noun = if too_big.len() == 1 { "part doesn't" } else { "parts don't" };
+    Some(format!(
+        "{} {noun} fit the {bed_text} bed: {}",
+        too_big.len(),
+        too_big.join(", ")
+    ))
+}
 
 /// Edit a TypeScript CAD model and see it hot-reload in a 3D viewport.
 #[derive(Debug, Parser)]
@@ -126,6 +259,7 @@ fn normalize(path: &Path) -> PathBuf {
 /// Script host + kernel: one TS file in, one `SceneUpdate` out. Also tracks
 /// which files the model depends on, for the watcher.
 pub struct Pipeline {
+    root: PathBuf,
     script: RustyScriptHost,
     kernel: Box<dyn Kernel + Send>,
     dependencies: BTreeSet<PathBuf>,
@@ -139,6 +273,7 @@ impl Pipeline {
         };
         let script = RustyScriptHost::new(root).map_err(|e| e.to_string())?;
         Ok(Self {
+            root: normalize(&std::path::absolute(root).map_err(|e| e.to_string())?),
             script,
             kernel,
             dependencies: BTreeSet::new(),
@@ -146,9 +281,10 @@ impl Pipeline {
     }
 
     /// Files the model read on its last successful eval, plus anything a failed
-    /// eval since then touched. Keeping the old set across failures means fixing
-    /// a broken import (which may stop the eval before later imports load)
-    /// still triggers a reload.
+    /// eval since then touched, plus the project's [`PRINTER_CONFIG`] (whether
+    /// or not it exists). Keeping the old set across failures means fixing a
+    /// broken import (which may stop the eval before later imports load) still
+    /// triggers a reload.
     pub fn dependencies(&self) -> &BTreeSet<PathBuf> {
         &self.dependencies
     }
@@ -163,16 +299,25 @@ impl Pipeline {
         } else {
             self.dependencies.extend(latest);
         }
+        self.dependencies.insert(self.root.join(PRINTER_CONFIG));
         let views = match result {
             Ok(views) => views,
             Err(e) => return SceneUpdate::error(format!("{name}: {e}")),
+        };
+        let printer = match load_printer_config(&self.root) {
+            Ok(printer) => printer,
+            Err(e) => return SceneUpdate::error(e),
+        };
+        let print_spec = match printer {
+            Some(config) => views.print.map(|spec| with_default_bed(spec, config.bed)),
+            None => views.print,
         };
         let kernel = self.kernel.name();
         let assembled = match self.kernel.build(&views.assembled) {
             Ok(scene) => scene,
             Err(e) => return SceneUpdate::error(format!("{name}: {kernel} kernel: {e}")),
         };
-        let print = match views.print.map(|spec| self.kernel.build(&spec)).transpose() {
+        let print = match print_spec.map(|spec| self.kernel.build(&spec)).transpose() {
             Ok(scene) => scene,
             Err(e) => {
                 return SceneUpdate::error(format!("{name}: {kernel} kernel (print view): {e}"));
@@ -189,7 +334,24 @@ impl Pipeline {
             triangles(&assembled),
             started.elapsed().as_millis()
         );
-        SceneUpdate::ok(SceneViews { assembled, print }, message)
+
+        // Check against the configured bed, or else the plates arrange laid out.
+        let bed = printer.map(|c| c.bed).or_else(|| {
+            let plate = print.as_ref()?.plates.first()?;
+            Some(Bed {
+                width: plate.size[0] as f64,
+                depth: plate.size[1] as f64,
+                height: f64::INFINITY,
+            })
+        });
+        let warning = print
+            .as_ref()
+            .zip(bed)
+            .and_then(|(scene, bed)| oversize_warning(scene, bed));
+
+        let mut update = SceneUpdate::ok(SceneViews { assembled, print }, message);
+        update.diagnostics.extend(warning.map(Diagnostic::warning));
+        update
     }
 }
 
@@ -202,6 +364,12 @@ pub fn export_3mf(
     out: &Path,
 ) -> Result<String, String> {
     let update = pipeline.evaluate(model);
+    let warnings: String = update
+        .diagnostics
+        .iter()
+        .filter(|d| d.warning)
+        .map(|d| format!("\nwarning: {}", d.message))
+        .collect();
     let Some(views) = update.views else {
         let messages: Vec<&str> = update.diagnostics.iter().map(|d| d.message.as_str()).collect();
         return Err(messages.join("\n"));
@@ -224,7 +392,7 @@ pub fn export_3mf(
     };
     match write() {
         Ok(objects) => Ok(format!(
-            "wrote {} ({label} view, {objects} objects)",
+            "wrote {} ({label} view, {objects} objects){warnings}",
             out.display()
         )),
         Err(e) => {
@@ -236,7 +404,9 @@ pub fn export_3mf(
 
 pub fn report(update: &SceneUpdate) {
     for d in &update.diagnostics {
-        if d.ok {
+        if d.warning {
+            eprintln!("warning: {}", d.message);
+        } else if d.ok {
             println!("{}", d.message);
         } else {
             eprintln!("{}", d.message);
@@ -740,7 +910,7 @@ mod tests {
         assembled_colors.sort();
         assert_eq!(print_colors, assembled_colors);
 
-        let mut previous_max_x = f32::MIN;
+        let mut footprints: Vec<([f32; 3], [f32; 3])> = Vec::new();
         for chunk in print.positions.chunks(per_board) {
             let aabb = cad_ir::TessellatedScene {
                 positions: chunk.to_vec(),
@@ -752,9 +922,15 @@ mod tests {
             assert!(aabb.min[2].abs() < 1e-3, "{aabb:?}");
             let z = aabb.max[2] - aabb.min[2];
             assert!(z <= aabb.max[0] - aabb.min[0] && z <= aabb.max[1] - aabb.min[1], "{aabb:?}");
-            // ...and not overlapping the board before it.
-            assert!(aabb.min[0] >= previous_max_x, "{aabb:?}");
-            previous_max_x = aabb.max[0];
+            // ...and not overlapping any other board.
+            for (min, max) in &footprints {
+                let apart = aabb.max[0] <= min[0] + 1e-3
+                    || max[0] <= aabb.min[0] + 1e-3
+                    || aabb.max[1] <= min[1] + 1e-3
+                    || max[1] <= aabb.min[1] + 1e-3;
+                assert!(apart, "{aabb:?} overlaps {min:?}..{max:?}");
+            }
+            footprints.push((aabb.min, aabb.max));
         }
 
         // Each board has the same dimensions in both views.
@@ -787,6 +963,196 @@ mod tests {
             let covered: u32 = scene.parts.iter().map(|p| p.vertices.len() as u32).sum();
             assert_eq!(covered as usize, scene.positions.len());
         }
+    }
+
+    // --- Printer config and bed-aware print views --------------------------------
+
+    fn print_model(parts: &str) -> String {
+        format!(
+            "import {{ arrange, box, part }} from \"../dsl/cad.ts\";\n\
+             export default () => ({{ assembled: box({{ width: 1, depth: 1, height: 1 }}), \
+             print: arrange([{parts}]) }});\n"
+        )
+    }
+
+    fn coaster(name: &str, size: u32) -> String {
+        format!("part(\"{name}\", box({{ width: {size}, depth: {size}, height: 4 }}))")
+    }
+
+    fn bed_toml(width: u32, depth: u32, height: u32) -> String {
+        format!("[bed]\nwidth = {width}\ndepth = {depth}\nheight = {height}\n")
+    }
+
+    #[test]
+    fn printer_config_is_optional_and_validated() {
+        let project = Project::new(&cube_source(1));
+        assert_eq!(load_printer_config(project.root()), Ok(None));
+
+        project.write("printer.toml", &bed_toml(256, 250, 200));
+        let config = load_printer_config(project.root()).unwrap().unwrap();
+        assert_eq!(
+            config.bed,
+            Bed {
+                width: 256.0,
+                depth: 250.0,
+                height: 200.0
+            }
+        );
+
+        for bad in [
+            "[bed]\nwidth = 256\n",                              // missing fields
+            "[bed]\nwidth = 0\ndepth = 1\nheight = 1\n",       // non-positive
+            "[bed]\nwidth = 1\ndepth = 1\nheight = 1\nfoo = 2\n", // typo'd key
+            "bed = ",                                             // not TOML
+        ] {
+            project.write("printer.toml", bad);
+            let err = load_printer_config(project.root()).unwrap_err();
+            assert!(err.starts_with("printer.toml:"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn default_bed_fills_only_unset_arranges() {
+        let leaf = || ModelSpec::Rect {
+            width: 1.0,
+            height: 1.0,
+        };
+        let own = Bed {
+            width: 1.0,
+            depth: 2.0,
+            height: 3.0,
+        };
+        let config = Bed {
+            width: 9.0,
+            depth: 9.0,
+            height: 9.0,
+        };
+        let spec = ModelSpec::Group {
+            children: vec![
+                ModelSpec::Arrange {
+                    gap: 1.0,
+                    children: vec![leaf()],
+                    bed: None,
+                },
+                ModelSpec::Color {
+                    rgb: [0; 3],
+                    shape: Box::new(ModelSpec::Arrange {
+                        gap: 1.0,
+                        children: vec![leaf()],
+                        bed: Some(own),
+                    }),
+                },
+            ],
+        };
+        let ModelSpec::Group { children } = with_default_bed(spec, config) else {
+            panic!()
+        };
+        assert!(matches!(&children[0], ModelSpec::Arrange { bed: Some(b), .. } if *b == config));
+        let ModelSpec::Color { shape, .. } = &children[1] else { panic!() };
+        assert!(matches!(&**shape, ModelSpec::Arrange { bed: Some(b), .. } if *b == own));
+    }
+
+    #[test]
+    fn print_view_packs_onto_configured_bed() {
+        let parts: Vec<String> = (1..=5).map(|i| coaster(&format!("c{i}"), 90)).collect();
+        let project = Project::new(&print_model(&parts.join(", ")));
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+
+        let update = project.pipeline().evaluate(&project.model());
+        assert!(update.diagnostics.iter().all(|d| !d.warning), "{:?}", update.diagnostics);
+        let print = update.views.unwrap().print.unwrap();
+        // 90 mm coasters, 10 mm gap: 4 per 256 mm plate.
+        assert_eq!(print.plates.len(), 2);
+        assert_eq!(print.plates[0].size, [256.0, 256.0]);
+    }
+
+    #[test]
+    fn without_printer_config_print_view_has_no_plates() {
+        let project = Project::new(&print_model(&coaster("c", 90)));
+        let update = project.pipeline().evaluate(&project.model());
+        assert!(update.views.unwrap().print.unwrap().plates.is_empty());
+    }
+
+    #[test]
+    fn oversize_parts_get_one_warning_naming_them() {
+        let project = Project::new(&print_model(&[
+            coaster("small", 50),
+            coaster("huge", 300),
+            coaster("wide", 260),
+        ]
+        .join(", ")));
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+
+        let update = project.pipeline().evaluate(&project.model());
+        assert!(update.diagnostics[0].ok && !update.diagnostics[0].warning);
+        let warnings: Vec<&str> = update
+            .diagnostics
+            .iter()
+            .filter(|d| d.warning)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = warnings[0];
+        assert!(warning.starts_with("2 parts don't fit the 256 × 256 × 256 mm bed"), "{warning}");
+        assert!(warning.contains("huge (300 × 300 × 4)") && warning.contains("wide (260"), "{warning}");
+        assert!(!warning.contains("small"), "{warning}");
+        // A warning still shows the meshes.
+        assert!(update.views.is_some());
+    }
+
+    #[test]
+    fn bed_height_is_checked_too() {
+        let project = Project::new(&print_model(
+            "part(\"tower\", box({ width: 10, depth: 10, height: 300 }))",
+        ));
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+        let update = project.pipeline().evaluate(&project.model());
+        assert!(
+            update.diagnostics.iter().any(|d| d.warning && d.message.contains("tower")),
+            "{:?}",
+            update.diagnostics
+        );
+    }
+
+    #[test]
+    fn broken_printer_config_is_an_error_naming_the_file() {
+        let project = Project::new(&print_model(&coaster("c", 90)));
+        project.write("printer.toml", "[bed]\nwidth = \"wide\"\n");
+        let update = project.pipeline().evaluate(&project.model());
+        assert!(update.views.is_none());
+        assert!(update.diagnostics[0].message.starts_with("printer.toml:"));
+    }
+
+    #[test]
+    fn printer_config_is_a_dependency_even_before_it_exists() {
+        let project = Project::new(&cube_source(1));
+        let mut pipeline = project.pipeline();
+        pipeline.evaluate(&project.model());
+        assert!(pipeline.dependencies().contains(&project.root().join("printer.toml")));
+    }
+
+    #[test]
+    fn editing_printer_config_relayouts_print_view() {
+        let parts: Vec<String> = (1..=4).map(|i| coaster(&format!("c{i}"), 90)).collect();
+        let project = Project::new(&print_model(&parts.join(", ")));
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+        let (rx, _handle) = project.watch();
+
+        // A smaller bed fits one coaster per plate.
+        project.write("printer.toml", &bed_toml(120, 120, 120));
+        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        assert_eq!(update.views.unwrap().print.unwrap().plates.len(), 4);
+    }
+
+    #[test]
+    fn export_summary_includes_warnings() {
+        let project = Project::new(&print_model(&coaster("huge", 300)));
+        project.write("printer.toml", &bed_toml(256, 256, 256));
+        let out = project.root().join("out.3mf");
+        let summary =
+            export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, &out).unwrap();
+        assert!(summary.contains("\nwarning: 1 part doesn't fit"), "{summary}");
+        assert!(out.exists());
     }
 
     #[test]
@@ -948,6 +1314,7 @@ mod tests {
             project.model(),
             project.root().join("lib/parts.ts"),
             project.root().join("dsl/cad.ts"),
+            project.root().join("printer.toml"),
         ]);
 
         assert!(pipeline.evaluate(&project.model()).diagnostics[0].ok);
@@ -964,7 +1331,11 @@ mod tests {
         assert!(pipeline.evaluate(&project.model()).diagnostics[0].ok);
         assert_eq!(
             pipeline.dependencies(),
-            &BTreeSet::from([project.model(), project.root().join("dsl/cad.ts")])
+            &BTreeSet::from([
+                project.model(),
+                project.root().join("dsl/cad.ts"),
+                project.root().join("printer.toml"),
+            ])
         );
     }
 

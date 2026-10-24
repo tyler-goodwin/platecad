@@ -41,10 +41,34 @@ pub enum ModelSpec {
     /// Names `shape` as a part (for export and part lists). The innermost
     /// `Part` wins; a named profile names its extrusion.
     Part { name: String, shape: Box<ModelSpec> },
-    /// Lays children out for printing: each is moved so its bounding box sits on
-    /// the plate (z = 0, y = 0), side by side along +X with `gap` between them.
-    /// Orientation is left to the model.
-    Arrange { gap: f64, children: Vec<ModelSpec> },
+    /// Lays children out for printing: each moves (as a unit, never rotated)
+    /// onto the plate at z = 0. Children fill rows along +X, `gap` apart.
+    /// With a `bed`, rows wrap at the bed width, a new plate starts when the
+    /// bed depth runs out, and plates are laid out in a grid. Without one,
+    /// rows wrap so the block is roughly square.
+    Arrange {
+        gap: f64,
+        children: Vec<ModelSpec>,
+        #[serde(default)]
+        bed: Option<Bed>,
+    },
+}
+
+/// A printer's build volume, mm. Unknown keys are rejected so typos in
+/// `printer.toml` don't go unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bed {
+    pub width: f64,
+    pub depth: f64,
+    pub height: f64,
+}
+
+/// One build plate's footprint in a print layout, mm (XY, at z = 0).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Plate {
+    pub min: [f32; 2],
+    pub size: [f32; 2],
 }
 
 /// The ways a model can be shown. `print` is optional: models without one are
@@ -95,6 +119,9 @@ pub struct TessellatedScene {
     /// outside any `Part` isn't listed.
     #[serde(default)]
     pub parts: Vec<ScenePart>,
+    /// Build plates from an `Arrange` with a bed (empty otherwise).
+    #[serde(default)]
+    pub plates: Vec<Plate>,
     /// Optional line-list of boundary samples (pairs of points).
     #[serde(default)]
     pub edges: Vec<[f32; 3]>,
@@ -136,7 +163,11 @@ pub struct Aabb {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// False only for errors (the update then carries no new meshes).
     pub ok: bool,
+    /// An `ok` diagnostic worth the user's attention (e.g. a part too big for the bed).
+    #[serde(default)]
+    pub warning: bool,
     pub message: String,
 }
 
@@ -144,6 +175,15 @@ impl Diagnostic {
     pub fn ok(message: impl Into<String>) -> Self {
         Self {
             ok: true,
+            warning: false,
+            message: message.into(),
+        }
+    }
+
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            warning: true,
             message: message.into(),
         }
     }
@@ -151,6 +191,7 @@ impl Diagnostic {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             ok: false,
+            warning: false,
             message: message.into(),
         }
     }
@@ -283,8 +324,30 @@ mod tests {
                     width: 1.0,
                     height: 1.0
                 }],
+                bed: None,
             }
         );
+
+        let json = r#"{"kind":"Arrange","gap":5,"children":[],"bed":{"width":256,"depth":250,"height":200}}"#;
+        let ModelSpec::Arrange { bed, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not an arrange")
+        };
+        assert_eq!(
+            bed,
+            Some(Bed {
+                width: 256.0,
+                depth: 250.0,
+                height: 200.0
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostics_without_warning_flag_still_parse() {
+        let d: Diagnostic = serde_json::from_str(r#"{"ok":true,"message":"hi"}"#).unwrap();
+        assert_eq!(d, Diagnostic::ok("hi"));
+        assert!(Diagnostic::warning("w").ok && Diagnostic::warning("w").warning);
+        assert!(!Diagnostic::error("e").ok && !Diagnostic::error("e").warning);
     }
 
     fn unit_rect() -> ModelSpec {
