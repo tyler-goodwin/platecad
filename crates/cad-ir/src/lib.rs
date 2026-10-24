@@ -15,6 +15,9 @@ pub const DEFAULT_COLOR: Rgb = [150, 175, 210];
 pub enum ModelSpec {
     /// Planar rectangle in the XY plane with a corner at the origin.
     Rect { width: f64, height: f64 },
+    /// Planar simple polygon in the XY plane, from its outline. Either winding;
+    /// the closing point is implied.
+    Polygon { points: Vec<[f64; 2]> },
     /// Sweeps a 2D `profile` along +Z by `distance` into a solid.
     Extrude {
         profile: Box<ModelSpec>,
@@ -292,6 +295,18 @@ mod tests {
                     width: 1.0,
                     height: 1.0
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn polygon_matches_ts_shape() {
+        let json = r#"{"kind":"Polygon","points":[[0,0],[10,0],[0,5]]}"#;
+        let spec: ModelSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Polygon {
+                points: vec![[0.0, 0.0], [10.0, 0.0], [0.0, 5.0]]
             }
         );
     }

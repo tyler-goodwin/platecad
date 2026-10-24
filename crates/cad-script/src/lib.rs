@@ -504,6 +504,29 @@ mod tests {
     }
 
     #[test]
+    fn dsl_polygon_passes_points_through_and_validates() {
+        let spec = eval(
+            r#"import { polygon } from "./dsl/cad.ts";
+            export default () => polygon([[0, 0], [4, 0], [0, 3]]);"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::Polygon {
+                points: vec![[0.0, 0.0], [4.0, 0.0], [0.0, 3.0]]
+            }
+        );
+        for bad in ["polygon([[0, 0], [1, 0]])", "polygon([[0, 0], [1, 0], [0, NaN]])", "polygon([[0, 0], [1], [0, 1]])"] {
+            let source = format!(
+                r#"import {{ polygon }} from "./dsl/cad.ts";
+                export default () => {bad};"#
+            );
+            let err = eval(&source).unwrap_err().to_string();
+            assert!(err.contains("polygon"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"

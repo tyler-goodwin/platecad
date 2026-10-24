@@ -60,6 +60,7 @@ kernel and renderer can each be swapped without touching the others.
 | Node | Meaning |
 |---|---|
 | `Rect { width, height }` | Planar rectangle in XY, corner at the origin. |
+| `Polygon { points }` | Planar simple polygon in XY from its outline. Either winding is normalized to counter-clockwise, and the closing point is implied. Fewer than 3 points, repeated points, self-intersection and zero area are rejected. Non-convex shapes (L, U) tessellate and export correctly. |
 | `Extrude { profile, distance }` | Sweeps a 2D profile along +Z into a solid. |
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |

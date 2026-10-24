@@ -19,6 +19,11 @@ export type RectSpec = {
   height: number;
 };
 
+export type PolygonSpec = {
+  kind: "Polygon";
+  points: [number, number][];
+};
+
 export type ExtrudeSpec = {
   kind: "Extrude";
   profile: ProfileSpec;
@@ -67,10 +72,11 @@ export type ArrangeSpec = {
 };
 
 /** 2D shapes that can be swept into solids. */
-export type ProfileSpec = RectSpec | TranslateSpec | RotateSpec | ColorSpec | PartSpec;
+export type ProfileSpec = RectSpec | PolygonSpec | TranslateSpec | RotateSpec | ColorSpec | PartSpec;
 
 export type ModelSpec =
   | RectSpec
+  | PolygonSpec
   | ExtrudeSpec
   | TranslateSpec
   | RotateSpec
@@ -97,6 +103,23 @@ export function rect(opts: { width: number; height: number }): RectSpec {
   positive("rect width", opts.width);
   positive("rect height", opts.height);
   return { kind: "Rect", width: opts.width, height: opts.height };
+}
+
+/**
+ * Simple polygon in the XY plane from its outline, e.g. an L or U shape.
+ * Either winding works and the closing point is implied. It must not cross
+ * itself.
+ */
+export function polygon(points: [number, number][]): PolygonSpec {
+  if (!Array.isArray(points) || points.length < 3) {
+    throw new Error("polygon needs at least 3 points");
+  }
+  for (const p of points) {
+    if (!Array.isArray(p) || p.length !== 2 || !p.every(Number.isFinite)) {
+      throw new Error(`polygon points must be finite [x, y] pairs (got ${JSON.stringify(p)})`);
+    }
+  }
+  return { kind: "Polygon", points: points.map(([x, y]) => [x, y]) };
 }
 
 /** Sweeps a 2D profile along +Z into a solid. */

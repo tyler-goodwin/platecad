@@ -61,7 +61,7 @@ pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
             .collect()
     };
     match spec {
-        ModelSpec::Rect { .. } => spec,
+        ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } => spec,
         ModelSpec::Extrude { profile, distance } => ModelSpec::Extrude {
             profile: boxed(profile),
             distance,

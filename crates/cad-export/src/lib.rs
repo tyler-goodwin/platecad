@@ -344,6 +344,25 @@ mod tests {
     }
 
     #[test]
+    fn non_convex_polygon_prism_exports_closed_with_exact_volume() {
+        let u = ModelSpec::Polygon {
+            points: vec![
+                [0.0, 0.0], [3.0, 0.0], [3.0, 15.0], [23.0, 15.0],
+                [23.0, 0.0], [26.0, 0.0], [26.0, 18.0], [0.0, 18.0],
+            ],
+        };
+        let prism = ModelSpec::Extrude {
+            profile: Box::new(u),
+            distance: 10.0,
+        };
+        let object = &objects(&build(&part("holder", prism)))[0];
+        assert!(object.is_closed());
+        assert_watertight(object);
+        let expected = (26.0 * 18.0 - 20.0 * 15.0) * 10.0;
+        assert!((signed_volume(object) - expected).abs() < 1e-2, "{}", signed_volume(object));
+    }
+
+    #[test]
     fn every_part_is_its_own_watertight_object() {
         let spec = group(vec![
             paint([255, 0, 0], part("left", sized_box(1.0, 1.0, 1.0))),

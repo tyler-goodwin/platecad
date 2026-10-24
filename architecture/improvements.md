@@ -9,8 +9,9 @@ the improvement.
 - **Booleans.** `Group` is visual only, so overlapping parts stay separate
   bodies. That's fine on screen, but slicers dislike overlapping volumes.
   Add `union`/`difference`/`intersect` via truck-shapeops.
-- **More profiles.** Only `Rect` exists. Add circles, polygons, polylines
-  with arcs, and profiles with holes.
+- **More profiles.** `Rect` and `Polygon` exist. Add circles, polylines
+  with arcs, and profiles with holes (truck's `try_attach_plane` takes
+  several wires).
 - **Sweeps beyond +Z.** Extrude only goes along +Z. Add an extrude
   direction, revolve and loft.
 - **Fillets and chamfers.** These are common in printable parts. They're

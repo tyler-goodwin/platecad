@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use cad_ir::{Bed, DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
-use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Vector3, builder};
+use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Vector3, Wire, builder};
 
 const TESSELLATION_TOL: f64 = 0.01;
 
@@ -67,7 +67,7 @@ fn build_bodies(
     plates: &mut Vec<Plate>,
 ) -> Result<Vec<Body>, KernelError> {
     match spec {
-        ModelSpec::Rect { .. } => Ok(vec![Body {
+        ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } => Ok(vec![Body {
             shell: Shell::from(vec![build_face(spec)?]),
             style: style.clone(),
         }]),
@@ -361,6 +361,18 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
             let e = builder::tsweep(&v, Vector3::new(*width, 0.0, 0.0));
             Ok(builder::tsweep(&e, Vector3::new(0.0, *height, 0.0)))
         }
+        ModelSpec::Polygon { points } => {
+            let points = validate_polygon(points)?;
+            let vertices: Vec<_> = points
+                .iter()
+                .map(|[x, y]| builder::vertex(Point3::new(*x, *y, 0.0)))
+                .collect();
+            let edges: Vec<_> = (0..vertices.len())
+                .map(|i| builder::line(&vertices[i], &vertices[(i + 1) % vertices.len()]))
+                .collect();
+            builder::try_attach_plane(&[Wire::from(edges)])
+                .map_err(|e| KernelError::Message(format!("polygon face failed: {e}")))
+        }
         ModelSpec::Translate { offset, shape } => {
             Ok(builder::translated(&build_face(shape)?, to_vector(*offset)))
         }
@@ -383,6 +395,70 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
             ))
         }
     }
+}
+
+/// A simple polygon's outline, counter-clockwise with no closing duplicate.
+/// Rejects fewer than 3 points, non-finite or repeated points, zero area and
+/// self-intersections.
+fn validate_polygon(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, KernelError> {
+    let invalid = |why: &str| Err(KernelError::Invalid(format!("polygon {why}")));
+    let mut pts = points.to_vec();
+    if pts.len() > 1 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    if pts.len() < 3 {
+        return invalid("needs at least 3 points");
+    }
+    if !pts.iter().flatten().all(|c| c.is_finite()) {
+        return invalid("points must be finite");
+    }
+    let n = pts.len();
+    for i in 0..n {
+        let [a, b] = [pts[i], pts[(i + 1) % n]];
+        if (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-9 {
+            return invalid("has repeated consecutive points");
+        }
+    }
+    // Simple: no two non-adjacent edges touch.
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let touches = |p1: [f64; 2], p2: [f64; 2], q1: [f64; 2], q2: [f64; 2]| {
+        let (d1, d2) = (cross(q1, q2, p1), cross(q1, q2, p2));
+        let (d3, d4) = (cross(p1, p2, q1), cross(p1, p2, q2));
+        let on = |o: [f64; 2], a: [f64; 2], p: [f64; 2], d: f64| {
+            d.abs() < 1e-12
+                && p[0] >= o[0].min(a[0]) - 1e-12
+                && p[0] <= o[0].max(a[0]) + 1e-12
+                && p[1] >= o[1].min(a[1]) - 1e-12
+                && p[1] <= o[1].max(a[1]) + 1e-12
+        };
+        ((d1 > 0.0) != (d2 > 0.0) && (d3 > 0.0) != (d4 > 0.0) && d1 != 0.0 && d2 != 0.0 && d3 != 0.0 && d4 != 0.0)
+            || on(q1, q2, p1, d1)
+            || on(q1, q2, p2, d2)
+            || on(p1, p2, q1, d3)
+            || on(p1, p2, q2, d4)
+    };
+    for i in 0..n {
+        for j in i + 1..n {
+            let adjacent = j == i + 1 || (i == 0 && j == n - 1);
+            if !adjacent && touches(pts[i], pts[(i + 1) % n], pts[j], pts[(j + 1) % n]) {
+                return invalid("must not intersect itself");
+            }
+        }
+    }
+    // After the crossing check: a symmetric bow-tie's signed area cancels to 0.
+    let area2: f64 = (0..n)
+        .map(|i| {
+            let [a, b] = [pts[i], pts[(i + 1) % n]];
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum();
+    if area2.abs() < 1e-9 {
+        return invalid("has zero area");
+    }
+    if area2 < 0.0 {
+        pts.reverse();
+    }
+    Ok(pts)
 }
 
 fn to_vector([x, y, z]: [f64; 3]) -> Vector3 {
@@ -1140,6 +1216,85 @@ mod tests {
         assert_eq!(part_names(&scene), ["leg"]);
         assert!(TruckKernel.build(&part("   ", unit_box())).is_err());
         assert!(TruckKernel.build(&extrude(part("", rect(1.0, 1.0)), 1.0)).is_err());
+    }
+
+    fn polygon(points: &[[f64; 2]]) -> ModelSpec {
+        ModelSpec::Polygon {
+            points: points.to_vec(),
+        }
+    }
+
+    /// Area of the triangles whose normals point straight up.
+    fn top_area(scene: &TessellatedScene) -> f64 {
+        scene
+            .indices
+            .chunks_exact(3)
+            .filter(|t| t.iter().all(|&i| scene.normals[i as usize][2] > 0.999))
+            .map(|t| {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| scene.positions[i as usize].map(f64::from));
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0
+            })
+            .sum()
+    }
+
+    /// U-shaped outline (an open-front holder seen from above): 3 mm walls
+    /// around a 20 x 15 opening.
+    const U: [[f64; 2]; 8] = [
+        [0.0, 0.0],
+        [3.0, 0.0],
+        [3.0, 15.0],
+        [23.0, 15.0],
+        [23.0, 0.0],
+        [26.0, 0.0],
+        [26.0, 18.0],
+        [0.0, 18.0],
+    ];
+
+    #[test]
+    fn polygon_square_matches_rect() {
+        let square = TruckKernel
+            .build(&extrude(polygon(&[[0.0, 0.0], [2.0, 0.0], [2.0, 3.0], [0.0, 3.0]]), 1.0))
+            .unwrap();
+        assert_aabb(&square, [0.0; 3], [2.0, 3.0, 1.0]);
+        assert_eq!(square.edges.len(), 12 * 2);
+        assert!((top_area(&square) - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn non_convex_polygon_tessellates_its_true_area() {
+        let scene = TruckKernel.build(&extrude(polygon(&U), 10.0)).unwrap();
+        assert_aabb(&scene, [0.0; 3], [26.0, 18.0, 10.0]);
+        // 26 x 18 outline minus the 20 x 15 opening.
+        assert!((top_area(&scene) - (26.0 * 18.0 - 20.0 * 15.0)).abs() < 1e-6, "{}", top_area(&scene));
+        // 8 sides + top + bottom faces: 8 vertical edges, 8 top, 8 bottom.
+        assert_eq!(scene.edges.len(), 24 * 2);
+    }
+
+    #[test]
+    fn polygon_winding_and_closing_point_dont_matter() {
+        let ccw = TruckKernel.build(&extrude(polygon(&U), 1.0)).unwrap();
+        let mut cw = U.to_vec();
+        cw.reverse();
+        cw.push(cw[0]);
+        let cw = TruckKernel.build(&extrude(polygon(&cw), 1.0)).unwrap();
+        assert_eq!(ccw.indices.len(), cw.indices.len());
+        assert!((top_area(&ccw) - top_area(&cw)).abs() < 1e-6);
+        // Top faces face up either way.
+        assert!(top_area(&cw) > 0.0);
+    }
+
+    #[test]
+    fn rejects_bad_polygons() {
+        for (points, why) in [
+            (vec![[0.0, 0.0], [1.0, 0.0]], "at least 3"),
+            (vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], "zero area"),
+            (vec![[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], "repeated"),
+            (vec![[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]], "intersect"),
+            (vec![[0.0, 0.0], [f64::NAN, 0.0], [0.0, 1.0]], "finite"),
+        ] {
+            let err = TruckKernel.build(&extrude(polygon(&points), 1.0)).unwrap_err();
+            assert!(err.to_string().contains(why), "{points:?}: {err}");
+        }
     }
 
     #[test]

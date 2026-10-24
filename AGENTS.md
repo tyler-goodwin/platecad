@@ -42,7 +42,7 @@ cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|
 | `crates/cad-view-threed` | three-d + egui window. |
 | `crates/cad-export` | `TessellatedScene` to 3MF (welded, watertight, one object per part). |
 | `crates/cad-app` | Binary plus library: CLI (clap), `Pipeline`, file watcher, `export_3mf`. Most integration tests live here. |
-| `dsl/cad.ts` | The TS DSL: `rect`, `extrude`, `box`, `cube`, `translate`, `rotate`, `group`, `color`, `part`, `arrange`. |
+| `dsl/cad.ts` | The TS DSL: `rect`, `polygon`, `extrude`, `box`, `cube`, `translate`, `rotate`, `group`, `color`, `part`, `arrange`. |
 | `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`). The user edits these live. |
 | `printer.toml` | Optional bed size, used by `arrange` in print views. Watched like an import. |
 | `architecture/` | Living design docs. Update them with every change. |
