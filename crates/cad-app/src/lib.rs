@@ -437,6 +437,26 @@ pub fn report(update: &SceneUpdate) {
     }
 }
 
+/// The reload thread's whole job: tells the viewer `model` is loading,
+/// evaluates it, sends the result, then [`watch_and_reload`]s. The window can
+/// open before any of this finishes. Returns once the viewer is gone.
+pub fn load_and_watch(
+    model: &Path,
+    mut pipeline: Pipeline,
+    tx: Sender<SceneUpdate>,
+) -> notify::Result<()> {
+    let name = model.file_name().unwrap_or_default().to_string_lossy();
+    if tx.send(SceneUpdate::loading(format!("Loading {name}…"))).is_err() {
+        return Ok(());
+    }
+    let update = pipeline.evaluate(model);
+    report(&update);
+    if tx.send(update).is_err() {
+        return Ok(());
+    }
+    watch_and_reload(model, pipeline, tx)
+}
+
 /// Re-evaluates `model` whenever one of its [`Pipeline::dependencies`] changes,
 /// waiting for `DEBOUNCE` of quiet so editor save bursts cause one rebuild.
 /// The watched set follows the model's imports after every eval. `pipeline`
@@ -471,6 +491,10 @@ pub fn watch_and_reload(
             }
         }
 
+        let name = model.file_name().unwrap_or_default().to_string_lossy();
+        if tx.send(SceneUpdate::loading(format!("Rebuilding {name}…"))).is_err() {
+            return Ok(());
+        }
         let update = pipeline.evaluate(model);
         report(&update);
         watched.sync(pipeline.dependencies())?;
@@ -606,7 +630,19 @@ mod tests {
         )
     }
 
-    fn max_extent(update: &SceneUpdate) -> f32 {
+    /// The next evaluation result, skipping "loading" announcements.
+    fn next_result(rx: &Receiver<SceneUpdate>) -> Result<SceneUpdate, RecvTimeoutError> {
+        let deadline = Instant::now() + RELOAD_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let update = rx.recv_timeout(left)?;
+            if update.loading.is_none() {
+                return Ok(update);
+            }
+        }
+    }
+
+        fn max_extent(update: &SceneUpdate) -> f32 {
         let views = update.views.as_ref().expect("views");
         let aabb = views.assembled.aabb().unwrap();
         aabb.max.into_iter().fold(f32::MIN, f32::max)
@@ -1163,7 +1199,7 @@ mod tests {
 
         // A smaller bed fits one coaster per plate.
         project.write("printer.toml", &bed_toml(120, 120, 120));
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert_eq!(update.views.unwrap().print.unwrap().plates.len(), 4);
     }
 
@@ -1584,7 +1620,7 @@ export default () => organizer();
 
         project.write_model(&cube_source(20));
 
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
         assert_eq!(max_extent(&update), 20.0);
     }
@@ -1604,7 +1640,7 @@ export default () => organizer();
         assert_ne!(source, patched, "dsl/cad.ts cube() changed shape; update this test");
         std::fs::write(&dsl, patched).unwrap();
 
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert_eq!(max_extent(&update), 20.0);
     }
 
@@ -1618,7 +1654,7 @@ export default () => organizer();
             thread::sleep(Duration::from_millis(20));
         }
 
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert_eq!(max_extent(&update), 15.0);
         assert!(rx.recv_timeout(QUIET).is_err(), "burst should debounce to one reload");
     }
@@ -1629,12 +1665,12 @@ export default () => organizer();
         let (rx, _handle) = project.watch();
 
         project.write_model(&cube_source(0));
-        let broken = rx.recv_timeout(RELOAD_TIMEOUT).expect("error update");
+        let broken = next_result(&rx).expect("error update");
         assert!(broken.views.is_none());
         assert!(!broken.diagnostics[0].ok);
 
         project.write_model(&cube_source(7));
-        let fixed = rx.recv_timeout(RELOAD_TIMEOUT).expect("recovery");
+        let fixed = next_result(&rx).expect("recovery");
         assert!(fixed.diagnostics[0].ok, "{:?}", fixed.diagnostics);
         assert_eq!(max_extent(&fixed), 7.0);
     }
@@ -1660,7 +1696,7 @@ export default () => organizer();
 
         std::fs::write(&model, cube_source(4)).unwrap();
 
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
         assert_eq!(max_extent(&update), 4.0);
     }
@@ -1686,7 +1722,7 @@ export default () => organizer();
 
         project.write("lib/parts.ts", &lib_source(5));
 
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert_eq!(max_extent(&update), 5.0);
     }
 
@@ -1699,10 +1735,10 @@ export default () => organizer();
         project.write_model(
             "import { part } from \"../lib/parts.ts\";\nexport default () => part();\n",
         );
-        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("reload")), 3.0);
+        assert_eq!(max_extent(&next_result(&rx).expect("reload")), 3.0);
 
         project.write("lib/parts.ts", &lib_source(4));
-        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("lib reload")), 4.0);
+        assert_eq!(max_extent(&next_result(&rx).expect("lib reload")), 4.0);
     }
 
     #[test]
@@ -1722,11 +1758,11 @@ export default () => organizer();
         let (rx, _handle) = project.watch();
 
         project.write("lib/parts.ts", "export const part = ( => ;\n");
-        let broken = rx.recv_timeout(RELOAD_TIMEOUT).expect("error update");
+        let broken = next_result(&rx).expect("error update");
         assert!(!broken.diagnostics[0].ok);
 
         project.write("lib/parts.ts", &lib_source(6));
-        let fixed = rx.recv_timeout(RELOAD_TIMEOUT).expect("recovery");
+        let fixed = next_result(&rx).expect("recovery");
         assert!(fixed.diagnostics[0].ok, "{:?}", fixed.diagnostics);
         assert_eq!(max_extent(&fixed), 6.0);
     }
@@ -1740,7 +1776,7 @@ export default () => organizer();
 
         project.write("parts/new/thing.ts", &lib_source(7).replace("../dsl", "../../dsl"));
 
-        let update = rx.recv_timeout(RELOAD_TIMEOUT).expect("reload");
+        let update = next_result(&rx).expect("reload");
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
         assert_eq!(max_extent(&update), 7.0);
     }
@@ -1755,15 +1791,37 @@ export default () => organizer();
         std::fs::write(&temp, cube_source(8)).unwrap();
         std::fs::rename(&temp, project.model()).unwrap();
 
-        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("reload")), 8.0);
+        assert_eq!(max_extent(&next_result(&rx).expect("reload")), 8.0);
 
         // The watch survived the replace: a second save still reloads.
         std::fs::write(&temp, cube_source(9)).unwrap();
         std::fs::rename(&temp, project.model()).unwrap();
-        assert_eq!(max_extent(&rx.recv_timeout(RELOAD_TIMEOUT).expect("second reload")), 9.0);
+        assert_eq!(max_extent(&next_result(&rx).expect("second reload")), 9.0);
     }
 
     #[test]
+    fn load_and_watch_announces_then_delivers_then_watches() {
+        let project = Project::new(&cube_source(2));
+        let (tx, rx) = mpsc::channel();
+        let (model, pipeline) = (project.model(), project.pipeline());
+        thread::spawn(move || load_and_watch(&model, pipeline, tx));
+
+        let first = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        assert_eq!(first.loading.as_deref(), Some("Loading model.ts…"));
+        let result = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        assert!(result.loading.is_none());
+        assert_eq!(max_extent(&result), 2.0);
+
+        // Then it's watching: an edit is announced as a rebuild before its result.
+        thread::sleep(Duration::from_millis(300));
+        project.write_model(&cube_source(3));
+        let announce = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        assert_eq!(announce.loading.as_deref(), Some("Rebuilding model.ts…"));
+        let rebuilt = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        assert_eq!(max_extent(&rebuilt), 3.0);
+    }
+
+        #[test]
     fn stops_once_viewer_is_gone() {
         let project = Project::new(&cube_source(10));
         let (rx, handle) = project.watch();

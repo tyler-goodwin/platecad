@@ -1,7 +1,9 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use cad_ir::{Aabb, DEFAULT_COLOR, Diagnostic, Plate, TessellatedScene};
-use cad_view::{SceneUpdate, ViewError, ViewMode, ViewSelection, ViewportApp};
+use std::time::Instant;
+
+use cad_view::{SceneUpdate, ViewError, ViewMode, ViewSelection, ViewportApp, loading_status};
 use three_d::egui;
 use three_d::*;
 
@@ -64,6 +66,7 @@ impl ViewportApp for ThreeDViewport {
             selection: ViewSelection::default(),
             framed: None,
             diagnostics: Vec::new(),
+            loading: None,
             disconnected: false,
         };
         state.apply(initial);
@@ -111,6 +114,13 @@ impl ViewportApp for ThreeDViewport {
                                 );
                             });
                             ui.separator();
+                            if let Some((message, since)) = &state.loading {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(loading_status(message, since.elapsed()));
+                                });
+                                ui.separator();
+                            }
                             if let Some(scene) = state.active() {
                                 if !scene.parts.is_empty() {
                                     egui::CollapsingHeader::new(format!("Parts ({})", scene.parts.len()))
@@ -243,11 +253,18 @@ struct ViewState {
     /// View the camera was last framed for; reframe when the shown view changes.
     framed: Option<ViewMode>,
     diagnostics: Vec<Diagnostic>,
+    /// An evaluation in progress, and when it started.
+    loading: Option<(String, Instant)>,
     disconnected: bool,
 }
 
 impl ViewState {
     fn apply(&mut self, update: SceneUpdate) {
+        if let Some(message) = update.loading {
+            self.loading = Some((message, Instant::now()));
+            return;
+        }
+        self.loading = None;
         if let Some(views) = update.views {
             self.assembled = Some(GpuScene::new(&self.context, &views.assembled));
             self.print = views.print.as_ref().map(|s| GpuScene::new(&self.context, s));

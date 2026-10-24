@@ -23,6 +23,8 @@ flowchart LR
   watch["notify watcher"] -->|"debounced reload"| pipeline
 ```
 
+0. The window opens immediately. The reload thread (`load_and_watch`)
+   announces "Loading model.ts…", then runs steps 1 to 3.
 1. The script host evaluates the model file's default export into
    `ModelViews { assembled, print? }`.
 2. The pipeline asks the kernel to build each view into a `TessellatedScene`.
@@ -188,6 +190,11 @@ when the model has one, and the assembled view otherwise.
   isn't portable. They're a slate color between the background and typical
   face colors, about 0.16% of the model's diagonal wide. Tests pin their
   contrast against both, and their width next to an 18 mm board.
+- **Loading state.** Before every evaluation (the first and each rebuild)
+  the reload thread sends a `SceneUpdate::loading` message. The overlay
+  shows a spinner and "Loading model.ts… 2.3 s" until the result arrives,
+  keeping the current meshes. A slow or stuck build shows as a timer that
+  keeps counting, never as a missing window.
 - The egui overlay has an **Assembled/Print toggle** (Print is disabled when
   the model has no print view), a collapsible **part list** for the shown
   view (name and triangle count), reload diagnostics and an orbit hint.

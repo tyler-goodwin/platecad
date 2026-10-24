@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use cad_app::{Args, Pipeline, export_3mf, project_root, report, resolve_model, watch_and_reload};
+use cad_app::{Args, Pipeline, export_3mf, load_and_watch, project_root, resolve_model};
 use cad_view::{SceneUpdate, ViewportApp};
 use cad_view_threed::ThreeDViewport;
 use clap::Parser;
@@ -39,12 +39,13 @@ fn main() -> ExitCode {
         };
     }
 
-    let initial = pipeline.evaluate(&model);
-    report(&initial);
+    // Open the window right away; the model loads on the reload thread.
+    let name = model.file_name().unwrap_or_default().to_string_lossy();
+    let initial = SceneUpdate::loading(format!("Loading {name}…"));
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        if let Err(e) = watch_and_reload(&model, pipeline, tx.clone()) {
+        if let Err(e) = load_and_watch(&model, pipeline, tx.clone()) {
             let _ = tx.send(SceneUpdate::error(format!("file watcher stopped: {e}")));
         }
     });
