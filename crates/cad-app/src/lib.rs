@@ -1588,6 +1588,50 @@ export default () => organizer();
     }
 
     #[test]
+    fn rounded_box_has_even_3mm_walls_and_rounded_corners() {
+        use std::f64::consts::PI;
+        let project = Project::new(
+            "import { roundedBox } from \"./rounded_box.ts\";
+             export default () => roundedBox({ width: 60, depth: 40, height: 30, wall: 3, radius: 6 });
+",
+        );
+        let source = std::fs::read_to_string(repo_root().join("models/rounded_box.ts")).unwrap();
+        project.write("models/rounded_box.ts", &source);
+        let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
+        let update = pipeline.evaluate(&project.model());
+        let scene = update.views.expect("builds").assembled;
+
+        // Exact volume: rounded outer block minus the rounded cavity above the floor.
+        let rounded_rect = |w: f64, d: f64, r: f64| w * d - (4.0 - PI) * r * r;
+        let volume = rounded_rect(60.0, 40.0, 6.0) * 30.0 - rounded_rect(54.0, 34.0, 3.0) * 27.0;
+        let object = &cad_export::objects(&scene)[0];
+        assert!(object.is_closed());
+        assert!((object.signed_volume() - volume).abs() < volume * 0.005, "{} vs {volume}", object.signed_volume());
+
+        // The cavity's flat walls sit exactly 3 mm in from each outside face,
+        // and its floor is 3 mm up.
+        let has = |pred: &dyn Fn(&[f32; 3]) -> bool| scene.positions.iter().any(|p| pred(p));
+        assert!(has(&|p| (p[0] - 3.0).abs() < 1e-3 && p[2] > 3.5), "inner wall at x = 3");
+        assert!(has(&|p| (p[0] - 57.0).abs() < 1e-3 && p[2] > 3.5), "inner wall at x = 57");
+        assert!(has(&|p| (p[1] - 3.0).abs() < 1e-3 && p[2] > 3.5), "inner wall at y = 3");
+        assert!(has(&|p| (p[1] - 37.0).abs() < 1e-3 && p[2] > 3.5), "inner wall at y = 37");
+        // Floor top at z = 3: its straight edges run x = 6..54 (inside the
+        // 3 mm inner corner radius); flat faces only have boundary vertices.
+        assert!(has(&|p| (p[2] - 3.0).abs() < 1e-3 && (p[0] - 6.0).abs() < 1e-3), "floor top at z = 3");
+        // Rounded: no outer corner is sharp.
+        assert!(!has(&|p| p[0].abs() < 1e-3 && p[1].abs() < 1e-3), "outer corner still sharp");
+
+        // A radius no bigger than the wall can't round the inside.
+        project.write_model(
+            "import { roundedBox } from \"./rounded_box.ts\";
+export default () => roundedBox({ wall: 3, radius: 3 });
+",
+        );
+        let update = pipeline.evaluate(&project.model());
+        assert!(update.diagnostics[0].message.contains("must be larger than the wall"), "{:?}", update.diagnostics);
+    }
+
+    #[test]
     fn bookshelf_defaults_are_millimeters() {
         // A real bookshelf is around a meter wide; a cm-scale model would be ~100.
         let aabb = build_bookshelf("{}").aabb().unwrap();
