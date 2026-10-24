@@ -1195,7 +1195,7 @@ mod tests {
     #[test]
     fn coasters_fit_four_to_a_plate_without_warnings() {
         for (count, plates) in [(4, 1), (6, 2), (9, 3)] {
-            let (views, diagnostics) = coaster_views(&format!("{{ count: {count} }}"));
+            let (views, diagnostics) = coaster_views(&format!("{{ count: {count}, holder: false }}"));
             assert!(diagnostics.iter().all(|d| d.ok && !d.warning), "{diagnostics:?}");
             assert_eq!(views.print.unwrap().plates.len(), plates, "{count} coasters");
         }
@@ -1220,7 +1220,7 @@ mod tests {
 
     #[test]
     fn coasters_stack_when_assembled_and_lie_flat_for_print() {
-        let (views, _) = coaster_views("{ count: 4, base: 4, inlay: 1 }");
+        let (views, _) = coaster_views("{ count: 4, base: 4, inlay: 1, holder: false }");
         let assembled = views.assembled.aabb().unwrap();
         assert!((assembled.max[2] - 4.0 * 5.0).abs() < 1e-3, "{assembled:?}");
         let print = views.print.unwrap().aabb().unwrap();
@@ -1229,7 +1229,8 @@ mod tests {
 
     #[test]
     fn coasters_export_as_closed_multi_material_objects() {
-        let (views, _) = coaster_views("{ count: 4, inlayColors: [\"#e8b04f\", \"#4fa3a5\"] }");
+        let (views, _) =
+            coaster_views("{ count: 4, holder: false, inlayColors: [\"#e8b04f\", \"#4fa3a5\"] }");
         let objects = cad_export::objects(views.print.as_ref().unwrap());
         assert_eq!(objects.len(), 8, "a base and an inlay per coaster");
         for object in &objects {
@@ -1243,12 +1244,66 @@ mod tests {
     }
 
     #[test]
+    fn holder_surrounds_the_stack_with_clearance_and_an_open_front() {
+        let (views, diagnostics) =
+            coaster_views("{ count: 4, size: 95, base: 4, inlay: 1, wall: 3, clearance: 1 }");
+        assert!(diagnostics.iter().all(|d| d.ok && !d.warning), "{diagnostics:?}");
+        let scene = &views.assembled;
+        let (h_min, h_max) = part_bounds(scene, "holder");
+
+        // 95 + 2 x 1 clearance + 2 x 3 walls wide; one back wall deep; stack tall.
+        assert_eq!((h_min, h_max), ([0.0, 0.0, 0.0], [103.0, 100.0, 20.0]));
+
+        for n in 1..=4 {
+            let (c_min, c_max) = part_bounds(scene, &format!("coaster {n} base"));
+            // Inside the walls with exactly the clearance on the sides and back.
+            assert!((c_min[0] - 4.0).abs() < 1e-3 && (c_max[0] - 99.0).abs() < 1e-3, "coaster {n}");
+            assert!((c_max[1] - 96.0).abs() < 1e-3, "coaster {n} back clearance");
+        }
+
+        // Open front: no holder vertex inside the opening (x 3..100, y 0..97),
+        // so the coasters slide out.
+        let holder = scene.parts.iter().find(|p| p.name == "holder").unwrap();
+        for p in &scene.positions[holder.vertices.start as usize..holder.vertices.end as usize] {
+            let in_opening = p[0] > 3.0 + 1e-3 && p[0] < 100.0 - 1e-3 && p[1] < 97.0 - 1e-3;
+            assert!(!in_opening, "holder geometry at {p:?} blocks the opening");
+        }
+    }
+
+    #[test]
+    fn holder_prints_closed_with_the_coasters() {
+        let (views, diagnostics) = coaster_views("{ count: 4 }");
+        assert!(diagnostics.iter().all(|d| d.ok && !d.warning), "{diagnostics:?}");
+        let print = views.print.unwrap();
+        // Holder + 4 coasters at ~100 mm each: two plates on a 256 mm bed.
+        assert_eq!(print.plates.len(), 2);
+
+        let objects = cad_export::objects(&print);
+        let holder = objects.iter().find(|o| o.name == "holder").expect("holder object");
+        assert!(holder.is_closed(), "holder must be watertight");
+        assert_eq!(objects.len(), 9);
+        // Holder uses the base color: still three filaments.
+        let mut colors: Vec<_> = objects.iter().flat_map(|o| o.triangle_colors.clone()).collect();
+        colors.sort();
+        colors.dedup();
+        assert_eq!(colors.len(), 3);
+    }
+
+    #[test]
+    fn holder_can_be_left_out() {
+        let (views, _) = coaster_views("{ holder: false }");
+        assert!(views.assembled.parts.iter().all(|p| p.name != "holder"));
+        assert!(views.print.unwrap().parts.iter().all(|p| p.name != "holder"));
+    }
+
+    #[test]
     fn coaster_params_are_validated() {
         for (params, message) in [
             ("{ count: 0 }", "count must be"),
             ("{ stripes: 2.5 }", "stripes must be"),
             ("{ size: 10, margin: 8 }", "leaves no room"),
             ("{ inlayColors: [] }", "at least one color"),
+            ("{ wall: 0 }", "wall must be positive"),
         ] {
             let project = coaster_project(params);
             let update = project.pipeline().evaluate(&project.model());

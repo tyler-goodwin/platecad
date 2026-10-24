@@ -217,7 +217,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 |---|---|
 | `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
 | `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
-| `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one), stacked when assembled and packed four to a 256 mm plate for print. It exports as 8 closed objects in 3 colors. |
+| `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a U-shaped `polygon` extruded into three walls with an open front and no floor (a floor needs booleans). Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
 
 ## Testing
 

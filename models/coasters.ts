@@ -2,8 +2,10 @@ import {
   arrange,
   box,
   color,
+  extrude,
   group,
   part,
+  polygon,
   rotate,
   translate,
   type ColorInput,
@@ -14,8 +16,12 @@ import {
 /**
  * A set of square coasters with a raised stripe inlay in a second color: a
  * classic multi-filament print (base and inlay print together, one filament
- * each). Assembled: the set stacked. Print: packed onto the bed from
- * printer.toml (95 mm coasters fit four to a 256 mm plate).
+ * each), plus a holder. Assembled: the set stacked in its holder. Print:
+ * packed onto the bed from printer.toml.
+ *
+ * The holder is three walls (a U seen from above) with an open front to
+ * slide coasters out. It has no floor and holds the stack on the table:
+ * a floor needs a boolean union, which the kernel doesn't have yet.
  */
 export type CoasterParams = {
   /** How many coasters. */
@@ -33,6 +39,12 @@ export type CoasterParams = {
   baseColor: ColorInput;
   /** Inlay colors, used in turn from one coaster to the next. */
   inlayColors: ColorInput[];
+  /** Include the holder. */
+  holder: boolean;
+  /** Holder wall thickness, mm. */
+  wall: number;
+  /** Gap between the coasters and the holder walls, mm. */
+  clearance: number;
 };
 
 export const defaults: CoasterParams = {
@@ -44,6 +56,9 @@ export const defaults: CoasterParams = {
   stripes: 5,
   baseColor: "#2f3a4a",
   inlayColors: ["#e8b04f", "#4fa3a5"],
+  holder: true,
+  wall: 3,
+  clearance: 1,
 };
 
 function validate(p: CoasterParams) {
@@ -59,6 +74,31 @@ function validate(p: CoasterParams) {
   if (p.inlayColors.length === 0) {
     throw new Error("inlayColors needs at least one color");
   }
+  if (!(p.wall > 0) || !(p.clearance >= 0)) {
+    throw new Error(`wall must be positive and clearance >= 0 (got ${p.wall}, ${p.clearance})`);
+  }
+}
+
+/**
+ * Three walls around a `size` square opening (plus clearance), open toward -Y,
+ * as tall as the stack. The opening's corner is at (wall, 0).
+ */
+function holder(p: CoasterParams, height: number): ModelSpec {
+  const t = p.wall;
+  const opening = p.size + 2 * p.clearance;
+  const width = opening + 2 * t;
+  const depth = opening + t;
+  const outline: [number, number][] = [
+    [0, 0],
+    [t, 0],
+    [t, opening],
+    [t + opening, opening],
+    [t + opening, 0],
+    [width, 0],
+    [width, depth],
+    [0, depth],
+  ];
+  return color(part("holder", extrude(polygon(outline), { distance: height })), p.baseColor);
 }
 
 /** Coaster `i` (0-based): base plus stripes, stripes turned 90 degrees on every other one. */
@@ -87,10 +127,16 @@ export function coasters(overrides: Partial<CoasterParams> = {}): Model {
   validate(p);
   const set = Array.from({ length: p.count }, (_, i) => coaster(p, i));
   const height = p.base + p.inlay;
+  const stack = group(...set.map((c, i) => translate(c, [0, 0, i * height])));
 
+  if (!p.holder) {
+    return { assembled: stack, print: arrange(set) };
+  }
+  const caddy = holder(p, p.count * height);
+  const inside = p.wall + p.clearance;
   return {
-    assembled: group(...set.map((c, i) => translate(c, [0, 0, i * height]))),
-    print: arrange(set),
+    assembled: group(caddy, translate(stack, [inside, p.clearance, 0])),
+    print: arrange([caddy, ...set]),
   };
 }
 
