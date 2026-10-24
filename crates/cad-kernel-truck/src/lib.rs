@@ -184,9 +184,11 @@ const FIT_EPSILON: f64 = 1e-6;
 
 /// Next-fit row packing, keeping children in order. Rows wrap at the bed width
 /// (or, without a bed, at a width that makes the block roughly square). With a
-/// bed, a new plate starts when the next row would overrun the bed depth, and
-/// plates are laid out in a near-square grid. A part bigger than the bed still
-/// gets a spot (alone at the start of a row or plate); callers warn about it.
+/// bed, a new plate starts when the next row would overrun the bed depth,
+/// plates are laid out in a near-square grid, and each plate's block of parts
+/// is centered on it, as a slicer would place them. Without a bed, the block is
+/// centered on the origin. A part bigger than the bed still gets a spot (alone
+/// at the start of a row or plate, overhanging evenly); callers warn about it.
 fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
     let wrap = match bed {
         Some(bed) => bed.width,
@@ -217,26 +219,31 @@ fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
         row_depth = row_depth.max(d);
     }
 
+    // Extent of each plate's block of parts (blocks start at 0, 0).
+    let count = plate + 1;
+    let mut used = vec![[0.0f64; 2]; count];
+    for (&(k, x, y), [w, d]) in local.iter().zip(footprints) {
+        used[k] = [used[k][0].max(x + w), used[k][1].max(y + d)];
+    }
+
     let Some(bed) = bed else {
+        let [uw, ud] = used[0];
         return Packing {
-            positions: local.into_iter().map(|(_, x, y)| [x, y]).collect(),
+            positions: local.into_iter().map(|(_, x, y)| [x - uw / 2.0, y - ud / 2.0]).collect(),
             plates: Vec::new(),
         };
     };
 
-    // Plates in a grid. Cells grow if an oversize part hangs off its plate, so
-    // neighbouring plates never overlap.
-    let count = plate + 1;
+    // Plates in a grid. The step grows if an oversize block overhangs its plate,
+    // so neighbouring plates' parts never overlap.
     let columns = (count as f64).sqrt().ceil() as usize;
-    let mut cell = [bed.width, bed.depth];
-    for (&(_, x, y), [w, d]) in local.iter().zip(footprints) {
-        cell = [cell[0].max(x + w), cell[1].max(y + d)];
-    }
+    let widest = used.iter().map(|u| u[0]).fold(bed.width, f64::max);
+    let deepest = used.iter().map(|u| u[1]).fold(bed.depth, f64::max);
     let plate_gap = (bed.width.min(bed.depth) * 0.1).max(gap);
     let origin = |k: usize| {
         [
-            (k % columns) as f64 * (cell[0] + plate_gap),
-            (k / columns) as f64 * (cell[1] + plate_gap),
+            (k % columns) as f64 * (widest + plate_gap),
+            (k / columns) as f64 * (deepest + plate_gap),
         ]
     };
     Packing {
@@ -244,7 +251,8 @@ fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
             .into_iter()
             .map(|(k, x, y)| {
                 let [ox, oy] = origin(k);
-                [ox + x, oy + y]
+                let center = [(bed.width - used[k][0]) / 2.0, (bed.depth - used[k][1]) / 2.0];
+                [ox + center[0] + x, oy + center[1] + y]
             })
             .collect(),
         plates: (0..count)
@@ -720,10 +728,11 @@ mod tests {
         let per_child = TruckKernel.build(&unit_box()).unwrap().positions.len();
         let bounds = child_bounds(&scene, per_child);
 
+        // The 51 x 20 row is centered on the 1000 x 1000 bed: offset (474.5, 490).
         let expected = [
-            ([0.0, 0.0, 0.0], [10.0, 20.0, 2.0]),
-            ([15.0, 0.0, 0.0], [45.0, 5.0, 4.0]),
-            ([50.0, 0.0, 0.0], [51.0, 1.0, 1.0]),
+            ([474.5, 490.0, 0.0], [484.5, 510.0, 2.0]),
+            ([489.5, 490.0, 0.0], [519.5, 495.0, 4.0]),
+            ([524.5, 490.0, 0.0], [525.5, 491.0, 1.0]),
         ];
         assert_eq!(bounds.len(), expected.len());
         for (got, (min, max)) in bounds.iter().zip(expected) {
@@ -744,24 +753,27 @@ mod tests {
     #[test]
     fn pack_without_bed_makes_a_roughly_square_block() {
         let packing = pack(&[[10.0, 10.0]; 4], 0.0, None);
-        assert_positions(&packing.positions, &[[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]]);
+        // 2 x 2, centered on the origin.
+        assert_positions(&packing.positions, &[[-10.0, -10.0], [0.0, -10.0], [-10.0, 0.0], [0.0, 0.0]]);
         assert!(packing.plates.is_empty());
     }
 
     #[test]
     fn pack_wraps_rows_at_bed_width_and_fills_plates() {
         // 90 mm coasters, 10 mm gap, 256 mm bed: 2 per row, 2 rows per plate.
+        // A full plate's 190 x 190 block sits 33 mm in from each edge; the
+        // second plate's single row (190 x 90) is centered too.
         let packing = pack(&[[90.0, 90.0]; 6], 10.0, Some(&bed(256.0, 256.0)));
         let second_plate = 256.0 + 25.6;
         assert_positions(
             &packing.positions,
             &[
-                [0.0, 0.0],
-                [100.0, 0.0],
-                [0.0, 100.0],
-                [100.0, 100.0],
-                [second_plate, 0.0],
-                [second_plate + 100.0, 0.0],
+                [33.0, 33.0],
+                [133.0, 33.0],
+                [33.0, 133.0],
+                [133.0, 133.0],
+                [second_plate + 33.0, 83.0],
+                [second_plate + 133.0, 83.0],
             ],
         );
         assert_eq!(packing.plates.len(), 2);
@@ -772,8 +784,30 @@ mod tests {
     #[test]
     fn pack_exact_fit_shares_a_row() {
         let packing = pack(&[[123.0, 50.0], [123.0, 50.0]], 10.0, Some(&bed(256.0, 256.0)));
-        assert_positions(&packing.positions, &[[0.0, 0.0], [133.0, 0.0]]);
+        assert_positions(&packing.positions, &[[0.0, 103.0], [133.0, 103.0]]);
         assert_eq!(packing.plates.len(), 1);
+    }
+
+    #[test]
+    fn pack_centers_each_plates_parts_on_it() {
+        let parts: Vec<[f64; 2]> =
+            [[120.0, 40.0], [30.0, 200.0], [80.0, 80.0], [250.0, 20.0], [60.0, 60.0], [200.0, 100.0]].to_vec();
+        let packing = pack(&parts, 5.0, Some(&bed(256.0, 256.0)));
+        for plate in &packing.plates {
+            let (px, py) = (plate.min[0] as f64, plate.min[1] as f64);
+            let mut min = [f64::MAX; 2];
+            let mut max = [f64::MIN; 2];
+            for ([w, d], [x, y]) in parts.iter().zip(&packing.positions) {
+                let on_plate = *x >= px - 1e-3 && *x < px + 256.0;
+                if on_plate {
+                    min = [min[0].min(*x), min[1].min(*y)];
+                    max = [max[0].max(x + w), max[1].max(y + d)];
+                }
+            }
+            let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+            assert!((center[0] - (px + 128.0)).abs() < 1e-3, "{center:?} on {plate:?}");
+            assert!((center[1] - (py + 128.0)).abs() < 1e-3, "{center:?} on {plate:?}");
+        }
     }
 
     #[test]
@@ -846,6 +880,14 @@ mod tests {
     }
 
     #[test]
+    fn single_part_lands_in_the_middle_of_the_bed() {
+        let scene = TruckKernel
+            .build(&arrange_on(bed(256.0, 200.0), 10.0, vec![sized_box(90.0, 40.0, 4.0)]))
+            .unwrap();
+        assert_aabb(&scene, [83.0, 80.0, 0.0], [173.0, 120.0, 4.0]);
+    }
+
+    #[test]
     fn rejects_bad_beds() {
         for bad in [bed(0.0, 256.0), bed(256.0, f64::NAN), bed(-1.0, 1.0)] {
             assert!(TruckKernel.build(&arrange_on(bad, 1.0, vec![unit_box()])).is_err());
@@ -860,8 +902,9 @@ mod tests {
         let scene = TruckKernel
             .build(&arrange(0.0, vec![translate([9.0, 9.0, 9.0], pair)]))
             .unwrap();
-        // Stack keeps its internal spacing; only the whole thing moved to the plate.
-        assert_aabb(&scene, [0.0; 3], [1.0, 1.0, 6.0]);
+        // Stack keeps its internal spacing; the whole thing moved onto the plate,
+        // centered on the origin.
+        assert_aabb(&scene, [-0.5, -0.5, 0.0], [0.5, 0.5, 6.0]);
     }
 
     #[test]
@@ -966,7 +1009,7 @@ mod tests {
         let standing = sized_box(1.0, 10.0, 20.0);
         let flat = rotate([0.0, 1.0, 0.0], 90.0, [0.0; 3], standing);
         let scene = TruckKernel.build(&arrange(0.0, vec![flat])).unwrap();
-        assert_aabb(&scene, [0.0; 3], [20.0, 10.0, 1.0]);
+        assert_aabb(&scene, [-10.0, -5.0, 0.0], [10.0, 5.0, 1.0]);
     }
 
     #[test]

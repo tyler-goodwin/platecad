@@ -66,7 +66,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Group { children }` | Shapes shown together. Not a boolean union. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
 | `Part { name, shape }` | Names a shape as a part, for export and the part list. The innermost name wins; a named profile names its extrusion. |
-| `Arrange { gap, children, bed? }` | Print layout: drops each child onto the plate (z = 0), moving it as a unit and never rotating it. Rows wrap at the bed width and spill onto more plates, which sit in a grid. With no bed, rows wrap into a roughly square block. |
+| `Arrange { gap, children, bed? }` | Print layout: drops each child onto the plate (z = 0), moving it as a unit and never rotating it. Rows wrap at the bed width and spill onto more plates, which sit in a grid, and each plate's parts are centered on it. With no bed, rows wrap into a roughly square block centered on the origin. |
 
 `ModelViews` is what a model exports: `assembled` (how it looks put together)
 and an optional `print` (parts oriented and arranged for a slicer). A bare
