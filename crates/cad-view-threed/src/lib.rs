@@ -5,6 +5,9 @@ use cad_view::{SceneUpdate, ViewError, ViewMode, ViewSelection, ViewportApp};
 use three_d::egui;
 use three_d::*;
 
+/// Vertical field of view of the viewport camera.
+const FOV_Y_DEGREES: f32 = 45.0;
+
 /// three-d window with an orbit camera and an egui status overlay.
 pub struct ThreeDViewport {
     pub title: String,
@@ -33,9 +36,9 @@ impl ViewportApp for ThreeDViewport {
             vec3(5.0, -15.0, 12.0),
             vec3(5.0, 5.0, 0.0),
             vec3(0.0, 0.0, 1.0),
-            degrees(45.0),
+            degrees(FOV_Y_DEGREES),
             0.1,
-            1000.0,
+            1000.0, // Placeholder: replaced by `frame_camera` once a model loads.
         );
         let mut control = OrbitControl::new(vec3(5.0, 5.0, 0.0), 1.0, 500.0);
         let mut gui = GUI::new(&context);
@@ -324,6 +327,9 @@ struct Framing {
     eye: Vec3,
     min_distance: f32,
     max_distance: f32,
+    /// Clip planes that keep the whole model visible across the orbit range.
+    z_near: f32,
+    z_far: f32,
     edge_radius: f32,
 }
 
@@ -334,17 +340,24 @@ fn framing(aabb: Aabb) -> Framing {
     let center = (min + max) * 0.5;
     let diagonal = (max - min).magnitude();
     let radius = (diagonal * 0.5).max(1.0);
+    let min_distance = radius * 0.2;
+    let max_distance = radius * 50.0;
     Framing {
         center,
         eye: center + vec3(1.0, -1.6, 1.1).normalize() * radius * 3.0,
-        min_distance: radius * 0.2,
-        max_distance: radius * 50.0,
+        min_distance,
+        max_distance,
+        // Scale with the model: a fixed far plane clips anything big (a 1 m
+        // bookshelf framed from ~2 m vanished behind a 1000 mm far plane).
+        z_near: min_distance * 0.05,
+        z_far: max_distance + radius * 2.0,
         edge_radius: (diagonal * 0.002).max(1e-3),
     }
 }
 
 fn frame_camera(aabb: Aabb, camera: &mut Camera, control: &mut OrbitControl) {
     let f = framing(aabb);
+    camera.set_perspective_projection(degrees(FOV_Y_DEGREES), f.z_near, f.z_far);
     camera.set_view(f.eye, f.center, vec3(0.0, 0.0, 1.0));
     *control = OrbitControl::new(f.center, f.min_distance, f.max_distance);
 }
@@ -461,6 +474,34 @@ mod tests {
         assert!(distance * 22.5f32.to_radians().sin() > radius, "{distance}");
         assert!(f.min_distance < distance && distance < f.max_distance);
         assert!(f.min_distance > radius * 0.1);
+    }
+
+    /// The model's bounding sphere stays between the clip planes when framed and
+    /// at every orbit distance, from a 1 mm part to a 10 m assembly.
+    #[test]
+    fn clip_planes_contain_model_at_every_scale() {
+        for size in [1.0, 10.0, 300.0, 1000.0, 10_000.0] {
+            let f = framing(aabb([0.0; 3], [size, size * 0.3, size * 0.8]));
+            let radius = vec3(size, size * 0.3, size * 0.8).magnitude() * 0.5;
+            let framed = (f.eye - f.center).magnitude();
+            for distance in [framed, f.max_distance] {
+                assert!(distance + radius < f.z_far, "size {size}: far side clipped at {distance}");
+                assert!(distance - radius > f.z_near, "size {size}: near side clipped at {distance}");
+            }
+            // Zoomed all the way in, the camera is inside the model: the near
+            // plane must still be closer than the closest orbit distance.
+            assert!(f.z_near < f.min_distance, "size {size}");
+            assert!(f.z_far / f.z_near < 1e5, "size {size}: depth precision ratio too large");
+        }
+    }
+
+    #[test]
+    fn bookshelf_scale_regression() {
+        // models/bookshelf.ts defaults: 1000 x 300 x 800 mm.
+        let f = framing(aabb([0.0; 3], [1000.0, 300.0, 800.0]));
+        let framed = (f.eye - f.center).magnitude();
+        assert!(framed > 1000.0, "premise: framed beyond the old fixed 1000 mm far plane");
+        assert!(framed + 700.0 < f.z_far);
     }
 
     #[test]

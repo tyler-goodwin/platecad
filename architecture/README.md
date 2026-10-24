@@ -149,7 +149,10 @@ when the model has one, and the assembled view otherwise.
   the model has no print view), a collapsible **part list** for the shown
   view (name and triangle count), reload diagnostics and an orbit hint.
 - The camera frames the shown view when it first appears and when you switch
-  views. Reloads keep your camera.
+  views. Reloads keep your camera. Framing also sets the clip planes from the
+  model's size, so anything from a 1 mm part to a 10 m assembly stays visible
+  across the whole orbit range. Fixed planes once clipped the 1 m bookshelf
+  entirely.
 
 ## 3MF export
 
