@@ -65,6 +65,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
+| `Union { children }`, `Difference { shape, tools }`, `Intersect { children }` | Booleans via truck-shapeops, on closed solids. The result keeps the first operand's color and part name. A difference skips tools whose bounds miss the shape. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
 | `Part { name, shape }` | Names a shape as a part, for export and the part list. The innermost name wins; a named profile names its extrusion. |
 | `Arrange { gap, children, bed? }` | Print layout: drops each child onto the plate (z = 0), moving it as a unit and never rotating it. Rows wrap at the bed width and spill onto more plates, which sit in a grid, and each plate's parts are centered on it. With no bed, rows wrap into a roughly square block centered on the origin. |
@@ -72,6 +73,18 @@ kernel and renderer can each be swapped without touching the others.
 `ModelViews` is what a model exports: `assembled` (how it looks put together)
 and an optional `print` (parts oriented and arranged for a slicer). A bare
 `ModelSpec` export means assembled-only.
+
+### Booleans and coplanar faces
+
+truck-shapeops works only when the operands' faces cross. Faces that line
+up exactly (two solids sharing a plane, solids that only touch, a cutter
+ending flush with a surface) make it return `None` or **panic**. The kernel
+runs every boolean under `catch_unwind` and turns either into an error that
+says what to change. Models therefore use the subtractive idiom: start from
+a block and subtract cutters that overshoot the faces they cut through. The
+coaster holder is a box minus a cutter poking out of the top and front. A
+caught panic still prints truck's panic message to stderr. Kernel tests pin
+the failing cases, so a truck upgrade that fixes them will show up.
 
 `TessellatedScene` holds GPU-ready triangles: positions, normals and sRGB
 colors (one per vertex, de-indexed so corners stay crisp), plus indices and an
@@ -217,7 +230,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 |---|---|
 | `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
 | `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
-| `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a U-shaped `polygon` extruded into three walls with an open front and no floor (a floor needs booleans). Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
+| `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a tray with a floor and three walls, open at the front: a box minus an overshooting cutter. Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
 
 ## Testing
 
@@ -239,9 +252,9 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Booleans.** Union, difference and intersection via truck-shapeops, so
-   colored parts can be real non-overlapping bodies and holes become
-   possible.
+1. **Profiles with holes and circles,** then bounds for curved shapes,
+   then extrude direction and revolve (see the Modeling section of
+   improvements.md).
 
 Out of scope for now: OCC linkage, picking and measurements, constraint
 sketching, per-face painting.

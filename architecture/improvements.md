@@ -6,9 +6,14 @@ the improvement.
 
 ## Modeling
 
-- **Booleans.** `Group` is visual only, so overlapping parts stay separate
-  bodies. That's fine on screen, but slicers dislike overlapping volumes.
-  Add `union`/`difference`/`intersect` via truck-shapeops.
+- **Coplanar booleans.** Booleans exist but fail whenever faces line up
+  exactly (see README, "Booleans and coplanar faces"). Options: detect
+  coplanar contact and nudge a tool by a sub-tolerance epsilon
+  automatically, try a newer truck, or use an OCC backend whose booleans
+  handle coplanar faces.
+- **Quiet boolean panics.** A caught truck panic still prints to stderr.
+  A process-wide panic hook that silences panics from the kernel's boolean
+  calls would keep the console clean.
 - **More profiles.** `Rect` and `Polygon` exist. Add circles, polylines
   with arcs, and profiles with holes (truck's `try_attach_plane` takes
   several wires).

@@ -37,8 +37,19 @@ pub enum ModelSpec {
         origin: [f64; 3],
         shape: Box<ModelSpec>,
     },
-    /// Several independent shapes shown together (no boolean union yet).
+    /// Several independent shapes shown together, not fused (see `Union`).
     Group { children: Vec<ModelSpec> },
+    /// Fuses solids into one. truck needs their faces to cross: solids that
+    /// only touch, or share a face plane, fail with an error.
+    Union { children: Vec<ModelSpec> },
+    /// Cuts every tool out of `shape`. Tools must overshoot the faces they cut
+    /// through rather than end flush with them.
+    Difference {
+        shape: Box<ModelSpec>,
+        tools: Vec<ModelSpec>,
+    },
+    /// Keeps the volume common to all children.
+    Intersect { children: Vec<ModelSpec> },
     /// Paints `shape`. The innermost `Color` wins; a colored profile colors its extrusion.
     Color { rgb: Rgb, shape: Box<ModelSpec> },
     /// Names `shape` as a part (for export and part lists). The innermost
@@ -309,6 +320,20 @@ mod tests {
                 points: vec![[0.0, 0.0], [10.0, 0.0], [0.0, 5.0]]
             }
         );
+    }
+
+    #[test]
+    fn booleans_match_ts_shape() {
+        let rect = r#"{"kind":"Rect","width":1,"height":1}"#;
+        let json = format!(r#"{{"kind":"Difference","shape":{rect},"tools":[{rect},{rect}]}}"#);
+        let ModelSpec::Difference { tools, .. } = serde_json::from_str(&json).unwrap() else {
+            panic!("not a difference")
+        };
+        assert_eq!(tools.len(), 2);
+        let json = format!(r#"{{"kind":"Union","children":[{rect}]}}"#);
+        assert!(matches!(serde_json::from_str(&json).unwrap(), ModelSpec::Union { .. }));
+        let json = format!(r#"{{"kind":"Intersect","children":[{rect}]}}"#);
+        assert!(matches!(serde_json::from_str(&json).unwrap(), ModelSpec::Intersect { .. }));
     }
 
     #[test]

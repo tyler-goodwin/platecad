@@ -527,6 +527,28 @@ mod tests {
     }
 
     #[test]
+    fn dsl_booleans() {
+        let spec = eval(
+            r#"import { cube, difference, intersect, union } from "./dsl/cad.ts";
+            export default () => difference(union(cube(1), cube(1)), intersect(cube(1)), cube(1));"#,
+        )
+        .unwrap();
+        let ModelSpec::Difference { shape, tools } = spec else { panic!("{spec:?}") };
+        assert!(matches!(*shape, ModelSpec::Union { ref children } if children.len() == 2));
+        assert!(matches!(tools[0], ModelSpec::Intersect { ref children } if children.len() == 1));
+        assert_eq!(tools[1], unit_cube());
+
+        for bad in ["union()", "intersect()", "difference(cube(1))"] {
+            let source = format!(
+                r#"import {{ cube, difference, intersect, union }} from "./dsl/cad.ts";
+                export default () => {bad};"#
+            );
+            let err = eval(&source).unwrap_err().to_string();
+            assert!(err.contains("needs at least one"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"

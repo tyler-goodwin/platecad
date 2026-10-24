@@ -2,10 +2,9 @@ import {
   arrange,
   box,
   color,
-  extrude,
+  difference,
   group,
   part,
-  polygon,
   rotate,
   translate,
   type ColorInput,
@@ -19,9 +18,9 @@ import {
  * each), plus a holder. Assembled: the set stacked in its holder. Print:
  * packed onto the bed from printer.toml.
  *
- * The holder is three walls (a U seen from above) with an open front to
- * slide coasters out. It has no floor and holds the stack on the table:
- * a floor needs a boolean union, which the kernel doesn't have yet.
+ * The holder is a tray: a floor and three walls, open at the front so the
+ * coasters slide out. It's a block with a cutter subtracted; the cutter
+ * overshoots the top and front, as booleans need.
  */
 export type CoasterParams = {
   /** How many coasters. */
@@ -43,6 +42,8 @@ export type CoasterParams = {
   holder: boolean;
   /** Holder wall thickness, mm. */
   wall: number;
+  /** Holder floor thickness, mm. */
+  floor: number;
   /** Gap between the coasters and the holder walls, mm. */
   clearance: number;
 };
@@ -58,6 +59,7 @@ export const defaults: CoasterParams = {
   inlayColors: ["#e8b04f", "#4fa3a5"],
   holder: true,
   wall: 3,
+  floor: 2,
   clearance: 1,
 };
 
@@ -74,31 +76,32 @@ function validate(p: CoasterParams) {
   if (p.inlayColors.length === 0) {
     throw new Error("inlayColors needs at least one color");
   }
-  if (!(p.wall > 0) || !(p.clearance >= 0)) {
-    throw new Error(`wall must be positive and clearance >= 0 (got ${p.wall}, ${p.clearance})`);
+  if (!(p.wall > 0) || !(p.floor > 0) || !(p.clearance >= 0)) {
+    throw new Error(
+      `wall and floor must be positive and clearance >= 0 (got ${p.wall}, ${p.floor}, ${p.clearance})`,
+    );
   }
 }
 
+/** How far cutters poke past the faces they cut through, mm. */
+const OVERSHOOT = 1;
+
 /**
- * Three walls around a `size` square opening (plus clearance), open toward -Y,
- * as tall as the stack. The opening's corner is at (wall, 0).
+ * A tray around a `size` square opening (plus clearance): floor, side walls
+ * and back wall, open toward -Y. Walls rise `stack` mm above the floor. The
+ * opening's corner is at (wall, 0, floor).
  */
-function holder(p: CoasterParams, height: number): ModelSpec {
+function holder(p: CoasterParams, stack: number): ModelSpec {
   const t = p.wall;
   const opening = p.size + 2 * p.clearance;
-  const width = opening + 2 * t;
-  const depth = opening + t;
-  const outline: [number, number][] = [
-    [0, 0],
-    [t, 0],
-    [t, opening],
-    [t + opening, opening],
-    [t + opening, 0],
-    [width, 0],
-    [width, depth],
-    [0, depth],
-  ];
-  return color(part("holder", extrude(polygon(outline), { distance: height })), p.baseColor);
+  const block = box({ width: opening + 2 * t, depth: opening + t, height: p.floor + stack });
+  const cutter = box({
+    width: opening,
+    depth: opening + OVERSHOOT,
+    height: stack + OVERSHOOT,
+    at: [t, -OVERSHOOT, p.floor],
+  });
+  return color(part("holder", difference(block, cutter)), p.baseColor);
 }
 
 /** Coaster `i` (0-based): base plus stripes, stripes turned 90 degrees on every other one. */
@@ -135,7 +138,7 @@ export function coasters(overrides: Partial<CoasterParams> = {}): Model {
   const caddy = holder(p, p.count * height);
   const inside = p.wall + p.clearance;
   return {
-    assembled: group(caddy, translate(stack, [inside, p.clearance, 0])),
+    assembled: group(caddy, translate(stack, [inside, p.clearance, p.floor])),
     print: arrange([caddy, ...set]),
   };
 }

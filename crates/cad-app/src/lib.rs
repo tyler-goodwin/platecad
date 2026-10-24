@@ -92,6 +92,16 @@ pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
         ModelSpec::Group { children } => ModelSpec::Group {
             children: all(children),
         },
+        ModelSpec::Union { children } => ModelSpec::Union {
+            children: all(children),
+        },
+        ModelSpec::Intersect { children } => ModelSpec::Intersect {
+            children: all(children),
+        },
+        ModelSpec::Difference { shape, tools } => ModelSpec::Difference {
+            shape: boxed(shape),
+            tools: all(tools),
+        },
         ModelSpec::Arrange {
             gap,
             children,
@@ -1246,13 +1256,15 @@ mod tests {
     #[test]
     fn holder_surrounds_the_stack_with_clearance_and_an_open_front() {
         let (views, diagnostics) =
-            coaster_views("{ count: 4, size: 95, base: 4, inlay: 1, wall: 3, clearance: 1 }");
+            coaster_views("{ count: 4, size: 95, base: 4, inlay: 1, wall: 3, floor: 2, clearance: 1 }");
         assert!(diagnostics.iter().all(|d| d.ok && !d.warning), "{diagnostics:?}");
         let scene = &views.assembled;
         let (h_min, h_max) = part_bounds(scene, "holder");
 
-        // 95 + 2 x 1 clearance + 2 x 3 walls wide; one back wall deep; stack tall.
-        assert_eq!((h_min, h_max), ([0.0, 0.0, 0.0], [103.0, 100.0, 20.0]));
+        // 95 + 2 x 1 clearance + 2 x 3 walls wide; one back wall deep; floor + stack tall.
+        for (got, want) in h_min.iter().chain(&h_max).zip([0.0, 0.0, 0.0, 103.0, 100.0, 22.0]) {
+            assert!((got - want).abs() < 1e-3, "holder bounds {h_min:?}..{h_max:?}");
+        }
 
         for n in 1..=4 {
             let (c_min, c_max) = part_bounds(scene, &format!("coaster {n} base"));
@@ -1260,13 +1272,25 @@ mod tests {
             assert!((c_min[0] - 4.0).abs() < 1e-3 && (c_max[0] - 99.0).abs() < 1e-3, "coaster {n}");
             assert!((c_max[1] - 96.0).abs() < 1e-3, "coaster {n} back clearance");
         }
+        // The stack rests on the floor.
+        let (bottom, _) = part_bounds(scene, "coaster 1 base");
+        assert!((bottom[2] - 2.0).abs() < 1e-3, "{bottom:?}");
 
-        // Open front: no holder vertex inside the opening (x 3..100, y 0..97),
-        // so the coasters slide out.
+        // Open front: above the floor, no holder vertex inside the opening
+        // (x 3..100, y 0..97), so the coasters slide out.
         let holder = scene.parts.iter().find(|p| p.name == "holder").unwrap();
-        for p in &scene.positions[holder.vertices.start as usize..holder.vertices.end as usize] {
+        let vertices = &scene.positions[holder.vertices.start as usize..holder.vertices.end as usize];
+        for p in vertices {
             let in_opening = p[0] > 3.0 + 1e-3 && p[0] < 100.0 - 1e-3 && p[1] < 97.0 - 1e-3;
-            assert!(!in_opening, "holder geometry at {p:?} blocks the opening");
+            assert!(!in_opening || p[2] <= 2.0 + 1e-3, "holder geometry at {p:?} blocks the opening");
+        }
+        // ...and there is a floor: its top face's corners at z = 2 span the opening.
+        let floor_corners = [[3.0, 0.0], [100.0, 0.0], [3.0, 97.0], [100.0, 97.0]];
+        for [x, y] in floor_corners {
+            let found = vertices
+                .iter()
+                .any(|p| (p[0] - x).abs() < 1e-3 && (p[1] - y).abs() < 1e-3 && (p[2] - 2.0).abs() < 1e-3);
+            assert!(found, "floor corner ({x}, {y}, 2) missing");
         }
     }
 
@@ -1303,7 +1327,8 @@ mod tests {
             ("{ stripes: 2.5 }", "stripes must be"),
             ("{ size: 10, margin: 8 }", "leaves no room"),
             ("{ inlayColors: [] }", "at least one color"),
-            ("{ wall: 0 }", "wall must be positive"),
+            ("{ wall: 0 }", "wall and floor must be positive"),
+            ("{ floor: 0 }", "wall and floor must be positive"),
         ] {
             let project = coaster_project(params);
             let update = project.pipeline().evaluate(&project.model());

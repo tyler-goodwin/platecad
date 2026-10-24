@@ -9,3 +9,4 @@ cad-ir.workspace = true
 cad-kernel.workspace = true
 truck-meshalgo = "0.4"
 truck-modeling = "0.6"
+truck-shapeops = { version = "0.4", default-features = false }

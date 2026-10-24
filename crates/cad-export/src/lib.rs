@@ -363,6 +363,33 @@ mod tests {
     }
 
     #[test]
+    fn boolean_results_export_closed_with_exact_volume() {
+        let ten = || translate([0.0; 3], sized_box(10.0, 10.0, 10.0));
+        let cases = [
+            // 1000 - a 4 x 4 x 10 through-hole.
+            (
+                ModelSpec::Difference {
+                    shape: Box::new(ten()),
+                    tools: vec![translate([3.0, 3.0, -1.0], sized_box(4.0, 4.0, 12.0))],
+                },
+                840.0,
+            ),
+            // Two 1000 cubes overlapping in a 5 x 4.5 x 4 corner.
+            (
+                ModelSpec::Union {
+                    children: vec![ten(), translate([5.0, 5.5, 6.0], sized_box(10.0, 10.0, 10.0))],
+                },
+                2000.0 - 90.0,
+            ),
+        ];
+        for (spec, volume) in cases {
+            let object = &objects(&build(&part("solid", spec)))[0];
+            assert!(object.is_closed());
+            assert!((signed_volume(object) - volume).abs() < 1e-2, "{} vs {volume}", signed_volume(object));
+        }
+    }
+
+    #[test]
     fn every_part_is_its_own_watertight_object() {
         let spec = group(vec![
             paint([255, 0, 0], part("left", sized_box(1.0, 1.0, 1.0))),

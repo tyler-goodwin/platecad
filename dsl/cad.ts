@@ -44,6 +44,10 @@ export type RotateSpec = {
   shape: ModelSpec;
 };
 
+export type UnionSpec = { kind: "Union"; children: ModelSpec[] };
+export type DifferenceSpec = { kind: "Difference"; shape: ModelSpec; tools: ModelSpec[] };
+export type IntersectSpec = { kind: "Intersect"; children: ModelSpec[] };
+
 export type GroupSpec = {
   kind: "Group";
   children: ModelSpec[];
@@ -81,6 +85,9 @@ export type ModelSpec =
   | TranslateSpec
   | RotateSpec
   | GroupSpec
+  | UnionSpec
+  | DifferenceSpec
+  | IntersectSpec
   | ColorSpec
   | PartSpec
   | ArrangeSpec;
@@ -226,6 +233,38 @@ export function arrange(parts: ModelSpec[], opts: { gap?: number; bed?: Bed } = 
     spec.bed = { width, depth, height };
   }
   return spec;
+}
+
+/**
+ * Fuses solids into one. Their faces must cross: solids that only touch or
+ * share a face plane can't be fused, so overlap them a little (e.g. sink one
+ * 0.5 mm into the other).
+ */
+export function union(...shapes: ModelSpec[]): UnionSpec {
+  if (shapes.length === 0) {
+    throw new Error("union needs at least one shape");
+  }
+  return { kind: "Union", children: shapes };
+}
+
+/**
+ * Cuts `tools` out of `shape`. Make tools overshoot the faces they cut
+ * through (a through-hole's cutter pokes out of both sides) rather than end
+ * flush with them.
+ */
+export function difference(shape: ModelSpec, ...tools: ModelSpec[]): DifferenceSpec {
+  if (tools.length === 0) {
+    throw new Error("difference needs at least one tool");
+  }
+  return { kind: "Difference", shape, tools };
+}
+
+/** Keeps the volume common to all shapes. */
+export function intersect(...shapes: ModelSpec[]): IntersectSpec {
+  if (shapes.length === 0) {
+    throw new Error("intersect needs at least one shape");
+  }
+  return { kind: "Intersect", children: shapes };
 }
 
 /**

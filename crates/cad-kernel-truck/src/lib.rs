@@ -3,9 +3,11 @@ use std::collections::{HashMap, HashSet};
 use cad_ir::{Bed, DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{Kernel, KernelError};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
-use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Vector3, Wire, builder};
+use truck_modeling::{Face, InnerSpace, Point3, Rad, Shell, Solid, Vector3, Wire, builder};
 
 const TESSELLATION_TOL: f64 = 0.01;
+/// Geometric tolerance for truck-shapeops, mm.
+const BOOLEAN_TOL: f64 = 0.05;
 
 #[derive(Debug, Default)]
 pub struct TruckKernel;
@@ -114,6 +116,50 @@ fn build_bodies(
                 bodies.extend(build_bodies(child, style, plates)?);
             }
             Ok(bodies)
+        }
+        ModelSpec::Union { children } => {
+            let mut operands = build_operands("union", children, style, plates)?.into_iter();
+            let (mut acc, result_style) = operands.next().ok_or_else(|| {
+                KernelError::Invalid("union needs at least one shape".into())
+            })?;
+            for (solid, _) in operands {
+                acc = boolean("union", UNION_HINT, || truck_shapeops::or(&acc, &solid, BOOLEAN_TOL))?;
+            }
+            Ok(bodies_of(acc, &result_style))
+        }
+        ModelSpec::Intersect { children } => {
+            let mut operands = build_operands("intersect", children, style, plates)?.into_iter();
+            let (mut acc, result_style) = operands.next().ok_or_else(|| {
+                KernelError::Invalid("intersect needs at least one shape".into())
+            })?;
+            for (solid, _) in operands {
+                if !bounds_overlap(&acc, &solid) {
+                    return Err(KernelError::Invalid("intersect is empty: the shapes don't overlap".into()));
+                }
+                acc = boolean("intersect", UNION_HINT, || truck_shapeops::and(&acc, &solid, BOOLEAN_TOL))?;
+            }
+            Ok(bodies_of(acc, &result_style))
+        }
+        ModelSpec::Difference { shape, tools } => {
+            if tools.is_empty() {
+                return Err(KernelError::Invalid("difference needs at least one tool".into()));
+            }
+            let tools = build_operands("difference", tools, style, plates)?;
+            let mut result = Vec::new();
+            for (mut acc, base_style) in build_operands("difference", std::slice::from_ref(&**shape), style, plates)? {
+                for (tool, _) in &tools {
+                    if !bounds_overlap(&acc, tool) {
+                        continue; // Nothing to cut; truck would report failure.
+                    }
+                    let mut inverted = tool.clone();
+                    inverted.not();
+                    acc = boolean("difference", DIFFERENCE_HINT, || {
+                        truck_shapeops::and(&acc, &inverted, BOOLEAN_TOL)
+                    })?;
+                }
+                result.extend(bodies_of(acc, &base_style));
+            }
+            Ok(result)
         }
         ModelSpec::Color { rgb, shape } => build_bodies(
             shape,
@@ -267,6 +313,71 @@ fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
     }
 }
 
+const UNION_HINT: &str = "truck can't combine solids that only touch or whose faces line up \
+exactly. Make them overlap so their faces cross (e.g. sink one 0.5 mm into the other).";
+const DIFFERENCE_HINT: &str = "truck can't cut where a tool's face lines up exactly with a face \
+of the shape. Make tools overshoot the faces they cut through (e.g. by 1 mm).";
+
+/// Builds each child into solids (one per closed body) with its style.
+fn build_operands(
+    op: &str,
+    children: &[ModelSpec],
+    style: &Style,
+    plates: &mut Vec<Plate>,
+) -> Result<Vec<(Solid, Style)>, KernelError> {
+    let mut operands = Vec::new();
+    for child in children {
+        for body in build_bodies(child, style, plates)? {
+            let solid = Solid::try_new(vec![body.shell]).map_err(|_| {
+                KernelError::Invalid(format!("{op} needs solids (e.g. extrusions), not 2D profiles"))
+            })?;
+            operands.push((solid, body.style));
+        }
+    }
+    Ok(operands)
+}
+
+/// Runs a truck-shapeops operation, turning its failures (and panics, which it
+/// raises on some coplanar inputs) into an error with a hint.
+fn boolean(op: &str, hint: &str, run: impl FnOnce() -> Option<Solid>) -> Result<Solid, KernelError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(Some(solid)) if !solid.boundaries().is_empty() => Ok(solid),
+        _ => Err(KernelError::Invalid(format!("{op} failed: {hint}"))),
+    }
+}
+
+fn bodies_of(solid: Solid, style: &Style) -> Vec<Body> {
+    solid
+        .into_boundaries()
+        .into_iter()
+        .map(|shell| Body {
+            shell,
+            style: style.clone(),
+        })
+        .collect()
+}
+
+fn solid_bounds(solid: &Solid) -> Option<(Point3, Point3)> {
+    let mut points = solid.boundaries().iter().flat_map(|s| s.vertex_iter()).map(|v| v.point());
+    let first = points.next()?;
+    Some(points.fold((first, first), |(min, max), p| {
+        (
+            Point3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z)),
+            Point3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z)),
+        )
+    }))
+}
+
+/// Whether two solids' bounding boxes overlap with positive volume.
+fn bounds_overlap(a: &Solid, b: &Solid) -> bool {
+    match (solid_bounds(a), solid_bounds(b)) {
+        (Some((amin, amax)), Some((bmin, bmax))) => {
+            amin.x < bmax.x && bmin.x < amax.x && amin.y < bmax.y && bmin.y < amax.y && amin.z < bmax.z && bmin.z < amax.z
+        }
+        _ => false,
+    }
+}
+
 fn validate_part_name(name: &str) -> Result<String, KernelError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -388,7 +499,12 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
             validate_part_name(name)?;
             build_face(shape)
         }
-        ModelSpec::Extrude { .. } | ModelSpec::Group { .. } | ModelSpec::Arrange { .. } => {
+        ModelSpec::Extrude { .. }
+        | ModelSpec::Group { .. }
+        | ModelSpec::Arrange { .. }
+        | ModelSpec::Union { .. }
+        | ModelSpec::Difference { .. }
+        | ModelSpec::Intersect { .. } => {
             Err(KernelError::Invalid(
                 "extrude profile must be a single 2D shape (rect, optionally moved, colored or named)"
                     .into(),
@@ -1295,6 +1411,122 @@ mod tests {
             let err = TruckKernel.build(&extrude(polygon(&points), 1.0)).unwrap_err();
             assert!(err.to_string().contains(why), "{points:?}: {err}");
         }
+    }
+
+    fn cuboid(min: [f64; 3], size: [f64; 3]) -> ModelSpec {
+        translate(min, sized_box(size[0], size[1], size[2]))
+    }
+
+    fn union(children: Vec<ModelSpec>) -> ModelSpec {
+        ModelSpec::Union { children }
+    }
+
+    fn difference(shape: ModelSpec, tools: Vec<ModelSpec>) -> ModelSpec {
+        ModelSpec::Difference {
+            shape: Box::new(shape),
+            tools,
+        }
+    }
+
+    fn intersect(children: Vec<ModelSpec>) -> ModelSpec {
+        ModelSpec::Intersect { children }
+    }
+
+    fn ten() -> ModelSpec {
+        cuboid([0.0; 3], [10.0; 3])
+    }
+
+    #[test]
+    fn union_of_crossing_solids_is_one_body() {
+        let spec = union(vec![ten(), cuboid([5.0, 5.5, 6.0], [10.0; 3])]);
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_aabb(&scene, [0.0; 3], [15.0, 15.5, 16.0]);
+        // Fused: each cube's corner that sits inside the other cube is gone
+        // (a plain group would still have both).
+        let has = |q: [f32; 3]| scene.positions.iter().any(|p| (0..3).all(|i| (p[i] - q[i]).abs() < 1e-4));
+        assert!(!has([10.0, 10.0, 10.0]), "first cube's buried corner survived");
+        assert!(!has([5.0, 5.5, 6.0]), "second cube's buried corner survived");
+        assert!(has([0.0, 0.0, 0.0]) && has([15.0, 15.5, 16.0]), "outer corners must remain");
+    }
+
+    #[test]
+    fn difference_cuts_a_through_hole_with_an_overshooting_tool() {
+        let spec = difference(ten(), vec![cuboid([3.0, 3.0, -1.0], [4.0, 4.0, 12.0])]);
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_aabb(&scene, [0.0; 3], [10.0; 3]);
+        // The hole's four walls are inside the outline: some vertex sits at x = 3.
+        assert!(scene.positions.iter().any(|p| (p[0] - 3.0).abs() < 1e-4 && p[1] > 3.0 && p[1] < 7.0));
+    }
+
+    #[test]
+    fn difference_with_several_tools_and_a_miss() {
+        let spec = difference(
+            ten(),
+            vec![
+                cuboid([2.0, 2.0, 5.0], [2.0, 2.0, 6.0]),  // pocket from the top
+                cuboid([6.0, 6.0, -1.0], [2.0, 2.0, 12.0]), // through-hole
+                cuboid([50.0, 50.0, 50.0], [1.0; 3]),      // misses entirely: ignored
+            ],
+        );
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_aabb(&scene, [0.0; 3], [10.0; 3]);
+    }
+
+    #[test]
+    fn intersect_keeps_the_overlap() {
+        let scene = TruckKernel
+            .build(&intersect(vec![ten(), cuboid([5.0, 5.5, 6.0], [10.0; 3])]))
+            .unwrap();
+        assert_aabb(&scene, [5.0, 5.5, 6.0], [10.0; 3]);
+        let err = TruckKernel
+            .build(&intersect(vec![ten(), cuboid([20.0, 0.0, 0.0], [1.0; 3])]))
+            .unwrap_err();
+        assert!(err.to_string().contains("don't overlap"), "{err}");
+    }
+
+    #[test]
+    fn booleans_keep_the_first_operands_style() {
+        let spec = paint(
+            RED,
+            part(
+                "plate",
+                difference(ten(), vec![paint(BLUE, cuboid([3.0, 3.0, -1.0], [4.0, 4.0, 12.0]))]),
+            ),
+        );
+        let scene = TruckKernel.build(&spec).unwrap();
+        assert_eq!(color_counts(&scene), vec![(RED, scene.positions.len())]);
+        assert_eq!(part_names(&scene), ["plate"]);
+    }
+
+    /// truck-shapeops can't handle faces that line up exactly. These pin that
+    /// down: each must fail with a hint, never panic. If a truck upgrade makes
+    /// one succeed, this test tells us the limitation is gone.
+    #[test]
+    fn coplanar_booleans_fail_with_a_hint_instead_of_panicking() {
+        let floor = || cuboid([0.0; 3], [20.0, 20.0, 2.0]);
+        let unions = [
+            ("shared bottom plane", union(vec![floor(), cuboid([0.0; 3], [3.0, 20.0, 15.0])])),
+            ("touching faces", union(vec![floor(), cuboid([0.0, 0.0, 2.0], [3.0, 20.0, 15.0])])),
+        ];
+        for (case, spec) in unions {
+            let err = TruckKernel.build(&spec).map(|_| ()).unwrap_err().to_string();
+            assert!(err.contains("union failed") && err.contains("overlap"), "{case}: {err}");
+        }
+        let flush_hole = difference(ten(), vec![cuboid([3.0, 3.0, 0.0], [4.0, 4.0, 10.0])]);
+        let err = TruckKernel.build(&flush_hole).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("difference failed") && err.contains("overshoot"), "{err}");
+    }
+
+    #[test]
+    fn booleans_reject_profiles_and_empty_input() {
+        let err = TruckKernel
+            .build(&union(vec![ten(), rect(1.0, 1.0)]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not 2D profiles"), "{err}");
+        assert!(TruckKernel.build(&union(vec![])).is_err());
+        assert!(TruckKernel.build(&difference(ten(), vec![])).is_err());
+        assert!(TruckKernel.build(&extrude(union(vec![ten()]), 1.0)).is_err());
     }
 
     #[test]
