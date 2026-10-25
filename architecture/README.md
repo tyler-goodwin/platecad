@@ -198,16 +198,22 @@ local use, but distributing the binary carries relinking obligations.
 
 ## App, CLI and hot reload
 
+The binary is `caddy` (package `cad-app`, so `cargo run -p cad-app -- …`).
+
 ```
-cad-app [PATH] [--kernel occ|truck]                         # open the viewer (default occ; CAD_KERNEL env works too)
-cad-app MODEL --export out.3mf [--view auto|print|assembled]  # write a 3MF and exit, no window
+caddy [open] [PATH] [--kernel occ|truck]                       # open the viewer (default occ; CAD_KERNEL env works too)
+caddy export MODEL [-o FILE.3mf] [--view auto|print|assembled]  # write a 3MF and exit, no window
+caddy init [DIR]                                                # set up a new project (default: the cwd)
 ```
 
-PATH is a model file or a folder. A model opens with its project root in
+`open` is the default subcommand, so `caddy models/x.ts` works. PATH is a
+model file or a folder. A model opens with its project root in
 the file list; a folder opens with no model picked. Without PATH, the cwd
 is opened if it's a project root, and otherwise the viewer starts empty.
 `--view auto` exports the print layout when the model has one, and the
-assembled view otherwise.
+assembled view otherwise. Without `-o`, export writes
+`<project root>/outputs/<model>_<view>.3mf`, the same place as the viewer's
+Export button.
 
 - The path is resolved against the cwd and must exist, or the app exits
   with code 2 before opening a window.
@@ -255,6 +261,25 @@ during a debounce waits its turn instead of being lost.
   After a failed rebuild that's still what the viewer shows. The result
   (or why there's nothing to export) comes back as a `ViewerMessage::Notice`.
 - The session stops when the viewer drops either channel end.
+
+### New projects
+
+`caddy init DIR` writes a project that opens, builds and exports as is:
+
+| File | Contents |
+|---|---|
+| `dsl/cad.ts` | The DSL built into the binary (`include_str!` of the repo's `dsl/cad.ts`). It also marks the project root. |
+| `printer.toml` | A Bambu Lab P2S bed, 256 × 256 × 256 mm. |
+| `models/cube.ts` | A 20 mm cube. |
+| `tsconfig.json` | Lets editors resolve the `.ts` import extensions and type-check models against the DSL (strict). The app doesn't read it. |
+| `.gitignore` | `/outputs`. |
+
+It creates DIR if needed, and refuses (writing nothing) if any of those
+files exists; other files are fine. A project keeps the DSL it was created
+with, so upgrading `caddy` doesn't change an existing project's DSL.
+Building the DSL into the binary means `cargo install --path crates/cad-app`
+works, but the crate can't be published to crates.io as is (the file lives
+outside the crate).
 
 ## Viewer
 

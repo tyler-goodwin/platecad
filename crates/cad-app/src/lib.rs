@@ -13,7 +13,7 @@ use cad_kernel_occ::OccKernel;
 use cad_kernel_truck::TruckKernel;
 use cad_script::{RustyScriptHost, ScriptHost};
 use cad_view::{FileEntry, FolderListing, SceneUpdate, SceneViews, ViewMode, ViewerCommand, ViewerMessage};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -186,10 +186,38 @@ pub fn oversize_warning(scene: &TessellatedScene, bed: Bed) -> Option<String> {
     ))
 }
 
-/// Edit a TypeScript CAD model and see it hot-reload in a 3D viewport.
+/// Code-first CAD: write models in TypeScript, see them hot-reload in a 3D
+/// viewport, and export 3MF for slicers.
+///
+/// `caddy [PATH]` is short for `caddy open [PATH]`.
 #[derive(Debug, Parser)]
-#[command(version)]
-pub struct Args {
+#[command(name = "caddy", version, args_conflicts_with_subcommands = true)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+    #[command(flatten)]
+    pub open: OpenArgs,
+}
+
+impl Cli {
+    /// The subcommand to run; no subcommand means `open`.
+    pub fn into_command(self) -> Command {
+        self.command.unwrap_or(Command::Open(self.open))
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Open the viewer on a model or folder.
+    Open(OpenArgs),
+    /// Write a model's 3MF for slicers, without opening the viewer.
+    Export(ExportArgs),
+    /// Start a project: printer config, the DSL and a starter model.
+    Init(InitArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct OpenArgs {
     /// Model script or folder to open. A model opens with its project root
     /// (the nearest folder up containing `dsl/cad.ts`) in the file list.
     /// Without one, the current folder is opened if it's a project root.
@@ -198,14 +226,31 @@ pub struct Args {
     /// Geometry kernel.
     #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
+}
 
-    /// Write a 3MF file for slicers instead of opening the viewer.
-    #[arg(long, value_name = "FILE.3mf", requires = "path")]
-    pub export: Option<PathBuf>,
+#[derive(Debug, clap::Args)]
+pub struct ExportArgs {
+    /// Model script to export.
+    pub model: PathBuf,
+
+    /// 3MF file to write [default: <project root>/outputs/<model>_<view>.3mf].
+    #[arg(short, long, value_name = "FILE.3mf")]
+    pub output: Option<PathBuf>,
 
     /// Which view to export.
-    #[arg(long, value_enum, default_value_t = ExportView::Auto, requires = "export")]
+    #[arg(long, value_enum, default_value_t = ExportView::Auto)]
     pub view: ExportView,
+
+    /// Geometry kernel.
+    #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
+    pub kernel: KernelChoice,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Folder to set up (created if missing).
+    #[arg(default_value = ".")]
+    pub dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -405,13 +450,14 @@ impl Pipeline {
     }
 }
 
-/// Evaluates `model` and writes the chosen view to `out` as 3MF. Returns a
-/// one-line summary. Nothing is left at `out` on failure.
+/// Evaluates `model` and writes the chosen view to `out` as 3MF, or by
+/// default to [`export_path`] under the model's project root. Returns a
+/// one-line summary. Nothing is left at the output on failure.
 pub fn export_3mf(
     pipeline: &mut Pipeline,
     model: &Path,
     view: ExportView,
-    out: &Path,
+    out: Option<&Path>,
 ) -> Result<String, String> {
     let update = pipeline.evaluate(model);
     let warnings: String = update
@@ -424,9 +470,9 @@ pub fn export_3mf(
         let messages: Vec<&str> = update.diagnostics.iter().map(|d| d.message.as_str()).collect();
         return Err(messages.join("\n"));
     };
-    let (label, scene) = match (view, views.print) {
-        (ExportView::Assembled, _) | (ExportView::Auto, None) => ("assembled", views.assembled),
-        (ExportView::Print | ExportView::Auto, Some(print)) => ("print", print),
+    let (mode, scene) = match (view, views.print) {
+        (ExportView::Assembled, _) | (ExportView::Auto, None) => (ViewMode::Assembled, views.assembled),
+        (ExportView::Print | ExportView::Auto, Some(print)) => (ViewMode::Print, print),
         (ExportView::Print, None) => {
             return Err(format!(
                 "{} has no print view (export {{ assembled, print }} from it, or use --view assembled)",
@@ -435,10 +481,15 @@ pub fn export_3mf(
         }
     };
 
-    let objects = write_scene_3mf(&scene, out)?;
+    let out = match out {
+        Some(out) => out.to_path_buf(),
+        None => export_path(&project_root(model), model, mode),
+    };
+    let objects = write_scene_3mf(&scene, &out)?;
     Ok(format!(
-        "wrote {} ({label} view, {objects} objects){warnings}",
-        out.display()
+        "wrote {} ({} view, {objects} objects){warnings}",
+        out.display(),
+        mode.label()
     ))
 }
 
@@ -541,6 +592,85 @@ pub fn list_models(folder: &Path) -> Vec<FileEntry> {
     files.sort_by_key(key);
     dirs.extend(files);
     dirs
+}
+
+/// The DSL a new project gets, as built into this binary.
+pub const DSL_SOURCE: &str = include_str!("../../../dsl/cad.ts");
+
+/// `printer.toml` for a new project.
+pub const STARTER_PRINTER: &str = r#"# Printer limits for print views (millimeters).
+#
+# arrange() in a model's print view packs parts onto plates of this size,
+# and the viewer warns about parts that don't fit. Edits hot-reload.
+# A model can override this with arrange(parts, { bed: { ... } }).
+
+# Build volume of a Bambu Lab P2S. Others: Bambu X1/P1/A1 are also
+# 256 x 256 x 256; Prusa MK4 is 250 x 210 x 220.
+[bed]
+width = 256
+depth = 256
+height = 256
+"#;
+
+/// The model a new project starts with.
+pub const STARTER_MODEL: &str = r#"import { cube } from "../dsl/cad.ts";
+
+/** A 20 mm cube. Edit and save: the viewer reloads. Sizes are millimeters. */
+export default () => cube(20);
+"#;
+
+/// Lets editors resolve `../dsl/cad.ts` imports and check models against
+/// the DSL's types. The viewer doesn't read it.
+pub const STARTER_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["**/*.ts"]
+}
+"#;
+
+/// What `init` writes, relative to the project folder.
+pub const STARTER_FILES: [(&str, &str); 5] = [
+    (PROJECT_MARKER, DSL_SOURCE),
+    (PRINTER_CONFIG, STARTER_PRINTER),
+    ("models/cube.ts", STARTER_MODEL),
+    ("tsconfig.json", STARTER_TSCONFIG),
+    (".gitignore", "/outputs\n"),
+];
+
+/// Sets up a project in `dir` (created if missing) with [`STARTER_FILES`].
+/// Refuses, writing nothing, if any of them already exists. Returns the
+/// files written.
+pub fn init_project(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let existing: Vec<String> = STARTER_FILES
+        .iter()
+        .filter(|(path, _)| dir.join(path).exists())
+        .map(|(path, _)| path.to_string())
+        .collect();
+    if !existing.is_empty() {
+        return Err(format!(
+            "{} already has {}; not overwriting anything",
+            dir.display(),
+            existing.join(", ")
+        ));
+    }
+    let mut written = Vec::new();
+    for (path, contents) in STARTER_FILES {
+        // Join per component so Windows paths don't mix separators.
+        let path = path.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&path, contents).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        written.push(path);
+    }
+    Ok(written)
 }
 
 /// Folder under the project root that viewer exports go to.
@@ -1117,13 +1247,27 @@ export default () => fillet(cube(2), 5);
 
     // --- CLI -----------------------------------------------------------------
 
-    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
-        Args::try_parse_from(std::iter::once("cad-app").chain(args.iter().copied()))
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(std::iter::once("caddy").chain(args.iter().copied())).map(Cli::into_command)
+    }
+
+    fn parse_open(args: &[&str]) -> OpenArgs {
+        match parse(args).unwrap() {
+            Command::Open(open) => open,
+            other => panic!("expected open, got {other:?}"),
+        }
+    }
+
+    fn parse_export(args: &[&str]) -> ExportArgs {
+        match parse(args).unwrap() {
+            Command::Export(export) => export,
+            other => panic!("expected export, got {other:?}"),
+        }
     }
 
     #[test]
     fn cli_path_is_optional_and_kernel_defaults_to_occ() {
-        let args = parse(&[]).unwrap();
+        let args = parse_open(&[]);
         assert_eq!(args.path, None);
         // A CAD_KERNEL in the developer's shell legitimately changes the default.
         if std::env::var_os("CAD_KERNEL").is_none() {
@@ -1168,10 +1312,15 @@ export default () => fillet(cube(2), 5);
     }
 
     #[test]
-    fn cli_takes_model_and_kernel() {
-        let args = parse(&["models/bookshelf.ts", "--kernel", "occ"]).unwrap();
-        assert_eq!(args.path, Some(PathBuf::from("models/bookshelf.ts")));
-        assert_eq!(args.kernel, KernelChoice::Occ);
+    fn cli_open_is_the_default_subcommand() {
+        for args in [
+            &["models/bookshelf.ts", "--kernel", "occ"][..],
+            &["open", "models/bookshelf.ts", "--kernel", "occ"][..],
+        ] {
+            let open = parse_open(args);
+            assert_eq!(open.path, Some(PathBuf::from("models/bookshelf.ts")));
+            assert_eq!(open.kernel, KernelChoice::Occ);
+        }
     }
 
     #[test]
@@ -1180,36 +1329,97 @@ export default () => fillet(cube(2), 5);
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
         assert!(err.to_string().contains("truck"), "should list valid kernels: {err}");
 
+        // clap reads a second path as a misplaced subcommand.
         let err = parse(&["a.ts", "b.ts"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
-    fn cli_help_documents_model_kernel_and_env() {
-        let err = parse(&["--help"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
-        let help = err.to_string();
-        for needle in ["[PATH]", "--kernel", "CAD_KERNEL", "truck", "occ"] {
-            assert!(help.contains(needle), "help is missing {needle}:\n{help}");
+    fn cli_help_documents_subcommands_kernel_and_env() {
+        let help = |args: &[&str]| {
+            let err = parse(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+            err.to_string()
+        };
+        let top = help(&["--help"]);
+        for needle in ["caddy", "open", "export", "init", "[PATH]", "--kernel", "CAD_KERNEL", "truck", "occ"] {
+            assert!(top.contains(needle), "help is missing {needle}:\n{top}");
+        }
+        let export = help(&["export", "--help"]);
+        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "CAD_KERNEL"] {
+            assert!(export.contains(needle), "export help is missing {needle}:\n{export}");
         }
     }
 
     #[test]
     fn cli_export_flags() {
-        let args = parse(&["models/bookshelf.ts", "--export", "out.3mf"]).unwrap();
-        assert_eq!(args.export, Some(PathBuf::from("out.3mf")));
+        let args = parse_export(&["export", "models/bookshelf.ts"]);
+        assert_eq!(args.model, PathBuf::from("models/bookshelf.ts"));
+        assert_eq!(args.output, None);
         assert_eq!(args.view, ExportView::Auto);
 
-        let args = parse(&["m.ts", "--export", "out.3mf", "--view", "assembled"]).unwrap();
+        let args = parse_export(&["export", "m.ts", "-o", "out.3mf", "--view", "assembled"]);
+        assert_eq!(args.output, Some(PathBuf::from("out.3mf")));
         assert_eq!(args.view, ExportView::Assembled);
 
-        // Export needs a model.
-        let err = parse(&["--export", "out.3mf"]).unwrap_err();
+        // Export needs a model, and --view belongs to export.
+        let err = parse(&["export"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(parse(&["m.ts", "--view", "print"]).is_err());
+    }
 
-        // --view only means something for export.
-        let err = parse(&["--view", "print"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    #[test]
+    fn cli_init_defaults_to_the_current_folder() {
+        let Command::Init(args) = parse(&["init"]).unwrap() else { panic!("init") };
+        assert_eq!(args.dir, PathBuf::from("."));
+        let Command::Init(args) = parse(&["init", "shelves"]).unwrap() else { panic!("init") };
+        assert_eq!(args.dir, PathBuf::from("shelves"));
+    }
+
+    // --- init ---------------------------------------------------------------
+
+    #[test]
+    fn init_writes_a_project_that_opens_builds_and_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("new/shelves");
+        let written = init_project(&project).unwrap();
+        assert_eq!(
+            written,
+            ["dsl/cad.ts", "printer.toml", "models/cube.ts", "tsconfig.json", ".gitignore"].map(|p| project.join(p))
+        );
+
+        // A project root, with the binary's DSL and a P2S bed.
+        let model = project.join("models/cube.ts");
+        assert_eq!(project_root(&model), project);
+        assert_eq!(std::fs::read_to_string(project.join("dsl/cad.ts")).unwrap(), DSL_SOURCE);
+        let bed = load_printer_config(&project).unwrap().unwrap().bed;
+        assert_eq!((bed.width, bed.depth, bed.height), (256.0, 256.0, 256.0));
+        assert!(STARTER_PRINTER.contains("P2S"));
+
+        // The starter cube builds, and exports to outputs/ by default.
+        let mut pipeline = Pipeline::new(&project, KernelChoice::Truck).unwrap();
+        let update = pipeline.evaluate(&model);
+        assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
+        assert_eq!(max_extent(&update), 20.0);
+        let summary = export_3mf(&mut pipeline, &model, ExportView::Auto, None).unwrap();
+        assert!(project.join("outputs/cube_assembled.3mf").is_file(), "{summary}");
+        assert_eq!(std::fs::read_to_string(project.join(".gitignore")).unwrap(), "/outputs\n");
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("printer.toml"), "mine").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "unrelated").unwrap();
+
+        let err = init_project(dir.path()).unwrap_err();
+        assert!(err.contains("already has printer.toml"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("printer.toml")).unwrap(), "mine");
+        assert!(!dir.path().join("dsl").exists() && !dir.path().join("models").exists());
+
+        // Unrelated files are fine.
+        std::fs::remove_file(dir.path().join("printer.toml")).unwrap();
+        init_project(dir.path()).unwrap();
     }
 
     /// Object names in an exported 3MF, in order.
@@ -1239,7 +1449,7 @@ export default () => fillet(cube(2), 5);
         let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
         let model = repo_root().join("models/bookshelf.ts");
 
-        let summary = export_3mf(&mut pipeline, &model, ExportView::Auto, &out).unwrap();
+        let summary = export_3mf(&mut pipeline, &model, ExportView::Auto, Some(&out)).unwrap();
         assert!(summary.contains("print view"), "{summary}");
 
         let names = exported_objects(&out);
@@ -1257,13 +1467,13 @@ export default () => fillet(cube(2), 5);
 
         // A bare-shape model exports its assembled view under auto...
         let out = out_dir.path().join("cube.3mf");
-        let summary = export_3mf(&mut pipeline, &cube, ExportView::Auto, &out).unwrap();
+        let summary = export_3mf(&mut pipeline, &cube, ExportView::Auto, Some(&out)).unwrap();
         assert!(summary.contains("assembled view, 1 objects"), "{summary}");
         assert_eq!(exported_objects(&out), [cad_export::UNNAMED]);
 
         // ...but asking for print is an error, and nothing is written.
         let missing = out_dir.path().join("cube-print.3mf");
-        let err = export_3mf(&mut pipeline, &cube, ExportView::Print, &missing).unwrap_err();
+        let err = export_3mf(&mut pipeline, &cube, ExportView::Print, Some(&missing)).unwrap_err();
         assert!(err.contains("no print view"), "{err}");
         assert!(!missing.exists());
     }
@@ -1272,7 +1482,7 @@ export default () => fillet(cube(2), 5);
     fn export_reports_model_errors_without_writing() {
         let project = Project::new(&cube_source(0));
         let out = project.root().join("broken.3mf");
-        let err = export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, &out)
+        let err = export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, Some(&out))
             .unwrap_err();
         assert!(err.contains("must be positive"), "{err}");
         assert!(!out.exists());
@@ -1704,7 +1914,7 @@ export default () => fillet(cube(2), 5);
         project.write("printer.toml", &bed_toml(256, 256, 256));
         let out = project.root().join("out.3mf");
         let summary =
-            export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, &out).unwrap();
+            export_3mf(&mut project.pipeline(), &project.model(), ExportView::Auto, Some(&out)).unwrap();
         assert!(summary.contains("\nwarning: 1 part doesn't fit"), "{summary}");
         assert!(out.exists());
     }
