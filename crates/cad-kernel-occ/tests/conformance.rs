@@ -132,6 +132,12 @@ fn cases() -> Vec<(&'static str, ModelSpec)> {
         ("tube", part("t", revolve(ring(), 360.0))),
         ("quarter tube", part("q", revolve(ring(), 90.0))),
         ("torus", part("o", revolve(translate([20.0, 0.0, 0.0], circle(5.0)), 360.0))),
+        ("sphere", part("sp", translate([1.0, 2.0, 3.0], ModelSpec::Sphere { radius: 5.0 }))),
+        ("cylinder primitive", part("cy", ModelSpec::Cylinder { radius: 4.0, height: 7.0 })),
+        ("cone", part("co", ModelSpec::Cone { radius: 5.0, top: 0.0, height: 8.0 })),
+        ("frustum", part("fr", ModelSpec::Cone { radius: 5.0, top: 2.0, height: 8.0 })),
+        ("upside-down cone", part("uc", ModelSpec::Cone { radius: 0.0, top: 3.0, height: 4.0 })),
+        ("torus primitive", part("to", ModelSpec::Torus { radius: 20.0, tube: 5.0 })),
         ("crossing union", part("u", ModelSpec::Union { children: vec![ten(), other()] })),
         (
             "through hole",
@@ -192,6 +198,34 @@ fn occ_matches_truck() {
                 (t_vol - o_vol).abs() < t_vol.abs() * 0.005,
                 "{name}/{part}: volume truck {t_vol} vs occ {o_vol}"
             );
+        }
+    }
+}
+
+#[test]
+fn primitives_have_their_exact_volumes_and_sizes() {
+    use std::f64::consts::PI;
+    let cases = [
+        (ModelSpec::Sphere { radius: 5.0 }, 4.0 / 3.0 * PI * 125.0, [-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]),
+        (ModelSpec::Cylinder { radius: 4.0, height: 7.0 }, PI * 16.0 * 7.0, [-4.0, -4.0, 0.0], [4.0, 4.0, 7.0]),
+        (
+            ModelSpec::Cone { radius: 5.0, top: 2.0, height: 8.0 },
+            PI * 8.0 / 3.0 * (25.0 + 10.0 + 4.0),
+            [-5.0, -5.0, 0.0],
+            [5.0, 5.0, 8.0],
+        ),
+        (ModelSpec::Torus { radius: 20.0, tube: 5.0 }, 2.0 * PI * PI * 20.0 * 25.0, [-25.0, -25.0, -5.0], [25.0, 25.0, 5.0]),
+    ];
+    let kernels: [(&str, Box<dyn Kernel>); 2] = [("truck", Box::new(TruckKernel)), ("occ", Box::new(OccKernel::default()))];
+    for (kernel, mut k) in kernels {
+        for (spec, volume, min, max) in &cases {
+            let s = summarize(&k.build(&part("p", spec.clone())).unwrap_or_else(|e| panic!("{kernel} {spec:?}: {e}")));
+            let got = s.parts[0].2;
+            assert!((got - volume).abs() < volume * 0.01, "{kernel} {spec:?}: volume {got} vs {volume}");
+            for i in 0..3 {
+                assert!((s.min[i] as f64 - min[i]).abs() < 0.05, "{kernel} {spec:?}: min {:?}", s.min);
+                assert!((s.max[i] as f64 - max[i]).abs() < 0.05, "{kernel} {spec:?}: max {:?}", s.max);
+            }
         }
     }
 }

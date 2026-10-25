@@ -64,7 +64,13 @@ pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
             .collect()
     };
     match spec {
-        ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } | ModelSpec::Circle { .. } => spec,
+        ModelSpec::Rect { .. }
+        | ModelSpec::Polygon { .. }
+        | ModelSpec::Circle { .. }
+        | ModelSpec::Sphere { .. }
+        | ModelSpec::Cylinder { .. }
+        | ModelSpec::Cone { .. }
+        | ModelSpec::Torus { .. } => spec,
         ModelSpec::Cutout { outer, holes } => ModelSpec::Cutout {
             outer: boxed(outer),
             holes: all(holes),
@@ -1788,9 +1794,12 @@ export default () => fillet(cube(2), 5);
             if path.extension().is_some_and(|e| e == "ts") {
                 let update = pipeline.evaluate(&path);
                 if !update.diagnostics[0].ok {
-                    // Models using fillets/chamfers are OCC-only; truck must say so.
+                    // Models using fillets/chamfers are OCC-only, and so are
+                    // ones whose curved booleans are too much for truck (cat.ts).
+                    // Either way truck must give its hinted error, not a crash.
+                    let message = &update.diagnostics[0].message;
                     assert!(
-                        update.diagnostics[0].message.contains("need the OCC kernel"),
+                        message.contains("need the OCC kernel") || message.contains("truck can't combine solids"),
                         "{}: {:?}",
                         path.display(),
                         update.diagnostics

@@ -608,6 +608,53 @@ mod tests {
     }
 
     #[test]
+    fn dsl_primitives() {
+        let cases = [
+            ("sphere(5)", ModelSpec::Sphere { radius: 5.0 }),
+            ("cylinder({ radius: 2, height: 7 })", ModelSpec::Cylinder { radius: 2.0, height: 7.0 }),
+            (
+                "cone({ radius: 3, height: 4 })",
+                ModelSpec::Cone {
+                    radius: 3.0,
+                    top: 0.0,
+                    height: 4.0,
+                },
+            ),
+            ("torus({ radius: 10, tube: 2 })", ModelSpec::Torus { radius: 10.0, tube: 2.0 }),
+        ];
+        let source = |expr: &str| {
+            format!(
+                r#"import {{ sphere, cylinder, cone, torus }} from "./dsl/cad.ts";
+                export default () => {expr};"#
+            )
+        };
+        for (expr, spec) in cases {
+            assert_eq!(eval(&source(expr)).unwrap(), spec, "{expr}");
+        }
+
+        let placed = eval(&source("sphere(1, { at: [1, 2, 3] })")).unwrap();
+        assert_eq!(
+            placed,
+            ModelSpec::Translate {
+                offset: [1.0, 2.0, 3.0],
+                shape: Box::new(ModelSpec::Sphere { radius: 1.0 }),
+            }
+        );
+
+        for (bad, why) in [
+            ("sphere(0)", "sphere radius must be positive"),
+            ("sphere(1, { at: [1, 2] })", "sphere at must be"),
+            ("cylinder({ radius: 1, height: -2 })", "cylinder height must be positive"),
+            ("cone({ radius: -1, height: 2 })", "cone radius and top must be 0 or more"),
+            ("cone({ radius: 0, height: 2 })", "cone needs a radius or top"),
+            ("torus({ radius: 2, tube: 2 })", "torus radius must be larger than its tube"),
+        ] {
+            let err = eval(&source(bad)).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_fillet_and_chamfer() {
         use cad_ir::EdgeSelector;
         let spec = eval(

@@ -40,6 +40,11 @@ export type RevolveSpec = {
   degrees: number;
 };
 
+export type SphereSpec = { kind: "Sphere"; radius: number };
+export type CylinderSpec = { kind: "Cylinder"; radius: number; height: number };
+export type ConeSpec = { kind: "Cone"; radius: number; top: number; height: number };
+export type TorusSpec = { kind: "Torus"; radius: number; tube: number };
+
 export type TranslateSpec = {
   kind: "Translate";
   offset: Vec3;
@@ -112,6 +117,10 @@ export type ModelSpec =
   | CutoutSpec
   | ExtrudeSpec
   | RevolveSpec
+  | SphereSpec
+  | CylinderSpec
+  | ConeSpec
+  | TorusSpec
   | TranslateSpec
   | RotateSpec
   | GroupSpec
@@ -208,6 +217,62 @@ export function revolve(profile: ProfileSpec, opts: { degrees?: number } = {}): 
     throw new Error(`revolve degrees must be in (0, 360] (got ${degrees})`);
   }
   return { kind: "Revolve", profile, degrees };
+}
+
+function placed<T extends ModelSpec>(name: string, spec: T, at: Vec3 | undefined): T | TranslateSpec {
+  if (at === undefined) {
+    return spec;
+  }
+  if (!Array.isArray(at) || at.length !== 3 || !at.every(Number.isFinite)) {
+    throw new Error(`${name} at must be a finite [x, y, z] (got ${JSON.stringify(at)})`);
+  }
+  return translate(spec, at);
+}
+
+/**
+ * Solid sphere centered on `at` (default the origin). A true sphere, unlike
+ * a revolved polygon, is one smooth face, so booleans with it stay cheap.
+ */
+export function sphere(radius: number, opts: { at?: Vec3 } = {}): SphereSpec | TranslateSpec {
+  positive("sphere radius", radius);
+  return placed("sphere", { kind: "Sphere", radius }, opts.at);
+}
+
+/** Solid cylinder standing on the XY plane: base centered on `at` (default the origin), `height` up +Z. */
+export function cylinder(opts: { radius: number; height: number; at?: Vec3 }): CylinderSpec | TranslateSpec {
+  positive("cylinder radius", opts.radius);
+  positive("cylinder height", opts.height);
+  return placed("cylinder", { kind: "Cylinder", radius: opts.radius, height: opts.height }, opts.at);
+}
+
+/**
+ * Solid cone standing on the XY plane: a base of `radius` centered on `at`
+ * (default the origin), narrowing to `top` (default 0, a point) at `height`.
+ * A `top` above 0 makes a frustum; `radius: 0` with a `top` stands it on its tip.
+ */
+export function cone(opts: { radius: number; top?: number; height: number; at?: Vec3 }): ConeSpec | TranslateSpec {
+  const top = opts.top ?? 0;
+  positive("cone height", opts.height);
+  if (!(opts.radius >= 0 && top >= 0) || !Number.isFinite(opts.radius) || !Number.isFinite(top)) {
+    throw new Error(`cone radius and top must be 0 or more (got ${opts.radius}, ${top})`);
+  }
+  if (opts.radius === 0 && top === 0) {
+    throw new Error("cone needs a radius or top above 0");
+  }
+  return placed("cone", { kind: "Cone", radius: opts.radius, top, height: opts.height }, opts.at);
+}
+
+/**
+ * Solid torus (a ring) lying flat around +Z, centered on `at` (default the
+ * origin). The tube's center runs on a circle of `radius`; `tube` is the
+ * tube's own radius, and must be smaller than `radius`.
+ */
+export function torus(opts: { radius: number; tube: number; at?: Vec3 }): TorusSpec | TranslateSpec {
+  positive("torus tube", opts.tube);
+  if (!(opts.radius > opts.tube) || !Number.isFinite(opts.radius)) {
+    throw new Error(`torus radius must be larger than its tube (got ${opts.radius} and ${opts.tube})`);
+  }
+  return placed("torus", { kind: "Torus", radius: opts.radius, tube: opts.tube }, opts.at);
 }
 
 /** Moves a shape by `offset`. */

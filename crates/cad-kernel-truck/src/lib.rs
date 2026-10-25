@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
-use cad_kernel::{Kernel, KernelError, pack, validate_polygon};
+use cad_kernel::{Kernel, KernelError, pack, validate_polygon, validate_primitive};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
 use truck_modeling::{
     BSplineCurve, BoundedCurve, Curve, Edge, Face, InnerSpace, KnotVec, Line, ParametricCurve, Point3,
@@ -173,6 +173,23 @@ fn build_bodies(
             let upright = facing(upright, Vector3::new(0.0, 1.0, 0.0))?;
             let solid: Solid = builder::rsweep(&upright, origin, Vector3::new(0.0, 0.0, 1.0), Rad(degrees.to_radians()));
             Ok(bodies_of(solid, &profile_style(profile, style.clone())))
+        }
+        ModelSpec::Sphere { radius } => {
+            validate_primitive(spec)?;
+            // A half circle from pole to pole, spun about Z (`cone` drops the
+            // degenerate edges at the poles).
+            let top = builder::vertex(Point3::new(0.0, 0.0, *radius));
+            let bottom = builder::vertex(Point3::new(0.0, 0.0, -*radius));
+            let arc = builder::circle_arc(&top, &bottom, Point3::new(*radius, 0.0, 0.0));
+            let shell = builder::cone(&Wire::from(vec![arc]), Vector3::new(0.0, 0.0, 1.0), Rad(std::f64::consts::TAU));
+            Ok(vec![Body {
+                shell,
+                style: style.clone(),
+            }])
+        }
+        ModelSpec::Cylinder { .. } | ModelSpec::Cone { .. } | ModelSpec::Torus { .. } => {
+            validate_primitive(spec)?;
+            build_bodies(&as_sweep(spec), style, plates)
         }
         ModelSpec::Translate { offset, shape } => Ok(build_bodies(shape, style, plates)?
             .into_iter()
@@ -409,6 +426,39 @@ fn bodies_bounds(bodies: &[Body]) -> Option<(Point3, Point3)> {
     bounds_of(bodies.iter().flat_map(|body| shell_points(&body.shell)))
 }
 
+/// The same solid as an extrusion or revolve, which truck builds exactly:
+/// a cylinder is an extruded circle, a cone a revolved triangle or
+/// trapezoid, a torus a revolved circle. Only for `Cylinder`, `Cone`, `Torus`.
+fn as_sweep(spec: &ModelSpec) -> ModelSpec {
+    let revolve = |profile: ModelSpec| ModelSpec::Revolve {
+        profile: Box::new(profile),
+        degrees: 360.0,
+    };
+    match *spec {
+        ModelSpec::Cylinder { radius, height } => ModelSpec::Extrude {
+            profile: Box::new(ModelSpec::Circle { radius }),
+            distance: height,
+            direction: None,
+        },
+        ModelSpec::Cone { radius, top, height } => {
+            let mut points = vec![[0.0, 0.0]];
+            if radius > 0.0 {
+                points.push([radius, 0.0]);
+            }
+            if top > 0.0 {
+                points.push([top, height]);
+            }
+            points.push([0.0, height]);
+            revolve(ModelSpec::Polygon { points })
+        }
+        ModelSpec::Torus { radius, tube } => revolve(ModelSpec::Translate {
+            offset: [radius, 0.0, 0.0],
+            shape: Box::new(ModelSpec::Circle { radius: tube }),
+        }),
+        _ => unreachable!("as_sweep takes a cylinder, cone or torus"),
+    }
+}
+
 /// Style set inside a profile (innermost wins), which its extrusion inherits
 /// over `inherited`.
 fn profile_style(spec: &ModelSpec, inherited: Style) -> Style {
@@ -552,6 +602,10 @@ fn build_face(spec: &ModelSpec) -> Result<Face, KernelError> {
         }
         ModelSpec::Extrude { .. }
         | ModelSpec::Revolve { .. }
+        | ModelSpec::Sphere { .. }
+        | ModelSpec::Cylinder { .. }
+        | ModelSpec::Cone { .. }
+        | ModelSpec::Torus { .. }
         | ModelSpec::Group { .. }
         | ModelSpec::Arrange { .. }
         | ModelSpec::Union { .. }

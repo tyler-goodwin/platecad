@@ -74,6 +74,7 @@ kernel and renderer can each be swapped without touching the others.
 | `Polygon { points }` | Planar simple polygon in XY from its outline. Either winding is normalized to counter-clockwise, and the closing point is implied. Fewer than 3 points, repeated points, self-intersection and zero area are rejected. Non-convex shapes (L, U) tessellate and export correctly. |
 | `Extrude { profile, distance, direction? }` | Sweeps a 2D profile `distance` mm along `direction` (normalized, default +Z) into a solid. The face is flipped to point along the sweep (every profile is wound counter-clockwise about +Z), so solids are never inside-out. A direction lying in the profile's plane is an error. |
 | `Revolve { profile, degrees }` | Lathe: the profile is drawn in XY with X as the radius and Y as the height, stood up into XZ, and spun around +Z (default 360°). It must stay at x >= 0; touching the axis is fine (a solid knob). |
+| `Sphere { radius }`, `Cylinder { radius, height }`, `Cone { radius, top, height }`, `Torus { radius, tube }` | Primitive solids. A sphere and torus are centered on the origin (the torus lies flat around +Z); a cylinder and cone stand on the XY plane with their base centered on it. A cone narrows from `radius` to `top` (either may be 0, not both); a torus needs `tube < radius`. Sizes are checked by `validate_primitive` in `cad-kernel`. OCC builds them as analytic surfaces (one smooth face each), which keeps booleans cheap: a revolved polygon has a face per segment. truck builds a sphere by spinning a half circle, and the rest as the equivalent extrude or revolve (`as_sweep`). The DSL's `at` option wraps them in a `Translate`. |
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
@@ -477,6 +478,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 | `models/rounded_box.ts` | An open-top box with rounded vertical corners and even walls and floor (`roundedBox()` defaults: 60 × 40 × 30 mm, 3 mm walls; the file's default export may override them): a `|Z`-filleted block minus a cavity filleted with the outer radius minus the wall, which overshoots the top. OCC-only. |
 | `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). Fillets round the plate's and holder's vertical corners, and a 0.8 mm chamfer on the cup's bottom edge stops the first layer flaring, so it's OCC-only. It prints as three closed parts on one 256 mm plate. |
 | `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a tray with a floor and three walls, open at the front: a box minus an overshooting cutter. Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
+| `models/cat.ts` | A stress test: a sitting cat. The fur is one `union` of a revolved egg body, `sphere` head, haunches and paws, `cone` ears, `cylinder` legs and a curled tail, trimmed flat at z = 0. Eyes, pupils, muzzle, nose, whiskers, a `torus` collar and a bell are separate colored parts. Its print view repeats the assembled cat, which the OCC cache serves. Debug export: 4.7 s at Draft, 8.2 s at Fine (21.9 s before the cache and true spheres, when its spheres were 24-band revolved polygons). OCC-only: truck's booleans can't fuse it. |
 
 ## Testing
 
@@ -488,8 +490,10 @@ launching the window:
 - **The pipeline and watcher run headless** against temp projects with a real
   `notify` watcher. Those tests cover debounce, recovery after errors, DSL
   edits, models outside `models/`, and shutdown.
-- **Repo models are smoke-tested:** every file in `models/` must build, and
-  any print view must sit on the plate.
+- **Repo models are smoke-tested:** every file in `models/` must build with
+  OCC, and any print view must sit on the plate. With truck, a model may
+  instead fail with one of truck's hinted errors (needs OCC, or a boolean it
+  can't do).
 - **Model files get shape checks only.** They're edited live, so tests that
   need exact values use inline sources.
 

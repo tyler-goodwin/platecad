@@ -47,8 +47,8 @@ cargo run -p platecad -- init path/to/new-project      # writes printer.toml, ds
 | `crates/cad-view-threed` | three-d + egui window. |
 | `crates/cad-export` | `TessellatedScene` to 3MF (welded, watertight, one object per part). |
 | `crates/platecad` | The `plate` binary plus library: CLI (clap), `Pipeline`, `run_session` (viewer commands, file list, watcher), `export_3mf`. Most integration tests live here. |
-| `dsl/cad.ts` | The TS DSL (also built into the binary for `plate init`): `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `fillet`, `chamfer`, `color`, `part`, `arrange`. |
-| `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`, `desk_organizer`, `rounded_box`). The user edits these live. |
+| `dsl/cad.ts` | The TS DSL (also built into the binary for `plate init`): `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `sphere`, `cylinder`, `cone`, `torus`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `fillet`, `chamfer`, `color`, `part`, `arrange`. |
+| `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`, `desk_organizer`, `rounded_box`, `cat`). The user edits these live. |
 | `assets/` | The app icon (`plate.ico`, drawn by `make_icon.py`; rerun it after editing the design). `build.rs` embeds it in `plate.exe`. |
 | `printer.toml` | Optional bed size, used by `arrange` in print views. Watched like an import. |
 | `architecture/` | Living design docs. Update them with every change. |

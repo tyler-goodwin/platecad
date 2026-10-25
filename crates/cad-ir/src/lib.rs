@@ -42,6 +42,19 @@ pub enum ModelSpec {
         #[serde(default = "full_turn")]
         degrees: f64,
     },
+    /// Solid sphere centered on the origin.
+    Sphere { radius: f64 },
+    /// Solid cylinder standing on the XY plane: base centered on the origin,
+    /// `height` up +Z.
+    Cylinder { radius: f64, height: f64 },
+    /// Solid cone or frustum standing on the XY plane: base of `radius`
+    /// centered on the origin, top of `top` (0 for a point) at `height`.
+    /// One of the radii may be 0.
+    Cone { radius: f64, top: f64, height: f64 },
+    /// Solid torus lying flat around +Z, centered on the origin: the tube's
+    /// center runs on a circle of `radius`, and `tube` is its own radius
+    /// (less than `radius`).
+    Torus { radius: f64, tube: f64 },
     /// Moves `shape` by `offset` (2D profiles stay profiles; solids stay solids).
     Translate {
         offset: [f64; 3],
@@ -477,6 +490,32 @@ mod tests {
     }
 
     #[test]
+    fn primitives_match_ts_shape() {
+        let cases = [
+            (r#"{"kind":"Sphere","radius":5}"#, ModelSpec::Sphere { radius: 5.0 }),
+            (
+                r#"{"kind":"Cylinder","radius":2,"height":7}"#,
+                ModelSpec::Cylinder { radius: 2.0, height: 7.0 },
+            ),
+            (
+                r#"{"kind":"Cone","radius":3,"top":0,"height":4}"#,
+                ModelSpec::Cone {
+                    radius: 3.0,
+                    top: 0.0,
+                    height: 4.0,
+                },
+            ),
+            (
+                r#"{"kind":"Torus","radius":10,"tube":2}"#,
+                ModelSpec::Torus { radius: 10.0, tube: 2.0 },
+            ),
+        ];
+        for (json, spec) in cases {
+            assert_eq!(serde_json::from_str::<ModelSpec>(json).unwrap(), spec, "{json}");
+        }
+    }
+
+    #[test]
     fn fillet_and_chamfer_match_ts_shape() {
         let rect = r#"{"kind":"Rect","width":1,"height":1}"#;
         let json = format!(r#"{{"kind":"Fillet","shape":{rect},"radius":2,"edges":["|Z",">Z","all"]}}"#);
@@ -575,10 +614,10 @@ mod tests {
     fn view_errors_point_at_the_bad_field() {
         let bad = serde_json::json!({
             "assembled": { "kind": "Rect", "width": 1, "height": 1 },
-            "print": { "kind": "Sphere" }
+            "print": { "kind": "Helix" }
         });
         let err = ModelViews::from_script_value(bad).unwrap_err().to_string();
-        assert!(err.contains("Sphere"), "{err}");
+        assert!(err.contains("Helix"), "{err}");
 
         let neither = serde_json::json!({ "shape": 1 });
         let err = ModelViews::from_script_value(neither).unwrap_err().to_string();

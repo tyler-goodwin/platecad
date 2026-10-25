@@ -160,6 +160,38 @@ pub fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
     }
 }
 
+/// Checks the sizes of a primitive solid (`Sphere`, `Cylinder`, `Cone`,
+/// `Torus`); other nodes pass.
+pub fn validate_primitive(spec: &ModelSpec) -> Result<(), KernelError> {
+    let invalid = |why: String| Err(KernelError::Invalid(why));
+    let positive = |what: &str, v: f64| if v > 0.0 && v.is_finite() { Ok(()) } else { invalid(format!("{what} must be positive")) };
+    match *spec {
+        ModelSpec::Sphere { radius } => positive("sphere radius", radius),
+        ModelSpec::Cylinder { radius, height } => {
+            positive("cylinder radius", radius)?;
+            positive("cylinder height", height)
+        }
+        ModelSpec::Cone { radius, top, height } => {
+            positive("cone height", height)?;
+            if !(radius >= 0.0 && top >= 0.0 && radius.is_finite() && top.is_finite()) {
+                return invalid("cone radii must be 0 or more".into());
+            }
+            if radius == 0.0 && top == 0.0 {
+                return invalid("cone needs a radius above 0 at the base or the top".into());
+            }
+            Ok(())
+        }
+        ModelSpec::Torus { radius, tube } => {
+            positive("torus tube", tube)?;
+            if !(radius > tube && radius.is_finite()) {
+                return invalid(format!("torus radius must be larger than its tube (got {radius} and {tube})"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A simple polygon's outline, counter-clockwise with no closing duplicate.
 /// Rejects fewer than 3 points, non-finite or repeated points, zero area and
 /// self-intersections.
@@ -406,6 +438,32 @@ mod tests {
                     && y + d <= py + bed.depth + 1e-3
             });
             assert!(on_a_plate, "{w}x{d} at {x},{y} not inside any plate");
+        }
+    }
+
+    #[test]
+    fn primitives_need_sensible_sizes() {
+        let ok = [
+            ModelSpec::Sphere { radius: 1.0 },
+            ModelSpec::Cylinder { radius: 1.0, height: 2.0 },
+            ModelSpec::Cone { radius: 1.0, top: 0.0, height: 2.0 },
+            ModelSpec::Cone { radius: 0.0, top: 1.0, height: 2.0 },
+            ModelSpec::Torus { radius: 3.0, tube: 1.0 },
+        ];
+        for spec in &ok {
+            assert!(validate_primitive(spec).is_ok(), "{spec:?}");
+        }
+        let bad = [
+            (ModelSpec::Sphere { radius: 0.0 }, "sphere radius must be positive"),
+            (ModelSpec::Cylinder { radius: 1.0, height: -1.0 }, "cylinder height must be positive"),
+            (ModelSpec::Cone { radius: -1.0, top: 1.0, height: 1.0 }, "cone radii must be 0 or more"),
+            (ModelSpec::Cone { radius: 0.0, top: 0.0, height: 1.0 }, "cone needs a radius"),
+            (ModelSpec::Torus { radius: 1.0, tube: 1.0 }, "torus radius must be larger than its tube"),
+            (ModelSpec::Sphere { radius: f64::NAN }, "sphere radius must be positive"),
+        ];
+        for (spec, why) in &bad {
+            let err = validate_primitive(spec).unwrap_err().to_string();
+            assert!(err.contains(why), "{spec:?}: {err}");
         }
     }
 }

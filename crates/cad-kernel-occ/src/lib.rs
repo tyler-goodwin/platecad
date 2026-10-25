@@ -6,7 +6,7 @@
 //! meshes solids.
 
 use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
-use cad_kernel::{EdgeShape, Kernel, KernelError, edge_selected, pack, validate_polygon};
+use cad_kernel::{EdgeShape, Kernel, KernelError, edge_selected, pack, validate_polygon, validate_primitive};
 use cadrum::{Boolean, DVec3, Edge, Solid, Tessellation};
 
 /// Edge sampling for selection and bounds, at the finest quality whatever
@@ -314,6 +314,17 @@ fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<
             let solid = Solid::revolve(&upright, DVec3::ZERO, DVec3::Z, degrees.to_radians())
                 .map_err(occ("revolve"))?;
             Ok(vec![(solid, style)])
+        }
+        ModelSpec::Sphere { .. } | ModelSpec::Cylinder { .. } | ModelSpec::Cone { .. } | ModelSpec::Torus { .. } => {
+            validate_primitive(spec)?;
+            let solid = match *spec {
+                ModelSpec::Sphere { radius } => Solid::sphere(radius),
+                ModelSpec::Cylinder { radius, height } => Solid::cylinder(radius, DVec3::Z * height),
+                ModelSpec::Cone { radius, top, height } => Solid::cone(radius, top, DVec3::Z * height),
+                ModelSpec::Torus { radius, tube } => Solid::torus(radius, tube, DVec3::Z),
+                _ => unreachable!("matched above"),
+            };
+            Ok(vec![(solid, style.clone())])
         }
         ModelSpec::Translate { offset, shape } => {
             let v = vec3(*offset);
