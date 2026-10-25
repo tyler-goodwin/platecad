@@ -1,12 +1,8 @@
 [package]
-name = "cad-app"
+name = "caddy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "caddy"
-path = "src/main.rs"
 
 [dependencies]
 cad-export.workspace = true

@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use cad_app::{
+use caddy::{
     Cli, Command, ExportArgs, InitArgs, OpenArgs, PROJECT_MARKER, Pipeline, Start, export_3mf, init_project,
     project_root, resolve_model, resolve_start, run_session,
 };

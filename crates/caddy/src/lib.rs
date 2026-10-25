@@ -1,6 +1,7 @@
-//! Reload pipeline behind the `cad-app` binary: TS file -> script host -> kernel
-//! -> `SceneUpdate`, re-run whenever watched sources change. Kept windowless so it
-//! can be tested headless.
+//! Library behind the `caddy` binary: the CLI, `caddy init`, the reload
+//! pipeline (TS file -> script host -> kernel -> `SceneUpdate`) and the viewer
+//! session that re-runs it whenever watched sources change. Kept windowless so
+//! it can be tested headless.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -224,7 +225,7 @@ pub struct OpenArgs {
     pub path: Option<PathBuf>,
 
     /// Geometry kernel.
-    #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
+    #[arg(long, env = "CADDY_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
 }
 
@@ -242,7 +243,7 @@ pub struct ExportArgs {
     pub view: ExportView,
 
     /// Geometry kernel.
-    #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
+    #[arg(long, env = "CADDY_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
 }
 
@@ -1269,8 +1270,8 @@ export default () => fillet(cube(2), 5);
     fn cli_path_is_optional_and_kernel_defaults_to_occ() {
         let args = parse_open(&[]);
         assert_eq!(args.path, None);
-        // A CAD_KERNEL in the developer's shell legitimately changes the default.
-        if std::env::var_os("CAD_KERNEL").is_none() {
+        // A CADDY_KERNEL in the developer's shell legitimately changes the default.
+        if std::env::var_os("CADDY_KERNEL").is_none() {
             assert_eq!(args.kernel, KernelChoice::Occ);
         }
     }
@@ -1342,11 +1343,11 @@ export default () => fillet(cube(2), 5);
             err.to_string()
         };
         let top = help(&["--help"]);
-        for needle in ["caddy", "open", "export", "init", "[PATH]", "--kernel", "CAD_KERNEL", "truck", "occ"] {
+        for needle in ["caddy", "open", "export", "init", "[PATH]", "--kernel", "CADDY_KERNEL", "truck", "occ"] {
             assert!(top.contains(needle), "help is missing {needle}:\n{top}");
         }
         let export = help(&["export", "--help"]);
-        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "CAD_KERNEL"] {
+        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "CADDY_KERNEL"] {
             assert!(export.contains(needle), "export help is missing {needle}:\n{export}");
         }
     }

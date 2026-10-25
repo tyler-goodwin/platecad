@@ -6,10 +6,11 @@ Guide for coding agents working in this repo. For the full design, read
 
 ## What this is
 
-A code-first CAD playground. You write a model in TypeScript (`models/*.ts`,
-using the DSL in `dsl/cad.ts`). Rust evaluates it with rustyscript (V8),
-builds B-rep geometry with the truck kernel, and shows it in a three-d
-window that hot-reloads on save. It can also export a 3MF for slicers.
+`caddy` is a code-first CAD playground. You write a model in TypeScript
+(`models/*.ts`, using the DSL in `dsl/cad.ts`). Rust evaluates it with
+rustyscript (V8), builds B-rep geometry with OpenCascade (or the truck
+kernel), and shows it in a three-d window that hot-reloads on save. It can
+also export a 3MF for slicers, and `caddy init` starts new projects.
 
 ```
 models/*.ts --(cad-script)--> ModelViews IR --(Kernel)--> TessellatedScene --> viewer | 3MF
@@ -19,9 +20,9 @@ models/*.ts --(cad-script)--> ModelViews IR --(Kernel)--> TessellatedScene --> v
 
 ```sh
 cargo test --workspace                                # the main way to verify anything
-cargo run -p cad-app -- models/bookshelf.ts           # opens the viewer window (OCC kernel by default); a folder works too
-cargo run -p cad-app -- export models/bookshelf.ts [-o out.3mf] [--view auto|print|assembled]  # headless
-cargo run -p cad-app -- init path/to/new-project      # writes printer.toml, dsl/cad.ts, a starter model
+cargo run -p caddy -- models/bookshelf.ts           # opens the viewer window (OCC kernel by default); a folder works too
+cargo run -p caddy -- export models/bookshelf.ts [-o out.3mf] [--view auto|print|assembled]  # headless
+cargo run -p caddy -- init path/to/new-project      # writes printer.toml, dsl/cad.ts, a starter model
 ```
 
 - The first build compiles V8 and takes a while. Later builds are fast.
@@ -45,7 +46,7 @@ cargo run -p cad-app -- init path/to/new-project      # writes printer.toml, dsl
 | `crates/cad-view` | `SceneUpdate`, view selection logic, viewer protocol (`ViewerMessage`/`ViewerCommand`), `ViewportApp` trait (no GPU code). |
 | `crates/cad-view-threed` | three-d + egui window. |
 | `crates/cad-export` | `TessellatedScene` to 3MF (welded, watertight, one object per part). |
-| `crates/cad-app` | The `caddy` binary plus library: CLI (clap), `Pipeline`, `run_session` (viewer commands, file list, watcher), `export_3mf`. Most integration tests live here. |
+| `crates/caddy` | The `caddy` binary plus library: CLI (clap), `Pipeline`, `run_session` (viewer commands, file list, watcher), `export_3mf`. Most integration tests live here. |
 | `dsl/cad.ts` | The TS DSL (also built into the binary for `caddy init`): `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `fillet`, `chamfer`, `color`, `part`, `arrange`. |
 | `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`, `desk_organizer`, `rounded_box`). The user edits these live. |
 | `printer.toml` | Optional bed size, used by `arrange` in print views. Watched like an import. |
@@ -53,7 +54,7 @@ cargo run -p cad-app -- init path/to/new-project      # writes printer.toml, dsl
 
 ## Rules of the house
 
-- **Verify with tests, not the window.** Don't launch `cad-app` to check
+- **Verify with tests, not the window.** Don't launch `caddy` to check
   rendering, and don't take screenshots of it. Pull logic out of GPU and
   window code into pure functions and test those. Examples are `framing`,
   `edge_transform`, `vertex_colors`, `part_list`, `ViewSelection` and
@@ -86,7 +87,7 @@ non-exhaustive `match` error, but not always.
    if it applies), and a builder function. Validate input in TS with a
    message that names the function, e.g. `rotate axis must be…`.
 4. Tests in each layer: kernel geometry, DSL output and errors (in
-   `cad-script`), and end to end in `cad-app` if it affects models or export.
+   `cad-script`), and end to end in `caddy` if it affects models or export.
 5. The IR table in `architecture/README.md`.
 
 ## Gotchas learned the hard way
@@ -138,5 +139,5 @@ non-exhaustive `match` error, but not always.
     edit scripts in a file instead.
 - **Rust raw strings.** A raw string holding a hex color like `"#ff0000"`
   needs `r##"..."##`, because `"#` ends a `r#"..."#` string.
-- **`cad_ir` in `cad-app`.** It's a normal dependency there, used outside
+- **`cad_ir` in `caddy`.** It's a normal dependency there, used outside
   tests too. Test-only crates (`tempfile`, `zip`) are dev-dependencies.

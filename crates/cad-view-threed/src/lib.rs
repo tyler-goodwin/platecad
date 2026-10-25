@@ -34,7 +34,7 @@ pub struct ThreeDViewport {
 impl Default for ThreeDViewport {
     fn default() -> Self {
         Self {
-            title: "CAD playground".into(),
+            title: "caddy".into(),
         }
     }
 }
