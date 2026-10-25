@@ -23,6 +23,9 @@ notify = "8"
 serde = { workspace = true }
 toml = "0.8"
 
+[build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"

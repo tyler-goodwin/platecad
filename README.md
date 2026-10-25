@@ -1,4 +1,4 @@
-# platecad
+# <img src="assets/plate.png" width="48" alt=""> platecad
 
 Code-first CAD for 3D printing. You write models in TypeScript and see them
 as solids in a native 3D viewer that reloads every time you save. When a

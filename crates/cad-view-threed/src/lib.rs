@@ -26,6 +26,13 @@ const EDGE_RADIUS_FRACTION: f32 = 0.0008;
 /// Build plate outlines in the print view.
 const PLATE_COLOR: [u8; 3] = [90, 150, 210];
 
+/// Size the window opens at (and its maximum), in logical pixels.
+const WINDOW_SIZE: (u32, u32) = (1280, 800);
+
+/// Resource id of the app icon in the executable. The `plate` binary embeds
+/// `assets/plate.ico` under it (see `crates/platecad/build.rs`).
+pub const ICON_RESOURCE_ID: u16 = 1;
+
 /// three-d window with an orbit camera and an egui status overlay.
 pub struct ThreeDViewport {
     pub title: String,
@@ -46,12 +53,7 @@ impl ViewportApp for ThreeDViewport {
         messages: Receiver<ViewerMessage>,
         commands: Sender<ViewerCommand>,
     ) -> Result<(), ViewError> {
-        let window = Window::new(WindowSettings {
-            title: self.title,
-            max_size: Some((1280, 800)),
-            ..Default::default()
-        })
-        .map_err(|e| ViewError::Message(e.to_string()))?;
+        let window = open_window(&self.title)?;
         let context = window.gl();
 
         let mut camera = Camera::new_perspective(
@@ -248,6 +250,41 @@ impl ViewportApp for ThreeDViewport {
 
         Ok(())
     }
+}
+
+/// The window three-d would open for `WindowSettings { max_size: WINDOW_SIZE }`,
+/// built here so it can carry the app icon.
+fn open_window(title: &str) -> Result<Window, ViewError> {
+    use winit::dpi::LogicalSize;
+    let event_loop = winit::event_loop::EventLoop::new();
+    let (width, height) = WINDOW_SIZE;
+    let builder = winit::window::WindowBuilder::new()
+        .with_title(title)
+        .with_min_inner_size(LogicalSize::new(2, 2))
+        .with_inner_size(LogicalSize::new(width, height))
+        .with_max_inner_size(LogicalSize::new(width, height));
+    let window = with_app_icon(builder)
+        .build(&event_loop)
+        .map_err(|e| ViewError::Message(e.to_string()))?;
+    window.focus_window();
+    Window::from_winit_window(window, event_loop, SurfaceSettings::default(), false)
+        .map_err(|e| ViewError::Message(e.to_string()))
+}
+
+/// Title bar and taskbar icon from the executable's embedded icon resource.
+/// Without one (test binaries, other hosts), the window keeps the default.
+#[cfg(windows)]
+fn with_app_icon(builder: winit::window::WindowBuilder) -> winit::window::WindowBuilder {
+    use winit::platform::windows::{IconExtWindows, WindowBuilderExtWindows};
+    match winit::window::Icon::from_resource(ICON_RESOURCE_ID, None) {
+        Ok(icon) => builder.with_window_icon(Some(icon.clone())).with_taskbar_icon(Some(icon)),
+        Err(_) => builder,
+    }
+}
+
+#[cfg(not(windows))]
+fn with_app_icon(builder: winit::window::WindowBuilder) -> winit::window::WindowBuilder {
+    builder
 }
 
 /// One view's meshes on the GPU.

@@ -9,3 +9,5 @@ cad-ir.workspace = true
 cad-view.workspace = true
 three-d = { version = "0.19", features = ["egui-gui"] }
 rfd = "0.15"
+# Same version three-d uses, to build its window with an icon.
+winit = "0.28"

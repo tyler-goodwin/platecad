@@ -286,6 +286,16 @@ outside the crate).
 
 ## Viewer
 
+- **Icon.** `assets/make_icon.py` draws `assets/plate.ico`, a cube on a print
+  bed. It's dependency-free Python that rasterizes each size from 16 to 256 px
+  with 4x4 supersampling and stores PNG entries. The `platecad` crate's
+  `build.rs` (via `winresource`) embeds it in `plate.exe` as icon resource 1,
+  with product name, description and copyright, on Windows targets only. Explorer
+  shows that icon. The window doesn't pick it up by itself, so the viewer
+  builds its winit window itself (three-d's `WindowSettings` has no icon) and
+  loads resource 1 for the title bar and taskbar. Without the resource (test
+  binaries) the window keeps the default icon. `tests/icon.rs` checks the
+  sizes and that the exe contains every image.
 - three-d physical material, lit by ambient plus key and fill lights. Vertex
   colors multiply a white albedo; uncolored meshes use `DEFAULT_COLOR`.
 - B-rep edges are drawn as instanced thin cylinders, because GL line width
