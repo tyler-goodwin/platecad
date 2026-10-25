@@ -71,18 +71,18 @@ pub enum ModelSpec {
     },
     /// Several independent shapes shown together, not fused (see `Union`).
     Group { children: Vec<ModelSpec> },
-    /// Fuses solids into one. truck needs their faces to cross: solids that
-    /// only touch, or share a face plane, fail with an error.
+    /// Fuses solids into one. Solids that only touch, or share a face plane,
+    /// fuse too.
     Union { children: Vec<ModelSpec> },
-    /// Cuts every tool out of `shape`. Tools must overshoot the faces they cut
-    /// through rather than end flush with them.
+    /// Cuts every tool out of `shape`. A tool may end flush with the faces it
+    /// cuts through.
     Difference {
         shape: Box<ModelSpec>,
         tools: Vec<ModelSpec>,
     },
     /// Keeps the volume common to all children.
     Intersect { children: Vec<ModelSpec> },
-    /// Rounds the selected edges of every solid in `shape` (OCC kernel only).
+    /// Rounds the selected edges of every solid in `shape`.
     Fillet {
         shape: Box<ModelSpec>,
         radius: f64,
@@ -90,7 +90,7 @@ pub enum ModelSpec {
         #[serde(default)]
         edges: Vec<EdgeSelector>,
     },
-    /// Bevels the selected edges by `distance` (OCC kernel only).
+    /// Bevels the selected edges by `distance`.
     Chamfer {
         shape: Box<ModelSpec>,
         distance: f64,

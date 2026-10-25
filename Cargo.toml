@@ -5,7 +5,6 @@ members = [
     "crates/cad-ir",
     "crates/cad-kernel",
     "crates/cad-kernel-occ",
-    "crates/cad-kernel-truck",
     "crates/cad-script",
     "crates/cad-view",
     "crates/cad-view-threed",
@@ -22,7 +21,6 @@ cad-export = { path = "crates/cad-export" }
 cad-ir = { path = "crates/cad-ir" }
 cad-kernel = { path = "crates/cad-kernel" }
 cad-kernel-occ = { path = "crates/cad-kernel-occ" }
-cad-kernel-truck = { path = "crates/cad-kernel-truck" }
 cad-script = { path = "crates/cad-script" }
 cad-view = { path = "crates/cad-view" }
 cad-view-threed = { path = "crates/cad-view-threed" }

@@ -5,8 +5,6 @@ use thiserror::Error;
 pub enum KernelError {
     #[error("{0}")]
     Message(String),
-    #[error("unsupported model: {0}")]
-    Unsupported(String),
     #[error("invalid spec: {0}")]
     Invalid(String),
 }

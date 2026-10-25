@@ -54,7 +54,7 @@ cargo install --path crates/platecad   # installs the `plate` command
 The first build compiles V8 and links a prebuilt OpenCascade, so it takes a
 while. If the build fails while downloading OpenCascade
 ("max_headers_size"), see
-[Building with OCC](architecture/README.md#kernels-truck-and-occ).
+[Building with OCC](architecture/README.md#kernel).
 
 Then start a project and open it:
 
@@ -71,14 +71,13 @@ then edit it in any editor and save.
 
 ```sh
 plate [PATH]                                 # open the viewer on a model or folder
-plate export MODEL [-o FILE.3mf] [--view auto|print|assembled]
+plate export MODEL [-o FILE.3mf] [--view auto|print|assembled] [--quality draft|normal|fine]
 plate init [DIR]                             # set up a new project
 ```
 
 Exports go to `outputs/<model>_<view>.3mf` in the project unless you pass
 `-o`. The viewer's **Export 3MF** button writes the view on screen to the
-same place. Use `--kernel truck` (or `PLATE_KERNEL=truck`) to try the
-pure-Rust kernel instead of OpenCascade. It can't do fillets.
+same place.
 
 ## A project
 

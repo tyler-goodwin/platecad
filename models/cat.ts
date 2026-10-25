@@ -26,8 +26,7 @@ import {
  * everything is curved (spheres, a revolved egg of a body, cone ears, a
  * curled tail, a torus collar), and the fur is one big union of curved
  * solids trimmed flat at z = 0 so it prints standing up. Eyes, nose, whiskers, collar and bell are
- * separate colored parts for a multi-filament print. Needs the OCC kernel
- * (the default): truck's booleans can't fuse this many curved solids.
+ * separate colored parts for a multi-filament print.
  *
  * `segments` sets how many flat bands the body's outline has; raise it to
  * make the kernel and mesher work harder.

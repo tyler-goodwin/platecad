@@ -1,9 +1,7 @@
-//! OpenCascade backend, through cadrum (statically linked OCCT 8).
+//! The geometry kernel: OpenCascade, through cadrum (statically linked OCCT 8).
 //!
-//! Same IR and output as the truck kernel. OCCT's booleans handle faces that
-//! line up exactly, which truck can't. Spike limitation: a bare 2D profile at
-//! the top of a view (e.g. `models/square.ts`) is unsupported; OCC builds and
-//! meshes solids.
+//! It builds solids only. A bare 2D profile (e.g. `models/square.ts`) is
+//! shown as a plate `FLAT_THICKNESS` thick.
 
 use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{EdgeShape, Kernel, KernelError, edge_selected, pack, validate_polygon, validate_primitive};
@@ -13,7 +11,11 @@ use cadrum::{Boolean, DVec3, Edge, Solid, Tessellation};
 /// the mesh quality, so `fillet(..., { edges })` picks the same edges.
 const TESSELLATION: Tessellation = tessellation(MeshQuality::Fine);
 
-/// Absolute chord and angular tolerances for `quality`, as the truck kernel uses.
+/// Thickness of a bare profile shown on its own, mm: thin enough to read as
+/// flat, thick enough to mesh.
+pub const FLAT_THICKNESS: f64 = 0.01;
+
+/// Absolute chord and angular tolerances for `quality`.
 const fn tessellation(quality: MeshQuality) -> Tessellation {
     Tessellation {
         deflection_linear: quality.chord_tolerance(),
@@ -64,17 +66,20 @@ const CACHE_BUILDS: u64 = 4;
 /// the subtree and the style it inherits. They're reused within a build,
 /// e.g. a print view that repeats the assembled parts, and across builds,
 /// so a reload only redoes the parts whose specs changed. Solids don't
-/// depend on mesh quality, so a quality change reuses them too.
+/// depend on mesh quality, so a quality change reuses them too. The tight
+/// bounds of `arrange` children are kept the same way, since each costs a
+/// fine mesh.
 #[derive(Debug, Default)]
 struct SolidCache {
-    entries: std::collections::HashMap<String, CacheEntry>,
+    entries: std::collections::HashMap<String, CacheEntry<Bodies>>,
+    bounds: std::collections::HashMap<String, CacheEntry<(DVec3, DVec3)>>,
     build: u64,
     hits: usize,
 }
 
 #[derive(Debug)]
-struct CacheEntry {
-    bodies: Bodies,
+struct CacheEntry<T> {
+    value: T,
     last_used: u64,
 }
 
@@ -92,8 +97,13 @@ impl SolidCache {
                 | ModelSpec::Fillet { .. }
                 | ModelSpec::Chamfer { .. }
         );
+        if slow { Self::any_key(spec, style) } else { None }
+    }
+
+    /// The key for any subtree, or `None` if it holds an `arrange` (see `key`).
+    fn any_key(spec: &ModelSpec, style: &Style) -> Option<String> {
         let key = format!("{style:?} {spec:?}");
-        (slow && !key.contains("Arrange {")).then_some(key)
+        (!key.contains("Arrange {")).then_some(key)
     }
 
     /// A copy of the cached bodies (solids are deep-copied: cheap next to a boolean).
@@ -101,18 +111,33 @@ impl SolidCache {
         let entry = self.entries.get_mut(key)?;
         entry.last_used = self.build;
         self.hits += 1;
-        Some(entry.bodies.clone())
+        Some(entry.value.clone())
     }
 
     fn insert(&mut self, key: String, bodies: Bodies) {
         let last_used = self.build;
-        self.entries.insert(key, CacheEntry { bodies, last_used });
+        self.entries.insert(key, CacheEntry { value: bodies, last_used });
+    }
+
+    /// `bodies`' tight bounds, from the cache under `key` when there is one.
+    fn bounds(&mut self, key: Option<String>, bodies: &Bodies) -> Result<Option<(DVec3, DVec3)>, KernelError> {
+        if let Some(entry) = key.as_ref().and_then(|k| self.bounds.get_mut(k)) {
+            entry.last_used = self.build;
+            return Ok(Some(entry.value));
+        }
+        let found = tight_bounds(bodies)?;
+        if let (Some(key), Some(value)) = (key, found) {
+            let last_used = self.build;
+            self.bounds.insert(key, CacheEntry { value, last_used });
+        }
+        Ok(found)
     }
 
     /// Forgets entries no recent build has used.
     fn end_build(&mut self) {
         let build = self.build;
         self.entries.retain(|_, e| build - e.last_used < CACHE_BUILDS);
+        self.bounds.retain(|_, e| build - e.last_used < CACHE_BUILDS);
         self.build += 1;
     }
 }
@@ -267,9 +292,12 @@ fn build_solids(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bo
 fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bodies, KernelError> {
     match spec {
         ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } | ModelSpec::Circle { .. } | ModelSpec::Cutout { .. } => {
-            Err(KernelError::Unsupported(
-                "the OCC kernel builds solids only: extrude or revolve 2D profiles".into(),
-            ))
+            // OCC meshes solids, not lone faces, so a profile that isn't swept
+            // shows (and exports) as a plate `FLAT_THICKNESS` thick.
+            let (loops, style) = build_profile(spec, style.clone())?;
+            let edges: Vec<Edge> = loops.into_iter().flatten().collect();
+            let solid = Solid::extrude(&edges, DVec3::Z * FLAT_THICKNESS).map_err(occ("profile"))?;
+            Ok(vec![(solid, style)])
         }
         ModelSpec::Extrude {
             profile,
@@ -461,7 +489,10 @@ fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<
             let mut footprints = Vec::new();
             for child in children {
                 let bodies = build_solids(child, style, build)?;
-                let (min, max) = bounds(&bodies).ok_or_else(|| invalid("arrange child has no geometry"))?;
+                let (min, max) = build
+                    .cache
+                    .bounds(SolidCache::any_key(child, style), &bodies)?
+                    .ok_or_else(|| invalid("arrange child has no geometry"))?;
                 footprints.push([max.x - min.x, max.y - min.y]);
                 built.push((bodies, min));
             }
@@ -502,12 +533,25 @@ fn edge_bounds(solid: &Solid) -> ([f64; 3], [f64; 3]) {
     (min, max)
 }
 
-fn bounds(bodies: &Bodies) -> Option<(DVec3, DVec3)> {
-    bodies
-        .iter()
-        .map(|(s, _)| s.bounding_box())
-        .reduce(|[amin, amax], [bmin, bmax]| [amin.min(bmin), amax.max(bmax)])
-        .map(|[min, max]| (min, max))
+/// Bounds from a fine mesh's vertices, which lie on the surface: within the
+/// fine chord tolerance (0.01 mm) of exact, and exact on planar faces and
+/// edges. OCC's own bounding box is padded by tolerances and loose around
+/// curved faces, so a part dropped onto the plate by it would float.
+fn tight_bounds(bodies: &Bodies) -> Result<Option<(DVec3, DVec3)>, KernelError> {
+    let mut bounds: Option<(DVec3, DVec3)> = None;
+    for (solid, _) in bodies {
+        // Meshing stores the triangulation on the shape, and a later coarser
+        // mesh would keep it, so mesh a copy (deep copies drop meshes).
+        let copy = solid.clone();
+        let mesh = Solid::mesh([&copy], TESSELLATION).map_err(occ("meshing"))?;
+        for &v in &mesh.vertices {
+            bounds = Some(match bounds {
+                None => (v, v),
+                Some((min, max)) => (min.min(v), max.max(v)),
+            });
+        }
+    }
+    Ok(bounds)
 }
 
 fn to_f32(v: DVec3) -> [f32; 3] {
@@ -565,14 +609,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bare_profiles_are_unsupported_for_now() {
-        let err = OccKernel::default()
-            .build(&ModelSpec::Rect {
-                width: 10.0,
-                height: 10.0,
-            })
-            .unwrap_err();
-        assert!(matches!(err, KernelError::Unsupported(_)), "{err}");
+    fn bare_profiles_show_as_thin_plates_keeping_their_style() {
+        let square = ModelSpec::Translate {
+            offset: [1.0, 2.0, 3.0],
+            shape: Box::new(ModelSpec::Color {
+                rgb: [255, 0, 0],
+                shape: Box::new(ModelSpec::Rect {
+                    width: 10.0,
+                    height: 10.0,
+                }),
+            }),
+        };
+        let scene = OccKernel::default().build(&square).unwrap();
+        let aabb = scene.aabb().unwrap();
+        assert_eq!(aabb.min, [1.0, 2.0, 3.0]);
+        assert!((aabb.max[0] - 11.0).abs() < 1e-4 && (aabb.max[2] - 3.0 - FLAT_THICKNESS as f32).abs() < 1e-4, "{aabb:?}");
+        assert!(scene.colors.iter().all(|c| *c == [255, 0, 0]));
     }
 
     #[test]
@@ -660,6 +712,30 @@ mod tests {
         assert!(kernel.cache.entries.is_empty());
         kernel.build(&fused(0.0)).unwrap();
         assert_eq!(kernel.cache_hits(), 0);
+    }
+
+    #[test]
+    fn arranged_curved_parts_sit_exactly_on_the_plate() {
+        // OCC's padded bounding box would leave these floating.
+        let spec = ModelSpec::Arrange {
+            gap: 5.0,
+            children: vec![
+                ModelSpec::Translate {
+                    offset: [0.0, 0.0, 40.0],
+                    shape: Box::new(ModelSpec::Sphere { radius: 5.0 }),
+                },
+                ModelSpec::Torus { radius: 8.0, tube: 2.0 },
+            ],
+            bed: None,
+        };
+        let mut kernel = OccKernel::default();
+        for _ in 0..2 {
+            let scene = kernel.build_with(&spec, MeshQuality::Draft).unwrap();
+            let aabb = scene.aabb().unwrap();
+            assert!(aabb.min[2].abs() < 1e-3, "{aabb:?}");
+        }
+        // The second build took both bounds from the cache.
+        assert_eq!(kernel.cache.bounds.len(), 2);
     }
 
     #[test]

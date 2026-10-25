@@ -6,33 +6,24 @@ the improvement.
 
 ## Modeling
 
-- **Coplanar booleans.** Booleans exist but fail whenever faces line up
-  exactly (see README, "Booleans and coplanar faces"). Options: detect
-  coplanar contact and nudge a tool by a sub-tolerance epsilon
-  automatically, try a newer truck, or use an OCC backend whose booleans
-  handle coplanar faces.
-- **Quiet boolean panics.** A caught truck panic still prints to stderr.
-  A process-wide panic hook that silences panics from the kernel's boolean
-  calls would keep the console clean.
 - **More profiles.** `Rect`, `Polygon`, `Circle` and `Cutout` (holes)
   exist. Add polylines with arcs, rounded rectangles, and slots.
-- **Hide seam edges.** A cylinder shows the seam edges truck puts on its
-  side face. Skip edges whose two faces meet smoothly (tangent normals).
-- **Slow curved booleans (truck only).** Subtracting a cylinder takes about
-  3 s in a debug build with `--kernel truck`; OCC, the default, does it in
-  milliseconds. Matters only if truck stays around.
+- **Hide seam edges.** A cylinder shows the seam edge on its side face.
+  Skip edges whose two faces meet smoothly (tangent normals).
 - **Geometry queries from scripts.** Scripts can't measure anything, which
   is why `arrange` lives in the kernel. A hybrid query op such as
   `bounds(shape)` would let layouts and fits be written in TS.
-- **Cheaper bounds.** Bounds tessellate each shell an extra time (on top
-  of the tessellation for display). Cache that tessellation, or sample
-  surfaces directly.
+- **Cheaper bounds.** `arrange` meshes each child at Fine an extra time
+  (on top of the tessellation for display; cached across reloads). Reuse
+  the display mesh when it's Fine, or ask OCCT for an optimal bounding box
+  (`BRepBndLib::AddOptimal`, a cadrum patch).
 
-## OCC kernel (spike follow-ups)
+## OCC kernel
 
-- **Bare 2D profiles in OCC.** These fall back to truck. cadrum can't build
-  a planar face from edge loops or mesh a lone face; that needs OCCT's
-  `BRepBuilderAPI_MakeFace` exposed.
+- **Real flat faces.** A bare 2D profile shows as a 0.01 mm plate, because
+  cadrum can't build a planar face from edge loops or mesh a lone face.
+  Exposing OCCT's `BRepBuilderAPI_MakeFace` (a cadrum patch, like parallel
+  booleans) would show and export a true face.
 - **More OCC features.** Loft, sweep along a path, shell (hollowing) and
   STEP export are in cadrum but not exposed.
 - **Smarter edge selection.** Selectors can't tell a seam edge (a
@@ -42,8 +33,6 @@ the improvement.
 - **Reproducible OCCT fetch.** The documented curl workaround is manual.
   Vendor a fetch script, or switch to cadrum's `source` build (official
   sources; needs CMake).
-- **Drop truck's workarounds** (explicit curves, coplanar hints) if OCC
-  becomes the only kernel.
 - **Parallel booleans.** cadrum runs each boolean as one
   `BOPAlgo_CellsBuilder` pass (`builder_cells` in its `src/ffi.cpp`) without
   calling `SetRunParallel(true)`, so a big union uses one core. It's a

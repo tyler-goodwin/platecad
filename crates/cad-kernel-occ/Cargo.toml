@@ -11,4 +11,3 @@ cadrum = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 cad-export.workspace = true
-cad-kernel-truck.workspace = true

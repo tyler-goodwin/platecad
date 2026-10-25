@@ -14,7 +14,6 @@ cad-export.workspace = true
 cad-ir.workspace = true
 cad-kernel.workspace = true
 cad-kernel-occ.workspace = true
-cad-kernel-truck.workspace = true
 cad-script.workspace = true
 cad-view.workspace = true
 cad-view-threed.workspace = true

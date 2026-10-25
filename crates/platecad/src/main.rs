@@ -52,9 +52,8 @@ fn open(args: OpenArgs, cwd: std::path::PathBuf) -> ExitCode {
 
     let (tx, rx) = mpsc::channel();
     let (commands_tx, commands_rx) = mpsc::channel();
-    let kernel = args.kernel;
     std::thread::spawn(move || {
-        if let Err(e) = run_session(start, kernel, store, commands_rx, tx.clone()) {
+        if let Err(e) = run_session(start, store, commands_rx, tx.clone()) {
             let _ = tx.send(SceneUpdate::error(format!("file watcher stopped: {e}")).into());
         }
     });
@@ -74,7 +73,7 @@ fn export(args: ExportArgs, cwd: std::path::PathBuf) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut pipeline = match Pipeline::new(&project_root(&model), args.kernel) {
+    let mut pipeline = match Pipeline::new(&project_root(&model)) {
         Ok(pipeline) => pipeline,
         Err(e) => {
             eprintln!("error: {e}");

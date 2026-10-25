@@ -8,8 +8,7 @@ Guide for coding agents working in this repo. For the full design, read
 
 Plate CAD is a code-first CAD playground. You write a model in TypeScript
 (`models/*.ts`, using the DSL in `dsl/cad.ts`). Rust evaluates it with
-rustyscript (V8), builds B-rep geometry with OpenCascade (or the truck
-kernel), and shows it in a three-d window that hot-reloads on save. It can
+rustyscript (V8), builds B-rep geometry with OpenCascade, and shows it in a three-d window that hot-reloads on save. It can
 also export a 3MF for slicers, and `plate init` starts new projects.
 
 ```
@@ -20,8 +19,8 @@ models/*.ts --(cad-script)--> ModelViews IR --(Kernel)--> TessellatedScene --> v
 
 ```sh
 cargo test --workspace                                # the main way to verify anything
-cargo run -p platecad -- models/bookshelf.ts           # opens the viewer window (OCC kernel by default); a folder works too
-cargo run -p platecad -- export models/bookshelf.ts [-o out.3mf] [--view auto|print|assembled]  # headless
+cargo run -p platecad -- models/bookshelf.ts           # opens the viewer window; a folder works too
+cargo run -p platecad -- export models/bookshelf.ts [-o out.3mf] [--view auto|print|assembled] [--quality draft|normal|fine]  # headless
 cargo run -p platecad -- init path/to/new-project      # writes printer.toml, dsl/cad.ts, a starter model
 ```
 
@@ -40,8 +39,7 @@ cargo run -p platecad -- init path/to/new-project      # writes printer.toml, ds
 |---|---|
 | `crates/cad-ir` | Serde IR shared by everything: `ModelSpec`, `Views<T>`/`ModelViews`, `TessellatedScene`, `ScenePart`, `Rgb`. No kernel or renderer types. |
 | `crates/cad-kernel` | `Kernel` trait, `KernelError`, and shared `pack` and `validate_polygon`. |
-| `crates/cad-kernel-truck` | The real kernel: spec tree to bodies (`build_bodies`), then tessellation (normals, colors, edges, part ranges). |
-| `crates/cad-kernel-occ` | OpenCascade kernel via cadrum. `tests/conformance.rs` keeps it in step with truck. |
+| `crates/cad-kernel-occ` | The kernel: OpenCascade via cadrum. Spec tree to solids (`build_solids`, with the solid cache), then tessellation (normals, colors, edges, part ranges). `tests/geometry.rs` checks it against exact volumes and bounds. |
 | `crates/cad-script` | `ScriptHost` trait and the rustyscript host: sandboxed imports and dependency tracking. |
 | `crates/cad-view` | `SceneUpdate`, view selection logic, viewer protocol (`ViewerMessage`/`ViewerCommand`), `ViewportApp` trait (no GPU code). |
 | `crates/cad-view-threed` | three-d + egui window. |
@@ -65,7 +63,7 @@ cargo run -p platecad -- init path/to/new-project      # writes printer.toml, ds
   messages with the attribution trailer the harness provides.
 - **Millimeters everywhere, +Z up.** Slicers assume mm.
 - **The IR is the seam.** Crates talk only through `cad-ir` and the traits.
-  Never import truck, three-d or rustyscript types across crate boundaries.
+  Never import cadrum, three-d or rustyscript types across crate boundaries.
 - **Model files are user territory.** The user edits `models/*.ts` while you
   work, so expect changes you didn't make; don't revert them. Tests of model
   files check structure only (e.g. "builds", "parts named X"). Exact-value
@@ -78,12 +76,11 @@ non-exhaustive `match` error, but not always.
 
 1. `cad-ir`: the variant, with a doc comment, plus a JSON test matching the
    TS shape.
-2. Both kernels: `cad-kernel-truck` and `cad-kernel-occ` (add a
-   conformance case too). In `cad-kernel-truck`:
-   - `build_bodies` (solids and transforms);
-   - `build_face` if it can wrap a 2D profile;
-   - `profile_style` if it carries style (color or part name) that an
-     extrusion should inherit.
+2. The kernel, `cad-kernel-occ`: `build_uncached` for solids and
+   transforms, `build_profile` if it's a 2D profile or can wrap one, and
+   `SolidCache::key` if it's slow enough to cache. Add a case with its exact
+   volume and bounds to `tests/geometry.rs`. Shared validation goes in
+   `cad-kernel` (e.g. `validate_primitive`).
 3. `dsl/cad.ts`: the `*Spec` type, the `ModelSpec` union (and `ProfileSpec`
    if it applies), and a builder function. Validate input in TS with a
    message that names the function, e.g. `rotate axis must be…`.
@@ -109,27 +106,18 @@ non-exhaustive `match` error, but not always.
 - **Two mesh forms.** The viewer mesh is de-indexed per (position, normal),
   so corners stay crisp. Export must weld vertices by position, or slicers
   see non-manifold edges.
-- **Boolean results get explicit curves** (`explicit_curves`). truck's
-  implicit intersection curves can hang tessellation after a transform.
-  Never keep `Curve::IntersectionCurve` around, and build anything that
-  could hang under a timeout in tests (`build_within`).
-- **OCC is the default kernel.** truck can't fillet, and its booleans fail
-  on coplanar faces. Any new IR node needs a conformance case in
-  `crates/cad-kernel-occ/tests/conformance.rs` if both kernels support it,
-  or an "unsupported" error in truck if only OCC does.
-- **Booleans fail on coplanar faces (truck).** truck-shapeops returns `None` or
-  panics when faces line up exactly, so the kernel wraps it in
-  `catch_unwind` and returns a hinted error. Model subtractively, with
-  cutters that overshoot the faces they cut through.
-- **Profiles are wound counter-clockwise about +Z.** Sweeps must face the
-  face along the sweep direction (`facing`), or the solid comes out
-  inside-out with negative volume. The export volume tests catch this.
-- **Bounds come from sampled edges plus tessellation vertices** (64
-  segments per curved edge). That's exact for extrusions and within 0.01 mm
-  for bulging surfaces like a torus. Mesh bounds of curved shapes are inscribed
-  polygons, so compare them with the tessellation tolerance (0.01 mm), not
-  1e-4. Inscribed holes leave slightly more material: volumes can land a
-  little above *or* below the exact value.
+- **OCC's bounding box is padded,** and loose around curved faces. Don't
+  use `Solid::bounding_box` to place things: `arrange` measures a fine mesh
+  (`tight_bounds`), and edge selectors use sampled edges (`edge_bounds`).
+- **Meshing sticks to the shape.** cadrum's mesher stores the triangulation
+  on the OCC shape, and a later coarser mesh keeps the finer one. Mesh a
+  deep copy (`solid.clone()`) for anything but the final tessellation.
+- **Bare profiles become 0.01 mm plates** (`FLAT_THICKNESS`), anywhere they
+  appear outside a sweep, because OCC meshes solids only.
+- **Mesh bounds of curved shapes are inscribed polygons,** so compare them
+  with the tessellation tolerance (0.01 mm), not 1e-4. Inscribed holes leave
+  slightly more material: volumes can land a little above *or* below the
+  exact value.
 - **Exact pins.** `serde` and `serde_json` are pinned exactly in the
   workspace `Cargo.toml` for rustyscript compatibility. Don't loosen them
   casually.

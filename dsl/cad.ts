@@ -376,9 +376,8 @@ export function arrange(parts: ModelSpec[], opts: { gap?: number; bed?: Bed } = 
 }
 
 /**
- * Fuses solids into one. Their faces must cross: solids that only touch or
- * share a face plane can't be fused, so overlap them a little (e.g. sink one
- * 0.5 mm into the other).
+ * Fuses solids into one. Solids that only touch or share a face plane fuse
+ * too. Solids that don't touch at all stay separate pieces of one part.
  */
 export function union(...shapes: ModelSpec[]): UnionSpec {
   if (shapes.length === 0) {
@@ -388,9 +387,8 @@ export function union(...shapes: ModelSpec[]): UnionSpec {
 }
 
 /**
- * Cuts `tools` out of `shape`. Make tools overshoot the faces they cut
- * through (a through-hole's cutter pokes out of both sides) rather than end
- * flush with them.
+ * Cuts `tools` out of `shape`. A tool may end flush with the faces it cuts
+ * through.
  */
 export function difference(shape: ModelSpec, ...tools: ModelSpec[]): DifferenceSpec {
   if (tools.length === 0) {
@@ -413,7 +411,7 @@ function edgeSelectors(name: string, edges: EdgeSelector | EdgeSelector[] | unde
 
 /**
  * Rounds edges of a solid with `radius` mm: every edge, or those picked by
- * `edges` (e.g. "|Z" for corners seen from above). OCC kernel only.
+ * `edges` (e.g. "|Z" for corners seen from above).
  */
 export function fillet(shape: ModelSpec, radius: number, opts: { edges?: EdgeSelector | EdgeSelector[] } = {}): FilletSpec {
   positive("fillet radius", radius);
@@ -422,7 +420,7 @@ export function fillet(shape: ModelSpec, radius: number, opts: { edges?: EdgeSel
 
 /**
  * Bevels edges of a solid by `distance` mm (e.g. "<Z" for a first-layer
- * chamfer). OCC kernel only.
+ * chamfer).
  */
 export function chamfer(shape: ModelSpec, distance: number, opts: { edges?: EdgeSelector | EdgeSelector[] } = {}): ChamferSpec {
   positive("chamfer distance", distance);

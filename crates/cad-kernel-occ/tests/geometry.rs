@@ -1,11 +1,10 @@
-//! The OCC and truck kernels must agree on everything truck can build, and
-//! OCC must handle the lined-up-faces cases truck can't.
+//! Kernel geometry against exact values: volumes, bounds, parts, colors and
+//! plates, with every exported object closed.
 
 use cad_export::objects;
 use cad_ir::{Bed, EdgeSelector, ModelSpec, Rgb, TessellatedScene};
 use cad_kernel::Kernel;
 use cad_kernel_occ::OccKernel;
-use cad_kernel_truck::TruckKernel;
 
 fn rect(width: f64, height: f64) -> ModelSpec {
     ModelSpec::Rect { width, height }
@@ -112,127 +111,159 @@ fn summarize(scene: &TessellatedScene) -> Summary {
     }
 }
 
-fn cases() -> Vec<(&'static str, ModelSpec)> {
+/// (name, spec, volume, min, max): one solid each.
+fn cases() -> Vec<(&'static str, ModelSpec, f64, [f64; 3], [f64; 3])> {
+    use std::f64::consts::PI;
     let ring = || translate([5.0, 0.0, 0.0], rect(5.0, 20.0));
     let ten = || cuboid([0.0; 3], [10.0; 3]);
     let other = || cuboid([5.0, 5.5, 6.0], [10.0; 3]);
+    let (cos, sin) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
     vec![
-        ("box", part("b", cuboid([1.0, 2.0, 3.0], [10.0, 20.0, 5.0]))),
-        ("rotated box", part("b", rotate([0.0, 0.0, 1.0], 30.0, cuboid([0.0; 3], [10.0, 4.0, 2.0])))),
-        ("cylinder", part("c", extrude(circle(10.0), 5.0))),
-        ("washer", part("w", extrude(cutout(circle(10.0), vec![circle(4.0)]), 2.0))),
+        ("box", cuboid([1.0, 2.0, 3.0], [10.0, 20.0, 5.0]), 1000.0, [1.0, 2.0, 3.0], [11.0, 22.0, 8.0]),
+        (
+            "rotated box",
+            rotate([0.0, 0.0, 1.0], 30.0, cuboid([0.0; 3], [10.0, 4.0, 2.0])),
+            80.0,
+            [-4.0 * sin, 0.0, 0.0],
+            [10.0 * cos, 10.0 * sin + 4.0 * cos, 2.0],
+        ),
+        ("cylinder", extrude(circle(10.0), 5.0), PI * 100.0 * 5.0, [-10.0, -10.0, 0.0], [10.0, 10.0, 5.0]),
+        (
+            "washer",
+            extrude(cutout(circle(10.0), vec![circle(4.0)]), 2.0),
+            PI * 84.0 * 2.0,
+            [-10.0, -10.0, 0.0],
+            [10.0, 10.0, 2.0],
+        ),
         (
             "L prism",
-            part(
-                "l",
-                extrude(polygon(&[[0.0, 0.0], [4.0, 0.0], [4.0, 1.0], [1.0, 1.0], [1.0, 3.0], [0.0, 3.0]]), 2.0),
-            ),
+            extrude(polygon(&[[0.0, 0.0], [4.0, 0.0], [4.0, 1.0], [1.0, 1.0], [1.0, 3.0], [0.0, 3.0]]), 2.0),
+            12.0,
+            [0.0; 3],
+            [4.0, 3.0, 2.0],
         ),
-        ("slanted", part("s", extrude_along(rect(2.0, 3.0), 4.0, [0.0, 3.0, 4.0]))),
-        ("tube", part("t", revolve(ring(), 360.0))),
-        ("quarter tube", part("q", revolve(ring(), 90.0))),
-        ("torus", part("o", revolve(translate([20.0, 0.0, 0.0], circle(5.0)), 360.0))),
-        ("sphere", part("sp", translate([1.0, 2.0, 3.0], ModelSpec::Sphere { radius: 5.0 }))),
-        ("cylinder primitive", part("cy", ModelSpec::Cylinder { radius: 4.0, height: 7.0 })),
-        ("cone", part("co", ModelSpec::Cone { radius: 5.0, top: 0.0, height: 8.0 })),
-        ("frustum", part("fr", ModelSpec::Cone { radius: 5.0, top: 2.0, height: 8.0 })),
-        ("upside-down cone", part("uc", ModelSpec::Cone { radius: 0.0, top: 3.0, height: 4.0 })),
-        ("torus primitive", part("to", ModelSpec::Torus { radius: 20.0, tube: 5.0 })),
-        ("crossing union", part("u", ModelSpec::Union { children: vec![ten(), other()] })),
+        // 4 mm along (0, 3, 4)/5: rises 3.2 mm and leans 2.4 mm toward +Y.
+        ("slanted", extrude_along(rect(2.0, 3.0), 4.0, [0.0, 3.0, 4.0]), 6.0 * 3.2, [0.0; 3], [2.0, 5.4, 3.2]),
+        ("tube", revolve(ring(), 360.0), PI * 75.0 * 20.0, [-10.0, -10.0, 0.0], [10.0, 10.0, 20.0]),
+        ("quarter tube", revolve(ring(), 90.0), PI * 75.0 * 5.0, [0.0; 3], [10.0, 10.0, 20.0]),
         (
-            "through hole",
-            part(
-                "h",
-                ModelSpec::Difference {
-                    shape: Box::new(ten()),
-                    tools: vec![cuboid([3.0, 3.0, -1.0], [4.0, 4.0, 12.0])],
-                },
-            ),
+            "revolved torus",
+            revolve(translate([20.0, 0.0, 0.0], circle(5.0)), 360.0),
+            2.0 * PI * PI * 20.0 * 25.0,
+            [-25.0, -25.0, -5.0],
+            [25.0, 25.0, 5.0],
         ),
         (
-            "round hole",
-            part(
-                "r",
-                ModelSpec::Difference {
-                    shape: Box::new(cuboid([0.0; 3], [20.0, 20.0, 4.0])),
-                    tools: vec![translate([10.0, 10.0, -1.0], extrude(circle(3.0), 6.0))],
-                },
-            ),
+            "sphere",
+            translate([1.0, 2.0, 3.0], ModelSpec::Sphere { radius: 5.0 }),
+            4.0 / 3.0 * PI * 125.0,
+            [-4.0, -3.0, -2.0],
+            [6.0, 7.0, 8.0],
         ),
-        ("intersection", part("i", ModelSpec::Intersect { children: vec![ten(), other()] })),
         (
-            "colored parts on plates",
-            ModelSpec::Arrange {
-                gap: 10.0,
-                bed: Some(Bed {
-                    width: 256.0,
-                    depth: 256.0,
-                    height: 256.0,
-                }),
-                children: (0..5u8)
-                    .map(|i| paint([i * 40, 0, 0], part(&format!("p{i}"), extrude(rect(90.0, 90.0), 4.0))))
-                    .collect(),
-            },
+            "cylinder primitive",
+            ModelSpec::Cylinder { radius: 4.0, height: 7.0 },
+            PI * 16.0 * 7.0,
+            [-4.0, -4.0, 0.0],
+            [4.0, 4.0, 7.0],
         ),
-    ]
-}
-
-#[test]
-fn occ_matches_truck() {
-    for (name, spec) in cases() {
-        let truck = summarize(&TruckKernel.build(&spec).unwrap_or_else(|e| panic!("{name}: truck: {e}")));
-        let occ = summarize(&OccKernel::default().build(&spec).unwrap_or_else(|e| panic!("{name}: occ: {e}")));
-
-        for i in 0..3 {
-            assert!((truck.min[i] - occ.min[i]).abs() < 0.05, "{name}: min {:?} vs {:?}", truck.min, occ.min);
-            assert!((truck.max[i] - occ.max[i]).abs() < 0.05, "{name}: max {:?} vs {:?}", truck.max, occ.max);
-        }
-        assert_eq!(truck.colors, occ.colors, "{name}: colors");
-        assert_eq!(truck.plates, occ.plates, "{name}: plates");
-        let names = |s: &Summary| s.parts.iter().map(|p| p.0.clone()).collect::<Vec<_>>();
-        assert_eq!(names(&truck), names(&occ), "{name}: parts");
-        for ((part, t_closed, t_vol), (_, o_closed, o_vol)) in truck.parts.iter().zip(&occ.parts) {
-            assert!(*t_closed && *o_closed, "{name}/{part}: closed truck={t_closed} occ={o_closed}");
-            assert!(*o_vol > 0.0, "{name}/{part}: OCC solid inside-out ({o_vol})");
-            assert!(
-                (t_vol - o_vol).abs() < t_vol.abs() * 0.005,
-                "{name}/{part}: volume truck {t_vol} vs occ {o_vol}"
-            );
-        }
-    }
-}
-
-#[test]
-fn primitives_have_their_exact_volumes_and_sizes() {
-    use std::f64::consts::PI;
-    let cases = [
-        (ModelSpec::Sphere { radius: 5.0 }, 4.0 / 3.0 * PI * 125.0, [-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]),
-        (ModelSpec::Cylinder { radius: 4.0, height: 7.0 }, PI * 16.0 * 7.0, [-4.0, -4.0, 0.0], [4.0, 4.0, 7.0]),
         (
+            "cone",
+            ModelSpec::Cone { radius: 5.0, top: 0.0, height: 8.0 },
+            PI * 25.0 * 8.0 / 3.0,
+            [-5.0, -5.0, 0.0],
+            [5.0, 5.0, 8.0],
+        ),
+        (
+            "frustum",
             ModelSpec::Cone { radius: 5.0, top: 2.0, height: 8.0 },
             PI * 8.0 / 3.0 * (25.0 + 10.0 + 4.0),
             [-5.0, -5.0, 0.0],
             [5.0, 5.0, 8.0],
         ),
-        (ModelSpec::Torus { radius: 20.0, tube: 5.0 }, 2.0 * PI * PI * 20.0 * 25.0, [-25.0, -25.0, -5.0], [25.0, 25.0, 5.0]),
-    ];
-    let kernels: [(&str, Box<dyn Kernel>); 2] = [("truck", Box::new(TruckKernel)), ("occ", Box::new(OccKernel::default()))];
-    for (kernel, mut k) in kernels {
-        for (spec, volume, min, max) in &cases {
-            let s = summarize(&k.build(&part("p", spec.clone())).unwrap_or_else(|e| panic!("{kernel} {spec:?}: {e}")));
-            let got = s.parts[0].2;
-            assert!((got - volume).abs() < volume * 0.01, "{kernel} {spec:?}: volume {got} vs {volume}");
-            for i in 0..3 {
-                assert!((s.min[i] as f64 - min[i]).abs() < 0.05, "{kernel} {spec:?}: min {:?}", s.min);
-                assert!((s.max[i] as f64 - max[i]).abs() < 0.05, "{kernel} {spec:?}: max {:?}", s.max);
-            }
+        (
+            "upside-down cone",
+            ModelSpec::Cone { radius: 0.0, top: 3.0, height: 4.0 },
+            PI * 9.0 * 4.0 / 3.0,
+            [-3.0, -3.0, 0.0],
+            [3.0, 3.0, 4.0],
+        ),
+        (
+            "torus primitive",
+            ModelSpec::Torus { radius: 20.0, tube: 5.0 },
+            2.0 * PI * PI * 20.0 * 25.0,
+            [-25.0, -25.0, -5.0],
+            [25.0, 25.0, 5.0],
+        ),
+        // Overlap: 5 x 4.5 x 4.
+        ("crossing union", ModelSpec::Union { children: vec![ten(), other()] }, 2000.0 - 90.0, [0.0; 3], [15.0, 15.5, 16.0]),
+        (
+            "through hole",
+            ModelSpec::Difference {
+                shape: Box::new(ten()),
+                tools: vec![cuboid([3.0, 3.0, -1.0], [4.0, 4.0, 12.0])],
+            },
+            840.0,
+            [0.0; 3],
+            [10.0; 3],
+        ),
+        (
+            "round hole",
+            ModelSpec::Difference {
+                shape: Box::new(cuboid([0.0; 3], [20.0, 20.0, 4.0])),
+                tools: vec![translate([10.0, 10.0, -1.0], extrude(circle(3.0), 6.0))],
+            },
+            1600.0 - PI * 9.0 * 4.0,
+            [0.0; 3],
+            [20.0, 20.0, 4.0],
+        ),
+        ("intersection", ModelSpec::Intersect { children: vec![ten(), other()] }, 90.0, [5.0, 5.5, 6.0], [10.0; 3]),
+    ]
+}
+
+#[test]
+fn solids_have_their_exact_volumes_and_bounds() {
+    for (name, spec, volume, min, max) in cases() {
+        let s = summarize(&OccKernel::default().build(&part("p", spec)).unwrap_or_else(|e| panic!("{name}: {e}")));
+        assert_eq!(s.parts.len(), 1, "{name}: parts");
+        let (_, closed, got) = &s.parts[0];
+        assert!(*closed, "{name}: not closed");
+        // Meshes are inscribed in curved surfaces, so curved volumes land a little off.
+        assert!((got - volume).abs() < volume * 0.005, "{name}: volume {got} vs {volume}");
+        for i in 0..3 {
+            assert!((s.min[i] as f64 - min[i]).abs() < 0.05, "{name}: min {:?} vs {min:?}", s.min);
+            assert!((s.max[i] as f64 - max[i]).abs() < 0.05, "{name}: max {:?} vs {max:?}", s.max);
         }
     }
 }
 
-/// Exactly what truck-shapeops can't do (its kernel tests pin those failures).
 #[test]
-fn occ_handles_lined_up_faces() {
+fn colored_parts_are_arranged_onto_plates() {
+    let spec = ModelSpec::Arrange {
+        gap: 10.0,
+        bed: Some(Bed {
+            width: 256.0,
+            depth: 256.0,
+            height: 256.0,
+        }),
+        children: (0..5u8)
+            .map(|i| paint([i * 40, 0, 0], part(&format!("p{i}"), extrude(rect(90.0, 90.0), 4.0))))
+            .collect(),
+    };
+    let s = summarize(&OccKernel::default().build(&spec).unwrap());
+    // Two 90 mm squares fit across and down a 256 mm bed: 4 on the first plate.
+    assert_eq!(s.plates, 2);
+    assert_eq!(s.colors, (0..5u8).map(|i| [i * 40, 0, 0]).collect::<Vec<_>>());
+    let names: Vec<_> = s.parts.iter().map(|p| p.0.clone()).collect();
+    assert_eq!(names, ["p0", "p1", "p2", "p3", "p4"]);
+    for (name, closed, volume) in &s.parts {
+        assert!(*closed && (volume - 90.0 * 90.0 * 4.0).abs() < 1e-3, "{name}: {closed} {volume}");
+    }
+}
+
+/// Faces that line up exactly: many kernels' booleans fail on these.
+#[test]
+fn booleans_handle_lined_up_faces() {
     let floor = || cuboid([0.0; 3], [20.0, 20.0, 2.0]);
     let cases = [
         (
@@ -271,7 +302,7 @@ fn occ_handles_lined_up_faces() {
 }
 
 #[test]
-fn occ_validates_like_truck() {
+fn bad_specs_are_rejected() {
     let bad = [
         extrude(rect(0.0, 1.0), 1.0),
         extrude(rect(1.0, 1.0), 0.0),
@@ -285,8 +316,7 @@ fn occ_validates_like_truck() {
         },
     ];
     for spec in bad {
-        assert!(TruckKernel.build(&spec).is_err(), "truck accepted {spec:?}");
-        assert!(OccKernel::default().build(&spec).is_err(), "occ accepted {spec:?}");
+        assert!(OccKernel::default().build(&spec).is_err(), "accepted {spec:?}");
     }
 }
 

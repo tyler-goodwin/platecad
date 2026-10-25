@@ -15,10 +15,8 @@ flowchart LR
   ts["models/*.ts + dsl/cad.ts"] --> script["cad-script (rustyscript)"]
   script -->|"ModelViews: assembled + print? (serde IR)"| pipeline["platecad Pipeline"]
   pipeline -->|"ModelSpec per view"| kernel["Kernel trait"]
-  kernel --> occ["cad-kernel-occ (default, OCCT via cadrum)"]
-  kernel -.->|"--kernel truck, or fallback for bare 2D"| truck["cad-kernel-truck"]
+  kernel --> occ["cad-kernel-occ (OCCT via cadrum)"]
   occ -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
-  truck --> update
   update --> view["cad-view-threed (three-d + egui)"]
   view -->|"ViewerCommand: open folder / model, export, settings"| session["platecad session"]
   session <-->|"settings, last folder"| store["~/.plate/settings.toml"]
@@ -51,8 +49,7 @@ kernel and renderer can each be swapped without touching the others.
 |---|---|
 | `cad-ir` | Serde interchange: `ModelSpec`, `Views<T>`/`ModelViews`, `TessellatedScene`, `MeshQuality`, `Diagnostic`, `Rgb`. No kernel or renderer types. |
 | `cad-kernel` | `trait Kernel { fn build_with(&mut self, &ModelSpec, MeshQuality) -> Result<TessellatedScene> }` (plus `build`, at `Fine`), `KernelError`, and logic every kernel shares: `pack` (arrange layout) and `validate_polygon`. |
-| `cad-kernel-truck` | truck B-rep implementation: builds shells, tessellates, emits normals, colors and edges. |
-| `cad-kernel-occ` | OpenCascade backend via cadrum (statically linked OCCT 8.0.1). Spike: everything except bare 2D profiles at the top of a view. |
+| `cad-kernel-occ` | The kernel: OpenCascade via cadrum (statically linked OCCT 8.0.1). Builds solids, caches the slow ones, and tessellates them with normals, colors, edges and part ranges. |
 | `cad-script` | `trait ScriptHost` plus the rustyscript implementation and its sandboxed import loader. |
 | `cad-view` | `SceneUpdate`, `SceneViews`, `ViewMode`/`ViewSelection` (pure view logic), the viewer protocol (`ViewerMessage`, `ViewerCommand`, `FolderListing`) and `trait ViewportApp`. |
 | `cad-view-threed` | three-d window: orbit camera, lighting, edge cylinders, egui overlay. |
@@ -63,7 +60,7 @@ kernel and renderer can each be swapped without touching the others.
 
 ## IR
 
-`ModelSpec` is a tree the DSL emits and kernels consume. All lengths are
+`ModelSpec` is a tree the DSL emits and the kernel consumes. All lengths are
 **millimeters** (what slicers expect), and +Z is up.
 
 | Node | Meaning |
@@ -74,12 +71,12 @@ kernel and renderer can each be swapped without touching the others.
 | `Polygon { points }` | Planar simple polygon in XY from its outline. Either winding is normalized to counter-clockwise, and the closing point is implied. Fewer than 3 points, repeated points, self-intersection and zero area are rejected. Non-convex shapes (L, U) tessellate and export correctly. |
 | `Extrude { profile, distance, direction? }` | Sweeps a 2D profile `distance` mm along `direction` (normalized, default +Z) into a solid. The face is flipped to point along the sweep (every profile is wound counter-clockwise about +Z), so solids are never inside-out. A direction lying in the profile's plane is an error. |
 | `Revolve { profile, degrees }` | Lathe: the profile is drawn in XY with X as the radius and Y as the height, stood up into XZ, and spun around +Z (default 360°). It must stay at x >= 0; touching the axis is fine (a solid knob). |
-| `Sphere { radius }`, `Cylinder { radius, height }`, `Cone { radius, top, height }`, `Torus { radius, tube }` | Primitive solids. A sphere and torus are centered on the origin (the torus lies flat around +Z); a cylinder and cone stand on the XY plane with their base centered on it. A cone narrows from `radius` to `top` (either may be 0, not both); a torus needs `tube < radius`. Sizes are checked by `validate_primitive` in `cad-kernel`. OCC builds them as analytic surfaces (one smooth face each), which keeps booleans cheap: a revolved polygon has a face per segment. truck builds a sphere by spinning a half circle, and the rest as the equivalent extrude or revolve (`as_sweep`). The DSL's `at` option wraps them in a `Translate`. |
+| `Sphere { radius }`, `Cylinder { radius, height }`, `Cone { radius, top, height }`, `Torus { radius, tube }` | Primitive solids. A sphere and torus are centered on the origin (the torus lies flat around +Z); a cylinder and cone stand on the XY plane with their base centered on it. A cone narrows from `radius` to `top` (either may be 0, not both); a torus needs `tube < radius`. Sizes are checked by `validate_primitive` in `cad-kernel`. They're analytic surfaces (one smooth face each), which keeps booleans cheap: a revolved polygon has a face per segment. The DSL's `at` option wraps them in a `Translate`. |
 | `Translate { offset, shape }` | Moves a shape. Works on profiles and solids. |
 | `Rotate { axis, degrees, origin, shape }` | Rotates about the line through `origin` along `axis` (right-hand rule; the axis is normalized). Works on profiles and solids. |
 | `Group { children }` | Shapes shown together. Not a boolean union. |
-| `Union { children }`, `Difference { shape, tools }`, `Intersect { children }` | Booleans via truck-shapeops, on closed solids. The result keeps the first operand's color and part name. A difference skips tools whose bounds miss the shape. |
-| `Fillet { shape, radius, edges }`, `Chamfer { shape, distance, edges }` | Round or bevel the selected edges of each solid (OCC only; truck reports "needs the OCC kernel"). `edges` are CadQuery-style selectors, unioned; empty means all. `\|X/\|Y/\|Z` picks straight edges parallel to an axis. `>Z/<Z` (and X, Y) picks edges lying at the solid's max/min, measured from its sampled edges because OCC's bounding box is padded. |
+| `Union { children }`, `Difference { shape, tools }`, `Intersect { children }` | Booleans on closed solids, one OCC `BOPAlgo_CellsBuilder` pass per node. Faces that line up exactly (shared planes, solids that only touch, cutters ending flush) work. The result keeps the first operand's color and part name. |
+| `Fillet { shape, radius, edges }`, `Chamfer { shape, distance, edges }` | Round or bevel the selected edges of each solid. `edges` are CadQuery-style selectors, unioned; empty means all. `\|X/\|Y/\|Z` picks straight edges parallel to an axis. `>Z/<Z` (and X, Y) picks edges lying at the solid's max/min, measured from its sampled edges because OCC's bounding box is padded. |
 | `Color { rgb, shape }` | Paints a shape. The innermost color wins; a colored profile colors its extrusion. |
 | `Part { name, shape }` | Names a shape as a part, for export and the part list. The innermost name wins; a named profile names its extrusion. |
 | `Arrange { gap, children, bed? }` | Print layout: drops each child onto the plate (z = 0), moving it as a unit and never rotating it. Rows wrap at the bed width and spill onto more plates, which sit in a grid, and each plate's parts are centered on it. With no bed, rows wrap into a roughly square block centered on the origin. |
@@ -88,47 +85,36 @@ kernel and renderer can each be swapped without touching the others.
 and an optional `print` (parts oriented and arranged for a slicer). A bare
 `ModelSpec` export means assembled-only.
 
-### Booleans and coplanar faces
+### Bare 2D profiles
 
-truck-shapeops works only when the operands' faces cross. Faces that line
-up exactly (two solids sharing a plane, solids that only touch, a cutter
-ending flush with a surface) make it return `None` or **panic**. The kernel
-runs every boolean under `catch_unwind` and turns either into an error that
-says what to change. Models therefore use the subtractive idiom: start from
-a block and subtract cutters that overshoot the faces they cut through. The
-coaster holder is a box minus a cutter poking out of the top and front. A
-caught panic still prints truck's panic message to stderr. Kernel tests pin
-the failing cases, so a truck upgrade that fixes them will show up.
-
-**Booleans leave implicit intersection curves** on their new edges, which
-truck evaluates numerically. After some transforms (arrange moving the
-desk organizer's card holder to (83, 140.2)), that evaluation never
-converged, so tessellation hung and the app never opened its window. Every
-boolean result is therefore made explicit right away, while the curves
-still evaluate reliably: a `Line` when the samples are straight, a 64-segment
-polyline B-spline otherwise. A kernel test moves the card holder to that
-offset under a timeout.
+OCC meshes solids, not lone faces, so a profile shown on its own (not
+extruded or revolved, like `models/square.ts`) is built as a plate
+`FLAT_THICKNESS` (0.01 mm) thick, keeping its color and part name. It
+exports as that plate too. This applies wherever a profile appears outside
+a sweep, so a forgotten `extrude` inside a boolean also gives a thin plate
+rather than an error.
 
 ### Curved edges and bounds
 
-Line edges are their two endpoints. Curved edges (circles, and boolean
-intersection curves) are sampled into 64 segments, which are the viewer's
-edge lines. B-rep bounds (`arrange`, boolean overlap checks) use those
-samples plus the shell's tessellation vertices. The edge samples make
-extrusions exact; the tessellation catches surfaces that bulge between
-their edges (a torus's outer equator isn't an edge), within the tessellation
-tolerance. Mesh
-bounds of curved shapes are within the tessellation tolerance (0.01 mm), so
-tests compare them with that tolerance.
+Edges are sampled at the Fine tolerance for the viewer's edge lines and for
+edge selection. `arrange` needs tight bounds to drop parts onto the plate,
+and OCC's own bounding box is padded by tolerances and loose around curved
+faces (it floated the cat's print view). So `arrange` measures each child
+from the vertices of a Fine mesh of a deep copy (the copy keeps the
+triangulation off the real solid, which a later coarser mesh would
+otherwise reuse). Mesh vertices lie on the surface, so those bounds are
+exact on planar faces and edges, and within 0.01 mm of curved extremes.
+Mesh bounds of curved shapes are inscribed polygons, so tests compare them
+with that tolerance.
 
 ### Mesh quality
 
 `MeshQuality` sets how far a mesh may stray from the true surface: **Draft**
 0.1 mm, **Normal** 0.03 mm, **Fine** 0.01 mm (all with a 0.5 rad angular
-limit). Each kernel takes it in `build_with`, and `build` means Fine, so
+limit). The kernel takes it in `build_with`, and `build` means Fine, so
 tests and the CLI keep their old meshes. Only the triangles depend on it.
-Edge selection (OCC's edge samples) and bounds for `arrange` (truck's
-bounds tessellation) always use Fine, so `fillet(..., { edges })` and print
+Edge selection (edge samples) and bounds for `arrange` (a fine mesh) always
+use Fine, so `fillet(..., { edges })` and print
 layouts don't change with quality. Halving the tolerance roughly doubles
 segments around a circle, and quadruples triangles on doubly curved
 surfaces like fillets. On `playing.ts` (two filleted cups on a filleted
@@ -162,31 +148,28 @@ The cost is that scripts can't query geometry (bounding boxes, areas, edge
 picks). That's why `Arrange` is a kernel node rather than DSL code. The way
 out is a hybrid: keep emitting specs, and add query ops later.
 
-## Kernels: truck and OCC
+## Kernel
 
-Select one with `--kernel occ|truck` (default **`occ`**). With OCC, a
-view it reports as unsupported (today only a bare 2D profile like
-`square.ts`) is built by truck instead. The status line says so ("OK via
-truck (fallback: occ can't build this view)"). Other OCC errors don't fall
-back. Both take the same
-IR and produce the same `TessellatedScene` (parts, colors, plates, edges).
-`crates/cad-kernel-occ/tests/conformance.rs` holds them to that: 14 shared
-cases must match on bounds (0.05 mm), volume (0.5%), part names, colors and
-plates, with every exported object closed.
+There's one kernel, OpenCascade through cadrum, behind the `Kernel` trait
+in `cad-kernel` so the rest of the app only sees the IR. (An earlier
+pure-Rust kernel, truck, was dropped: its booleans failed on lined-up faces
+and curved solids, and it couldn't fillet.)
+`crates/cad-kernel-occ/tests/geometry.rs` checks it against exact values:
+volumes (0.5%), bounds (0.05 mm), part names, colors and plates, with every
+exported object closed.
 
-| | truck | OCC (cadrum) |
-|---|---|---|
-| Booleans with lined-up faces | Fail or panic (caught, hinted error) | Work (shared planes, touching solids, flush cutters) |
-| Implicit boolean curves | Can hang tessellation; made explicit right after each boolean | Not an issue |
-| Desk organizer export (debug) | ~1.1 s | ~0.4 s |
-| Coaster set export (debug) | ~0.2 s | ~0.3 s |
-| Bare 2D profile shown on its own | Yes | Falls back to truck |
-| Fillets, chamfers | No | Yes, with edge selectors |
-| Loft, sweep, shell, STEP | No | Available in cadrum, not exposed yet |
-| Build | Pure Rust | Links a 118 MB prebuilt static OCCT; see below |
-| Solid cache | No | Yes; see below |
+| | |
+|---|---|
+| Booleans with lined-up faces | Work (shared planes, touching solids, flush cutters) |
+| Desk organizer export (debug) | ~0.4 s |
+| Coaster set export (debug) | ~0.3 s |
+| Bare 2D profile shown on its own | A 0.01 mm plate (see "Bare 2D profiles") |
+| Fillets, chamfers | Yes, with edge selectors |
+| Loft, sweep, shell, STEP | Available in cadrum, not exposed yet |
+| Build | Links a 118 MB prebuilt static OCCT; see below |
+| Solid cache | Yes; see below |
 
-**OCC solid cache.** The slow steps are booleans, fillets and chamfers. One
+**Solid cache.** The slow steps are booleans, fillets and chamfers. One
 `CellsBuilder` pass intersects every face of every operand, so its cost grows
 with face count. `OccKernel` therefore keeps the solids each of those nodes
 built, keyed by the subtree's debug text plus the color and part name it
@@ -202,7 +185,8 @@ Solids don't depend on mesh quality, so a quality change or a Fine export
 rebuild only re-meshes. A hit returns deep copies (cheap next to a boolean).
 Entries unused for 4 builds (two reloads) are dropped. Subtrees containing
 an `Arrange` are never cached, because a hit would skip recording plates.
-truck has no cache.
+The tight bounds `arrange` measures for each child (see "Curved edges and
+bounds") are cached the same way.
 
 On `cat.ts` (a fused union of many curved solids, debug build), caching
 takes an export from 21.9 s to 11.8 s, because the print view reuses the
@@ -242,7 +226,7 @@ the repo with `cargo run -p platecad -- …`, or install it with
 `cargo install --path crates/platecad`.
 
 ```
-plate [open] [PATH] [--kernel occ|truck]                       # open the viewer (default occ; PLATE_KERNEL env works too)
+plate [open] [PATH]                                             # open the viewer
 plate export MODEL [-o FILE.3mf] [--view auto|print|assembled] [--quality draft|normal|fine]  # write a 3MF and exit (default fine)
 plate init [DIR]                                                # set up a new project (default: the cwd)
 ```
@@ -475,10 +459,10 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
 |---|---|
 | `models/cube.ts`, `models/square.ts` | The simplest solid and a bare 2D face (assembled-only). |
 | `models/bookshelf.ts` | Parameters, named and colored parts, and an assembled vs. flat-packed print view. At 1 m it's deliberately too big to print, so it triggers the bed warning. |
-| `models/rounded_box.ts` | An open-top box with rounded vertical corners and even walls and floor (`roundedBox()` defaults: 60 × 40 × 30 mm, 3 mm walls; the file's default export may override them): a `|Z`-filleted block minus a cavity filleted with the outer radius minus the wall, which overshoots the top. OCC-only. |
-| `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). Fillets round the plate's and holder's vertical corners, and a 0.8 mm chamfer on the cup's bottom edge stops the first layer flaring, so it's OCC-only. It prints as three closed parts on one 256 mm plate. |
+| `models/rounded_box.ts` | An open-top box with rounded vertical corners and even walls and floor (`roundedBox()` defaults: 60 × 40 × 30 mm, 3 mm walls; the file's default export may override them): a `|Z`-filleted block minus a cavity filleted with the outer radius minus the wall, which overshoots the top. |
+| `models/desk_organizer.ts` | Shows the newer modeling features in one printable set: a pen cup (a `polygon` wall-plus-floor section, `revolve`d), a card holder (a base `union`ed with a back rest made by a slanted `extrude`, then card slots cut with a `difference` of slanted cutters), and a base plate (a `cutout` with `circle` holes for 10 mm magnets). Fillets round the plate's and holder's vertical corners, and a 0.8 mm chamfer on the cup's bottom edge stops the first layer flaring. It prints as three closed parts on one 256 mm plate. |
 | `models/coasters.ts` | A printable multi-filament set. Each coaster is a base plus a raised stripe inlay (stripes rotated on every other one). The holder is a tray with a floor and three walls, open at the front: a box minus an overshooting cutter. Assembled, the stack sits in the holder; for print, everything is packed and centered on 256 mm plates (two plates by default). It exports as 9 closed objects in 3 colors, or `holder: false` for just the coasters. |
-| `models/cat.ts` | A stress test: a sitting cat. The fur is one `union` of a revolved egg body, `sphere` head, haunches and paws, `cone` ears, `cylinder` legs and a curled tail, trimmed flat at z = 0. Eyes, pupils, muzzle, nose, whiskers, a `torus` collar and a bell are separate colored parts. Its print view repeats the assembled cat, which the OCC cache serves. Debug export: 4.7 s at Draft, 8.2 s at Fine (21.9 s before the cache and true spheres, when its spheres were 24-band revolved polygons). OCC-only: truck's booleans can't fuse it. |
+| `models/cat.ts` | A stress test: a sitting cat. The fur is one `union` of a revolved egg body, `sphere` head, haunches and paws, `cone` ears, `cylinder` legs and a curled tail, trimmed flat at z = 0. Eyes, pupils, muzzle, nose, whiskers, a `torus` collar and a bell are separate colored parts. Its print view repeats the assembled cat, which the solid cache serves. Debug export: 6.6 s at Draft, 10.2 s at Fine, about 2 s of which is the fine mesh `arrange` measures it with (reloads in the viewer take that from the cache). Before the cache and true spheres, when its spheres were 24-band revolved polygons, it took 21.9 s. |
 
 ## Testing
 
@@ -490,10 +474,8 @@ launching the window:
 - **The pipeline and watcher run headless** against temp projects with a real
   `notify` watcher. Those tests cover debounce, recovery after errors, DSL
   edits, models outside `models/`, and shutdown.
-- **Repo models are smoke-tested:** every file in `models/` must build with
-  OCC, and any print view must sit on the plate. With truck, a model may
-  instead fail with one of truck's hinted errors (needs OCC, or a boolean it
-  can't do).
+- **Repo models are smoke-tested:** every file in `models/` must build into
+  closed, outward-facing solids, and any print view must sit on the plate.
 - **Model files get shape checks only.** They're edited live, so tests that
   need exact values use inline sources.
 

@@ -284,7 +284,7 @@ mod tests {
 
     use cad_ir::ModelSpec;
     use cad_kernel::Kernel;
-    use cad_kernel_truck::TruckKernel;
+    use cad_kernel_occ::OccKernel;
 
     use super::*;
 
@@ -326,7 +326,7 @@ mod tests {
     }
 
     fn build(spec: &ModelSpec) -> TessellatedScene {
-        TruckKernel.build(spec).unwrap()
+        OccKernel::default().build(spec).unwrap()
     }
 
     /// Closed and consistently oriented: each directed edge appears once and
@@ -371,8 +371,13 @@ mod tests {
 
     #[test]
     fn is_closed_rejects_open_surfaces() {
-        let plate = objects(&build(&part("plate", rect(5.0, 5.0))));
-        assert!(!plate[0].is_closed(), "a lone face has open edges");
+        let triangle = TessellatedScene {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            indices: vec![0, 1, 2],
+            ..Default::default()
+        };
+        assert!(!objects(&triangle)[0].is_closed(), "a lone triangle has open edges");
         let block = objects(&build(&part("block", sized_box(1.0, 1.0, 1.0))));
         assert!(block[0].is_closed());
         // Two disjoint boxes in one part are still closed.

@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use cad_ir::{Bed, Diagnostic, MeshQuality, ModelSpec, ModelViews, TessellatedScene};
 use cad_kernel::Kernel;
 use cad_kernel_occ::OccKernel;
-use cad_kernel_truck::TruckKernel;
 use cad_script::{RustyScriptHost, ScriptHost};
 use cad_view::{
     FileEntry, FolderListing, SceneUpdate, SceneViews, Settings, ViewMode, ViewerCommand, ViewerMessage,
@@ -231,10 +230,6 @@ pub struct OpenArgs {
     /// (the nearest folder up containing `dsl/cad.ts`) in the file list.
     /// Without one, the current folder is opened if it's a project root.
     pub path: Option<PathBuf>,
-
-    /// Geometry kernel.
-    #[arg(long, env = "PLATE_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
-    pub kernel: KernelChoice,
 }
 
 #[derive(Debug, clap::Args)]
@@ -253,10 +248,6 @@ pub struct ExportArgs {
     /// How finely curved surfaces are meshed.
     #[arg(long, value_enum, default_value_t = QualityArg::Fine)]
     pub quality: QualityArg,
-
-    /// Geometry kernel.
-    #[arg(long, env = "PLATE_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
-    pub kernel: KernelChoice,
 }
 
 #[derive(Debug, clap::Args)]
@@ -295,15 +286,6 @@ impl From<QualityArg> for MeshQuality {
             QualityArg::Fine => MeshQuality::Fine,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum KernelChoice {
-    /// truck B-rep kernel (pure Rust; no fillets, fragile booleans).
-    Truck,
-    /// OpenCascade via cadrum (default). Views it can't build yet (a bare 2D
-    /// profile) fall back to truck.
-    Occ,
 }
 
 /// Absolute, lexically normalized path to an existing model file.
@@ -383,8 +365,6 @@ pub struct Pipeline {
     root: PathBuf,
     script: RustyScriptHost,
     kernel: Box<dyn Kernel + Send>,
-    /// Builds views the main kernel reports as unsupported (OCC: bare 2D profiles).
-    fallback: Option<Box<dyn Kernel + Send>>,
     dependencies: BTreeSet<PathBuf>,
     /// Mesh quality of [`Pipeline::evaluate`]'s scenes.
     quality: MeshQuality,
@@ -395,17 +375,12 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// A pipeline meshing at [`MeshQuality::Fine`].
-    pub fn new(root: &Path, kernel: KernelChoice) -> Result<Self, String> {
-        let (kernel, fallback): (Box<dyn Kernel + Send>, Option<Box<dyn Kernel + Send>>) = match kernel {
-            KernelChoice::Truck => (Box::new(TruckKernel), None),
-            KernelChoice::Occ => (Box::new(OccKernel::default()), Some(Box::new(TruckKernel))),
-        };
+    pub fn new(root: &Path) -> Result<Self, String> {
         let script = RustyScriptHost::new(root).map_err(|e| e.to_string())?;
         Ok(Self {
             root: normalize(&std::path::absolute(root).map_err(|e| e.to_string())?),
             script,
-            kernel,
-            fallback,
+            kernel: Box::new(OccKernel::default()),
             dependencies: BTreeSet::new(),
             quality: MeshQuality::Fine,
             last_good: None,
@@ -453,31 +428,23 @@ impl Pipeline {
             Some(config) => views.print.map(|spec| with_default_bed(spec, config.bed)),
             None => views.print,
         };
-        let kernel = self.kernel.name();
         let quality = self.quality;
-        let mut fell_back = false;
-        let assembled = match self.build(&views.assembled, quality, &mut fell_back) {
+        let assembled = match self.kernel.build_with(&views.assembled, quality) {
             Ok(scene) => scene,
-            Err(e) => return SceneUpdate::error(format!("{name}: {kernel} kernel: {e}")),
+            Err(e) => return SceneUpdate::error(format!("{name}: {e}")),
         };
         let print = match print_spec
             .as_ref()
-            .map(|spec| self.build(spec, quality, &mut fell_back))
+            .map(|spec| self.kernel.build_with(spec, quality))
             .transpose()
         {
             Ok(scene) => scene,
-            Err(e) => {
-                return SceneUpdate::error(format!("{name}: {kernel} kernel (print view): {e}"));
-            }
+            Err(e) => return SceneUpdate::error(format!("{name} (print view): {e}")),
         };
         self.last_good = Some(ModelViews {
             assembled: views.assembled,
             print: print_spec,
         });
-        let kernel = match (&self.fallback, fell_back) {
-            (Some(fallback), true) => format!("{} (fallback: {kernel} can't build this view)", fallback.name()),
-            _ => kernel.to_string(),
-        };
 
         let triangles = |scene: &cad_ir::TessellatedScene| scene.indices.len() / 3;
         let print_note = print
@@ -485,7 +452,7 @@ impl Pipeline {
             .map(|p| format!("; print {}", triangles(p)))
             .unwrap_or_default();
         let message = format!(
-            "{name} OK via {kernel} ({} triangles{print_note}, {} mesh, {} ms)",
+            "{name} OK ({} triangles{print_note}, {} mesh, {} ms)",
             triangles(&assembled),
             quality.label().to_lowercase(),
             started.elapsed().as_millis()
@@ -564,35 +531,7 @@ impl Pipeline {
             ViewMode::Assembled => last.assembled.clone(),
             ViewMode::Print => last.print.clone()?,
         };
-        let kernel = self.kernel.name();
-        Some(
-            self.build(&spec, quality, &mut false)
-                .map_err(|e| format!("{kernel} kernel: {e}")),
-        )
-    }
-
-    /// Builds with the main kernel; if it reports the spec unsupported, with
-    /// the fallback (setting `fell_back`). If both fail, the main kernel's
-    /// error is the one that explains.
-    fn build(
-        &mut self,
-        spec: &ModelSpec,
-        quality: MeshQuality,
-        fell_back: &mut bool,
-    ) -> Result<TessellatedScene, cad_kernel::KernelError> {
-        match self.kernel.build_with(spec, quality) {
-            Err(e @ cad_kernel::KernelError::Unsupported(_)) => match &mut self.fallback {
-                Some(fallback) => match fallback.build_with(spec, quality) {
-                    Ok(scene) => {
-                        *fell_back = true;
-                        Ok(scene)
-                    }
-                    Err(_) => Err(e),
-                },
-                None => Err(e),
-            },
-            other => other,
-        }
+        Some(self.kernel.build_with(&spec, quality).map_err(|e| e.to_string()))
     }
 }
 
@@ -860,7 +799,6 @@ impl Store {
 /// sender is dropped.
 pub fn run_session(
     start: Start,
-    kernel: KernelChoice,
     store: Store,
     commands: Receiver<ViewerCommand>,
     tx: Sender<ViewerMessage>,
@@ -879,7 +817,6 @@ pub fn run_session(
         let _ = input_tx.send(Input::ViewerClosed);
     });
     let session = Session {
-        kernel,
         store,
         tx,
         watched: WatchSet::new(watcher),
@@ -934,7 +871,6 @@ struct Change {
 }
 
 struct Session<W: Watcher> {
-    kernel: KernelChoice,
     store: Store,
     tx: Sender<ViewerMessage>,
     watched: WatchSet<W>,
@@ -1094,7 +1030,7 @@ impl<W: Watcher> Session<W> {
             Some(folder) => folder.root.clone(),
             None => project_root(&path),
         };
-        let mut pipeline = match Pipeline::new(&root, self.kernel) {
+        let mut pipeline = match Pipeline::new(&root) {
             Ok(pipeline) => pipeline,
             Err(e) => return self.notice(Diagnostic::error(e)),
         };
@@ -1313,7 +1249,7 @@ mod tests {
         }
 
         fn pipeline(&self) -> Pipeline {
-            Pipeline::new(self.root(), KernelChoice::Truck).unwrap()
+            Pipeline::new(self.root()).unwrap()
         }
 
         fn write(&self, relative: &str, source: &str) {
@@ -1347,7 +1283,7 @@ mod tests {
     fn start_session_with(start: Start, store: Store) -> (Receiver<ViewerMessage>, Running) {
         let (tx, rx) = mpsc::channel();
         let (commands, commands_rx) = mpsc::channel();
-        let handle = thread::spawn(move || run_session(start, KernelChoice::Truck, store, commands_rx, tx));
+        let handle = thread::spawn(move || run_session(start, store, commands_rx, tx));
         (rx, Running { commands, handle })
     }
 
@@ -1424,14 +1360,14 @@ mod tests {
     // --- Pipeline -----------------------------------------------------------
 
     #[test]
-    fn evaluates_model_through_truck() {
+    fn evaluates_model() {
         let project = Project::new(&cube_source(10));
         let update = project.pipeline().evaluate(&project.model());
 
         assert_eq!(update.diagnostics.len(), 1);
         let d = &update.diagnostics[0];
         assert!(d.ok, "{}", d.message);
-        assert!(d.message.contains("model.ts OK via truck (12 triangles"), "{}", d.message);
+        assert!(d.message.contains("model.ts OK (12 triangles"), "{}", d.message);
         assert_eq!(max_extent(&update), 10.0);
     }
 
@@ -1448,19 +1384,19 @@ mod tests {
     }
 
     #[test]
-    fn kernel_error_names_the_kernel() {
-        // A fillet radius bigger than the part: OCC can't build it, and it's
-        // not "unsupported", so there's no fallback.
+    fn kernel_errors_explain() {
+        // A fillet radius bigger than the part.
         let project = Project::new(
             "import { cube, fillet } from \"../dsl/cad.ts\";
 export default () => fillet(cube(2), 5);
 ",
         );
-        let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
+        let mut pipeline = Pipeline::new(project.root()).unwrap();
         let update = pipeline.evaluate(&project.model());
 
         assert!(update.views.is_none());
-        assert!(update.diagnostics[0].message.contains("occ kernel"), "{:?}", update.diagnostics);
+        let message = &update.diagnostics[0].message;
+        assert!(message.starts_with("model.ts: ") && message.contains("too large"), "{message}");
     }
 
     #[test]
@@ -1493,68 +1429,34 @@ export default () => fillet(cube(2), 5);
     }
 
     #[test]
-    fn cli_path_is_optional_and_kernel_defaults_to_occ() {
-        let args = parse_open(&[]);
-        assert_eq!(args.path, None);
-        // A PLATE_KERNEL in the developer's shell legitimately changes the default.
-        if std::env::var_os("PLATE_KERNEL").is_none() {
-            assert_eq!(args.kernel, KernelChoice::Occ);
-        }
-    }
-
-    fn occ_project(model: &str) -> (Project, Pipeline) {
-        let project = Project::new(model);
-        let pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
-        (project, pipeline)
+    fn cli_path_is_optional() {
+        assert_eq!(parse_open(&[]).path, None);
     }
 
     #[test]
-    fn occ_falls_back_to_truck_for_bare_profiles_and_says_so() {
-        let (project, mut pipeline) =
-            occ_project("import { rect } from \"../dsl/cad.ts\";\nexport default () => rect({ width: 3, height: 2 });\n");
-        let update = pipeline.evaluate(&project.model());
-        let d = &update.diagnostics[0];
-        assert!(d.ok, "{:?}", update.diagnostics);
-        assert!(d.message.contains("OK via truck (fallback: occ can't build this view)"), "{}", d.message);
-        assert_eq!(max_extent(&update), 3.0);
-    }
-
-    #[test]
-    fn solids_on_occ_dont_mention_fallback() {
-        let (project, mut pipeline) = occ_project(&cube_source(4));
-        let update = pipeline.evaluate(&project.model());
-        assert!(update.diagnostics[0].message.contains("OK via occ ("), "{:?}", update.diagnostics);
-    }
-
-    #[test]
-    fn fillet_models_need_occ_and_say_so_on_truck() {
-        let source = "import { cube, fillet } from \"../dsl/cad.ts\";\nexport default () => fillet(cube(10), 1, { edges: \"|Z\" });\n";
-        let (project, mut occ) = occ_project(source);
-        let update = occ.evaluate(&project.model());
-        assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
-
+    fn bare_profiles_show_as_thin_plates() {
+        let project =
+            Project::new("import { rect } from \"../dsl/cad.ts\";\nexport default () => rect({ width: 3, height: 2 });\n");
         let update = project.pipeline().evaluate(&project.model());
-        assert!(update.views.is_none());
-        assert!(update.diagnostics[0].message.contains("need the OCC kernel"), "{:?}", update.diagnostics);
+        assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
+        assert_eq!(max_extent(&update), 3.0);
     }
 
     #[test]
     fn cli_open_is_the_default_subcommand() {
         for args in [
-            &["models/bookshelf.ts", "--kernel", "occ"][..],
-            &["open", "models/bookshelf.ts", "--kernel", "occ"][..],
+            &["models/bookshelf.ts"][..],
+            &["open", "models/bookshelf.ts"][..],
         ] {
-            let open = parse_open(args);
-            assert_eq!(open.path, Some(PathBuf::from("models/bookshelf.ts")));
-            assert_eq!(open.kernel, KernelChoice::Occ);
+            assert_eq!(parse_open(args).path, Some(PathBuf::from("models/bookshelf.ts")));
         }
     }
 
     #[test]
-    fn cli_rejects_unknown_kernel_and_extra_args() {
-        let err = parse(&["--kernel", "parasolid"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
-        assert!(err.to_string().contains("truck"), "should list valid kernels: {err}");
+    fn cli_rejects_unknown_flags_and_extra_args() {
+        // There's one kernel, so no --kernel any more.
+        let err = parse(&["--kernel", "occ"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 
         // clap reads a second path as a misplaced subcommand.
         let err = parse(&["a.ts", "b.ts"]).unwrap_err();
@@ -1562,18 +1464,18 @@ export default () => fillet(cube(2), 5);
     }
 
     #[test]
-    fn cli_help_documents_subcommands_kernel_and_env() {
+    fn cli_help_documents_subcommands() {
         let help = |args: &[&str]| {
             let err = parse(args).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
             err.to_string()
         };
         let top = help(&["--help"]);
-        for needle in ["plate", "open", "export", "init", "[PATH]", "--kernel", "PLATE_KERNEL", "truck", "occ"] {
+        for needle in ["plate", "open", "export", "init", "[PATH]"] {
             assert!(top.contains(needle), "help is missing {needle}:\n{top}");
         }
         let export = help(&["export", "--help"]);
-        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "PLATE_KERNEL"] {
+        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "--quality"] {
             assert!(export.contains(needle), "export help is missing {needle}:\n{export}");
         }
     }
@@ -1624,7 +1526,7 @@ export default () => fillet(cube(2), 5);
         assert!(STARTER_PRINTER.contains("P2S"));
 
         // The starter cube builds, and exports to outputs/ by default.
-        let mut pipeline = Pipeline::new(&project, KernelChoice::Truck).unwrap();
+        let mut pipeline = Pipeline::new(&project).unwrap();
         let update = pipeline.evaluate(&model);
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
         assert_eq!(max_extent(&update), 20.0);
@@ -1673,7 +1575,7 @@ export default () => fillet(cube(2), 5);
     fn exports_bookshelf_print_view_by_default() {
         let out_dir = tempfile::tempdir().unwrap();
         let out = out_dir.path().join("shelf.3mf");
-        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
+        let mut pipeline = Pipeline::new(&repo_root()).unwrap();
         let model = repo_root().join("models/bookshelf.ts");
 
         let summary = export_3mf(&mut pipeline, &model, ExportView::Auto, Some(&out)).unwrap();
@@ -1689,7 +1591,7 @@ export default () => fillet(cube(2), 5);
     #[test]
     fn export_view_selection() {
         let out_dir = tempfile::tempdir().unwrap();
-        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
+        let mut pipeline = Pipeline::new(&repo_root()).unwrap();
         let cube = repo_root().join("models/cube.ts");
 
         // A bare-shape model exports its assembled view under auto...
@@ -1766,7 +1668,7 @@ export default () => fillet(cube(2), 5);
         let model = resolve_model(&project.model(), cwd.path()).unwrap();
         let root = project_root(&model);
 
-        let update = Pipeline::new(&root, KernelChoice::Truck)
+        let update = Pipeline::new(&root)
             .unwrap()
             .evaluate(&model);
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
@@ -1786,43 +1688,8 @@ export default () => fillet(cube(2), 5);
     }
 
     #[test]
-    fn every_repo_model_builds_with_truck_or_asks_for_occ() {
-        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
-        let mut count = 0;
-        for entry in std::fs::read_dir(repo_root().join("models")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "ts") {
-                let update = pipeline.evaluate(&path);
-                if !update.diagnostics[0].ok {
-                    // Models using fillets/chamfers are OCC-only, and so are
-                    // ones whose curved booleans are too much for truck (cat.ts).
-                    // Either way truck must give its hinted error, not a crash.
-                    let message = &update.diagnostics[0].message;
-                    assert!(
-                        message.contains("need the OCC kernel") || message.contains("truck can't combine solids"),
-                        "{}: {:?}",
-                        path.display(),
-                        update.diagnostics
-                    );
-                    count += 1;
-                    continue;
-                }
-                let views = update.views.unwrap();
-                assert!(!views.assembled.is_empty(), "{}", path.display());
-                if let Some(print) = &views.print {
-                    assert!(!print.is_empty(), "{} print", path.display());
-                    let aabb = print.aabb().unwrap();
-                    assert!(aabb.min[2].abs() < 1e-3, "{} print floats", path.display());
-                }
-                count += 1;
-            }
-        }
-        assert!(count >= 4, "expected square, cube, bookshelf and coasters; found {count}");
-    }
-
-    #[test]
-    fn every_repo_model_builds_with_occ() {
-        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Occ).unwrap();
+    fn every_repo_model_builds_closed_solids() {
+        let mut pipeline = Pipeline::new(&repo_root()).unwrap();
         for entry in std::fs::read_dir(repo_root().join("models")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|e| e != "ts") {
@@ -1831,14 +1698,12 @@ export default () => fillet(cube(2), 5);
             let update = pipeline.evaluate(&path);
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             assert!(update.diagnostics[0].ok, "{name}: {:?}", update.diagnostics);
-            // square.ts is a bare rect: OCC hands it to truck, and says so.
-            let fell_back = update.diagnostics[0].message.contains("fallback");
-            assert_eq!(fell_back, name == "square.ts", "{name}: {:?}", update.diagnostics);
-            if fell_back {
-                continue; // A flat face: not a solid, nothing to check for closure.
-            }
+            // Every view is closed solids; square.ts, a bare rect, is a thin plate.
             let views = update.views.unwrap();
             for scene in std::iter::once(&views.assembled).chain(views.print.as_ref()) {
+                if let Some(print) = &views.print {
+                    assert!(print.aabb().unwrap().min[2].abs() < 1e-3, "{name}: print floats");
+                }
                 for object in cad_export::objects(scene) {
                     assert!(object.is_closed(), "{name}: {} not closed", object.name);
                     assert!(object.signed_volume() > 0.0, "{name}: {} inside-out", object.name);
@@ -1847,7 +1712,7 @@ export default () => fillet(cube(2), 5);
         }
     }
 
-    /// Bookshelf views through the real script host and truck kernel.
+    /// Bookshelf views through the real script host and kernel.
     fn build_bookshelf_views(params: &str) -> SceneViews {
         let mut script = RustyScriptHost::new(repo_root()).unwrap();
         let source = format!(
@@ -1856,8 +1721,8 @@ export default () => fillet(cube(2), 5);
         );
         let views = script.eval_source("bookshelf_test.ts", &source).unwrap();
         SceneViews {
-            assembled: TruckKernel.build(&views.assembled).unwrap(),
-            print: Some(TruckKernel.build(&views.print.expect("print view")).unwrap()),
+            assembled: OccKernel::default().build(&views.assembled).unwrap(),
+            print: Some(OccKernel::default().build(&views.print.expect("print view")).unwrap()),
         }
     }
 
@@ -2330,7 +2195,7 @@ export default () => organizer();
         let source = std::fs::read_to_string(repo_root().join("models/desk_organizer.ts")).unwrap();
         project.write("models/desk_organizer.ts", &source);
         project.write("printer.toml", &bed_toml(256, 256, 256));
-        let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
+        let mut pipeline = Pipeline::new(project.root()).unwrap();
         let update = pipeline.evaluate(&project.model());
         (update.views.expect("organizer builds"), update.diagnostics)
     }
@@ -2413,7 +2278,7 @@ export default () => organizer();
         );
         let source = std::fs::read_to_string(repo_root().join("models/rounded_box.ts")).unwrap();
         project.write("models/rounded_box.ts", &source);
-        let mut pipeline = Pipeline::new(project.root(), KernelChoice::Occ).unwrap();
+        let mut pipeline = Pipeline::new(project.root()).unwrap();
         let update = pipeline.evaluate(&project.model());
         let scene = update.views.expect("builds").assembled;
 
@@ -2456,7 +2321,7 @@ export default () => roundedBox({ wall: 3, radius: 3 });
 
     #[test]
     fn pipeline_reports_print_view() {
-        let mut pipeline = Pipeline::new(&repo_root(), KernelChoice::Truck).unwrap();
+        let mut pipeline = Pipeline::new(&repo_root()).unwrap();
         let update = pipeline.evaluate(&repo_root().join("models/bookshelf.ts"));
         let message = &update.diagnostics[0].message;
         assert!(message.contains("; print "), "{message}");

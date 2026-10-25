@@ -12,4 +12,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 roxmltree = "0.20"
 cad-kernel.workspace = true
-cad-kernel-truck.workspace = true
+cad-kernel-occ.workspace = true
