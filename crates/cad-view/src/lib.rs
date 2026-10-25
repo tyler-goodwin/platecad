@@ -118,6 +118,9 @@ pub struct FolderListing {
 pub enum ViewerCommand {
     /// Browse this folder and hot-reload from it. Closes the open model.
     OpenFolder(PathBuf),
+    /// Set up a new project in this folder (as `caddy init` does), then open
+    /// it with its starter model.
+    NewProject(PathBuf),
     /// Load this model and watch its dependencies.
     OpenModel(PathBuf),
     /// Write this view (the one on screen) to a 3MF file.

@@ -265,7 +265,8 @@ during a debounce waits its turn instead of being lost.
 
 ### New projects
 
-`caddy init DIR` writes a project that opens, builds and exports as is:
+`caddy init DIR`, or the viewer's "New project…" button, writes a project
+that opens, builds and exports as is:
 
 | File | Contents |
 |---|---|
@@ -295,7 +296,10 @@ outside the crate).
   shows a spinner and "Loading model.ts… 2.3 s" until the result arrives,
   keeping the current meshes. A slow or stuck build shows as a timer that
   keeps counting, never as a missing window.
-- A left **Files panel** has an "Open folder…" button (the native picker
+- A left **Files panel** has a "New project…" button (pick or create an
+  empty folder; the session runs `init_project` there, then opens it on
+  `models/cube.ts`, or explains why not, without writing anything, if the
+  folder already has any starter file), an "Open folder…" button (the native picker
   via `rfd`, run on its own thread so the window keeps drawing) and the
   folder's tree: folders that contain `.ts` files, at any depth, then `.ts`
   files (not `.d.ts`), each sorted case-insensitively. Clicking a file opens

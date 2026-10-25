@@ -636,11 +636,14 @@ pub const STARTER_TSCONFIG: &str = r#"{
 }
 "#;
 
+/// Where `init` puts [`STARTER_MODEL`], relative to the project folder.
+pub const STARTER_MODEL_PATH: &str = "models/cube.ts";
+
 /// What `init` writes, relative to the project folder.
 pub const STARTER_FILES: [(&str, &str); 5] = [
     (PROJECT_MARKER, DSL_SOURCE),
     (PRINTER_CONFIG, STARTER_PRINTER),
-    ("models/cube.ts", STARTER_MODEL),
+    (STARTER_MODEL_PATH, STARTER_MODEL),
     ("tsconfig.json", STARTER_TSCONFIG),
     (".gitignore", "/outputs\n"),
 ];
@@ -846,6 +849,7 @@ impl<W: Watcher> Session<W> {
     fn handle(&mut self, command: ViewerCommand) -> Result<(), Stop> {
         match command {
             ViewerCommand::OpenFolder(folder) => self.open_folder(&folder),
+            ViewerCommand::NewProject(folder) => self.new_project(&folder),
             ViewerCommand::OpenModel(model) => self.open_model(&model),
             ViewerCommand::Export(view) => {
                 let notice = match self.export(view) {
@@ -855,6 +859,21 @@ impl<W: Watcher> Session<W> {
                 self.notice(notice)
             }
         }
+    }
+
+    /// [`init_project`] in `folder`, then opens it on the starter model. On
+    /// failure (say, the folder is already a project) only a notice is sent.
+    fn new_project(&mut self, folder: &Path) -> Result<(), Stop> {
+        if let Err(e) = init_project(folder) {
+            return self.notice(Diagnostic::error(e));
+        }
+        self.open_folder(folder)?;
+        self.open_model(&folder.join(STARTER_MODEL_PATH))?;
+        // After the open, which clears notices in the viewer.
+        self.notice(Diagnostic::ok(format!(
+            "Created a project in {}. Edit {STARTER_MODEL_PATH} and save to see it reload.",
+            folder.display()
+        )))
     }
 
     fn open_folder(&mut self, folder: &Path) -> Result<(), Stop> {
@@ -2768,6 +2787,42 @@ export default () => roundedBox({ wall: 3, radius: 3 });
         assert!(matches!(next_message(&rx), ViewerMessage::Model(None)));
         // Nothing is built until a model is picked.
         assert!(rx.recv_timeout(QUIET).is_err());
+    }
+
+    #[test]
+    fn new_project_sets_up_the_folder_and_opens_its_starter_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("shelf");
+        let (rx, running) = start_session(Start::Empty);
+        running.send(ViewerCommand::NewProject(folder.clone()));
+
+        let listing = next_listing(&rx);
+        assert_eq!(listing.path, folder);
+        assert_eq!(names(&listing.entries), ["dsl/[cad.ts]", "models/[cube.ts]"]);
+        let model = next_matching(&rx, |m| match m {
+            ViewerMessage::Model(Some(model)) => Some(model),
+            _ => None,
+        });
+        assert_eq!(model, folder.join(STARTER_MODEL_PATH));
+        let update = next_result(&rx).unwrap();
+        assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
+        assert_eq!(max_extent(&update), 20.0);
+        let notice = next_notice(&rx);
+        assert!(notice.ok && notice.message.starts_with("Created a project in"), "{notice:?}");
+        assert!(folder.join(PRINTER_CONFIG).is_file());
+    }
+
+    #[test]
+    fn new_project_in_an_existing_project_only_explains() {
+        let project = Project::new(&cube_source(1));
+        let (rx, running) = start_session(Start::Folder(project.root().to_path_buf()));
+        next_listing(&rx);
+
+        running.send(ViewerCommand::NewProject(project.root().to_path_buf()));
+        let notice = next_notice(&rx);
+        assert!(!notice.ok && notice.message.contains("already has dsl/cad.ts"), "{notice:?}");
+        assert!(!project.root().join(STARTER_MODEL_PATH).exists());
+        assert!(!project.root().join(PRINTER_CONFIG).exists());
     }
 
     #[test]

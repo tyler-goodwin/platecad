@@ -114,13 +114,23 @@ impl ViewportApp for ThreeDViewport {
                         .default_size(220.0)
                         .show_inside(ui, |ui| {
                             let busy = picking.load(Ordering::Relaxed);
-                            if ui.add_enabled(!busy, egui::Button::new("Open folder…")).clicked() {
-                                pick_folder(
-                                    state.folder.as_ref().map(|f| f.path.clone()),
-                                    picking.clone(),
-                                    commands.clone(),
-                                );
-                            }
+                            let folder = state.folder.as_ref().map(|f| f.path.clone());
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!busy, egui::Button::new("Open folder…")).clicked() {
+                                    pick_folder(Picker::Open, folder.clone(), picking.clone(), commands.clone());
+                                }
+                                let new = ui
+                                    .add_enabled(!busy, egui::Button::new("New project…"))
+                                    .on_hover_text(
+                                        "Pick or create an empty folder for a printer config, \
+                                         the DSL and a starter model.",
+                                    );
+                                if new.clicked() {
+                                    // Start beside the open folder: new projects are usually siblings.
+                                    let start = folder.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+                                    pick_folder(Picker::NewProject, start, picking.clone(), commands.clone());
+                                }
+                            });
                             ui.separator();
                             match &state.folder {
                                 Some(folder) => {
@@ -292,17 +302,40 @@ fn plate_segments(plates: &[Plate]) -> Vec<([f32; 3], [f32; 3])> {
         .collect()
 }
 
+/// What a folder picked in the native dialog is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Picker {
+    Open,
+    NewProject,
+}
+
+impl Picker {
+    fn title(self) -> &'static str {
+        match self {
+            Picker::Open => "Open folder",
+            Picker::NewProject => "New project: pick or create an empty folder",
+        }
+    }
+
+    fn command(self, folder: PathBuf) -> ViewerCommand {
+        match self {
+            Picker::Open => ViewerCommand::OpenFolder(folder),
+            Picker::NewProject => ViewerCommand::NewProject(folder),
+        }
+    }
+}
+
 /// Shows the native folder picker on its own thread, so the window keeps
-/// drawing, and sends the choice as [`ViewerCommand::OpenFolder`].
-fn pick_folder(start: Option<PathBuf>, picking: Arc<AtomicBool>, commands: Sender<ViewerCommand>) {
+/// drawing, and sends the choice as `picker`'s command.
+fn pick_folder(picker: Picker, start: Option<PathBuf>, picking: Arc<AtomicBool>, commands: Sender<ViewerCommand>) {
     picking.store(true, Ordering::Relaxed);
     std::thread::spawn(move || {
-        let mut dialog = rfd::FileDialog::new().set_title("Open folder");
+        let mut dialog = rfd::FileDialog::new().set_title(picker.title());
         if let Some(start) = start {
             dialog = dialog.set_directory(start);
         }
         if let Some(folder) = dialog.pick_folder() {
-            let _ = commands.send(ViewerCommand::OpenFolder(folder));
+            let _ = commands.send(picker.command(folder));
         }
         picking.store(false, Ordering::Relaxed);
     });
@@ -645,6 +678,13 @@ mod tests {
         assert!(contains(children, Some(Path::new("/p/models/a.ts"))));
         assert!(!contains(children, Some(Path::new("/p/b.ts"))));
         assert!(!contains(children, None));
+    }
+
+    #[test]
+    fn pickers_send_their_own_command() {
+        let folder = PathBuf::from("/p/new");
+        assert_eq!(Picker::Open.command(folder.clone()), ViewerCommand::OpenFolder(folder.clone()));
+        assert_eq!(Picker::NewProject.command(folder.clone()), ViewerCommand::NewProject(folder));
     }
 
     #[test]
