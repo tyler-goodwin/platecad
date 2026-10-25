@@ -27,7 +27,8 @@ flowchart LR
 
 0. The window opens immediately. The session thread (`run_session`) opens
    the folder or model it was started with, announces "Loading model.ts…",
-   then runs steps 1 to 3.
+   and hands the build to the model's worker thread, which runs steps 1
+   and 2.
 1. The script host evaluates the model file's default export into
    `ModelViews { assembled, print? }`.
 2. The pipeline asks the kernel to build each view into a `TessellatedScene`.
@@ -268,9 +269,26 @@ Export button.
 
 ### Session
 
-`run_session` is the app side of the viewer. One thread handles commands
-and file events from a single input channel, so a command that arrives
-during a debounce waits its turn instead of being lost.
+`run_session` is the app side of the viewer. One thread handles commands,
+file events and build results from a single input channel, so a command
+that arrives during a debounce waits its turn instead of being lost.
+
+- **Builds run on a worker.** Each open model gets a thread
+  (`spawn_worker`) that owns its `Pipeline` and runs jobs: evaluations, and
+  export re-meshes. The session never blocks on a build, so picking another
+  model, changing settings or opening a folder answers at once. Results come
+  back as `Input::Built`, tagged with the model's id and the evaluation's
+  sequence number. The session drops results for a model that's been closed,
+  and evaluations older than the newest one asked for. Back-to-back
+  evaluations waiting in a worker's queue collapse into the last one. A
+  build already running can't be stopped (OpenCascade has no cancel), so a
+  superseded or closed model's build finishes in the background, using a
+  core, before its result is dropped. Closing a model drops its job sender,
+  which ends the worker after that. A panic inside a job becomes an error
+  diagnostic rather than a viewer stuck on "Loading…".
+- **Dependencies for the watcher** are copied from each finished evaluation.
+  Until the first one finishes they're just the model file, so saving it
+  mid-build still queues a rebuild.
 
 - **Opened folder.** It's watched recursively (dependency folders inside it
   need no watch of their own). Only creates, removes and renames under it
@@ -282,17 +300,18 @@ during a debounce waits its turn instead of being lost.
   until picked.
 - **Opening a model** outside the opened folder opens its project root
   first. Each opened model gets a fresh `Pipeline` rooted at the folder's
-  project root.
+  project root, and its own worker.
 - **Export** writes the last good build of the view on screen to
   `<root>/outputs/<model>_<view>.3mf` (`export_path`), creating `outputs/`.
   After a failed rebuild that's still what the viewer shows. It's written
-  at the export quality: if the screen shows another quality, the pipeline
+  at the export quality: if the screen shows another quality, the worker
   meshes the last good specs again (`Pipeline::rebuild`, no script run),
-  after an "Exporting model.ts with a fine mesh…" notice. The result (or
-  why there's nothing to export) comes back as a `ViewerMessage::Notice`.
+  after an "Exporting model.ts with a fine mesh…" notice. It queues behind
+  any build in progress, so it exports that build. The result (or why
+  there's nothing to export) comes back as a `ViewerMessage::Notice`.
 - **Settings.** `ViewerCommand::Settings` saves the new settings and, if the
-  view quality changed, rebuilds the open model at it. Each opened model's
-  pipeline starts at the view quality.
+  view quality changed, rebuilds the open model at it. Every evaluation job
+  carries the view quality.
 - The session stops when the viewer drops either channel end.
 
 ### Settings

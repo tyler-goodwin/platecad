@@ -795,8 +795,10 @@ impl Store {
 /// the model rebuilds only when one of its [`Pipeline::dependencies`] changes
 /// (which may be outside the folder, like a project's `dsl/cad.ts`). Change
 /// bursts are debounced by [`DEBOUNCE`]. Settings changes and each opened
-/// folder are saved to `store`. Returns once `tx`'s receiver or `commands`'
-/// sender is dropped.
+/// folder are saved to `store`. Builds and export re-meshes run on the open
+/// model's own worker thread (see [`spawn_worker`]), so commands are handled
+/// while a model builds. Returns once `tx`'s receiver or `commands`' sender
+/// is dropped.
 pub fn run_session(
     start: Start,
     store: Store,
@@ -805,6 +807,7 @@ pub fn run_session(
 ) -> notify::Result<()> {
     let (input_tx, inputs) = mpsc::channel();
     let fs_tx = input_tx.clone();
+    let built_tx = input_tx.clone();
     let watcher = notify::recommended_watcher(move |event| {
         let _ = fs_tx.send(Input::Fs(event));
     })?;
@@ -819,9 +822,11 @@ pub fn run_session(
     let session = Session {
         store,
         tx,
+        built_tx,
         watched: WatchSet::new(watcher),
         folder: None,
         model: None,
+        next_model: 0,
     };
     match session.run(start, inputs) {
         Ok(()) | Err(Stop::ViewerGone) => Ok(()),
@@ -833,6 +838,109 @@ enum Input {
     Fs(notify::Result<notify::Event>),
     Command(ViewerCommand),
     ViewerClosed,
+    /// A build worker finished a job.
+    Built(Built),
+}
+
+/// What the session asks an open model's build worker to do.
+enum Job {
+    /// Run the script and build its views at `quality`. A higher `seq` is a
+    /// newer request.
+    Evaluate { seq: u64, quality: MeshQuality },
+    /// Mesh the last good build's `view` again at `quality` and write it to
+    /// `out` (shown relative to `root`).
+    Export {
+        view: ViewMode,
+        quality: MeshQuality,
+        out: PathBuf,
+        root: PathBuf,
+    },
+}
+
+/// A finished [`Job`], tagged with the [`OpenModel::id`] it was for.
+struct Built {
+    model: u64,
+    outcome: Outcome,
+}
+
+enum Outcome {
+    Evaluated {
+        seq: u64,
+        update: SceneUpdate,
+        quality: MeshQuality,
+        dependencies: BTreeSet<PathBuf>,
+    },
+    Exported(Result<String, String>),
+}
+
+/// Runs one open model's jobs on their own thread, so the session keeps
+/// answering the viewer and the watcher while a model builds. Evaluations
+/// queued back to back collapse into the last one. A job that's already
+/// running can't be stopped (OpenCascade has no cancel), so the session
+/// drops results it no longer wants. The thread ends when the session drops
+/// `jobs`, that is when the model is closed, after any job in progress.
+fn spawn_worker(id: u64, model: PathBuf, mut pipeline: Pipeline, jobs: Receiver<Job>, done: Sender<Input>) {
+    std::thread::spawn(move || {
+        let mut queue = VecDeque::new();
+        while let Some(job) = queue.pop_front().or_else(|| jobs.recv().ok()) {
+            queue.extend(jobs.try_iter());
+            if matches!(job, Job::Evaluate { .. }) && matches!(queue.front(), Some(Job::Evaluate { .. })) {
+                continue;
+            }
+            let outcome = run_job(&mut pipeline, &model, job);
+            if done.send(Input::Built(Built { model: id, outcome })).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+fn run_job(pipeline: &mut Pipeline, model: &Path, job: Job) -> Outcome {
+    let name = model.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    // A panic in the kernel shouldn't leave the viewer waiting forever.
+    let caught = |what: &str| format!("{name}: {what} crashed; edit the model to try again");
+    match job {
+        Job::Evaluate { seq, quality } => {
+            pipeline.set_quality(quality);
+            let update = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pipeline.evaluate(model)))
+                .unwrap_or_else(|_| SceneUpdate::error(caught("the build")));
+            Outcome::Evaluated {
+                seq,
+                update,
+                quality,
+                dependencies: pipeline.dependencies().clone(),
+            }
+        }
+        Job::Export {
+            view,
+            quality,
+            out,
+            root,
+        } => {
+            let export = || match pipeline.rebuild(view, quality) {
+                None => Err(format!("{name} has no print view.")),
+                Some(Err(e)) => Err(format!("{name}: {e}")),
+                Some(Ok(scene)) => {
+                    let objects = write_scene_3mf(&scene, &out)?;
+                    Ok(export_summary(&root, &out, view, quality, objects))
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(export))
+                .unwrap_or_else(|_| Err(caught("the export")));
+            Outcome::Exported(result)
+        }
+    }
+}
+
+/// The notice for a finished viewer export.
+fn export_summary(root: &Path, out: &Path, view: ViewMode, quality: MeshQuality, objects: usize) -> String {
+    let shown = out.strip_prefix(root).unwrap_or(out);
+    format!(
+        "Wrote {} ({} view, {objects} objects, {} mesh)",
+        shown.display(),
+        view.label(),
+        quality.label().to_lowercase()
+    )
 }
 
 /// Why a session stops.
@@ -855,7 +963,15 @@ struct OpenFolder {
 
 struct OpenModel {
     path: PathBuf,
-    pipeline: Pipeline,
+    /// Tags this model's worker results; a closed model's late ones are dropped.
+    id: u64,
+    /// To this model's build worker, which owns its [`Pipeline`].
+    jobs: Sender<Job>,
+    /// [`Pipeline::dependencies`] as of the last finished evaluation; just the
+    /// model until the first one finishes.
+    dependencies: BTreeSet<PathBuf>,
+    /// The `seq` of the newest evaluation asked for. Older results are stale.
+    requested: u64,
     /// The last good build: what the viewer shows, and what export writes
     /// when the export quality matches.
     views: Option<SceneViews>,
@@ -873,9 +989,12 @@ struct Change {
 struct Session<W: Watcher> {
     store: Store,
     tx: Sender<ViewerMessage>,
+    /// Where build workers report back (the session's own inputs).
+    built_tx: Sender<Input>,
     watched: WatchSet<W>,
     folder: Option<OpenFolder>,
     model: Option<OpenModel>,
+    next_model: u64,
 }
 
 impl<W: Watcher> Session<W> {
@@ -898,6 +1017,7 @@ impl<W: Watcher> Session<W> {
             match input {
                 Input::ViewerClosed => return Err(Stop::ViewerGone),
                 Input::Command(command) => self.handle(command)?,
+                Input::Built(built) => self.built(built)?,
                 Input::Fs(event) => {
                     let mut change = self.classify(&event?);
                     if change == Change::default() {
@@ -940,13 +1060,12 @@ impl<W: Watcher> Session<W> {
             ViewerCommand::OpenFolder(folder) => self.open_folder(&folder),
             ViewerCommand::NewProject(folder) => self.new_project(&folder),
             ViewerCommand::OpenModel(model) => self.open_model(&model),
-            ViewerCommand::Export(view) => {
-                let notice = match self.export(view) {
-                    Ok(summary) => Diagnostic::ok(summary),
-                    Err(e) => Diagnostic::error(e),
-                };
-                self.notice(notice)
-            }
+            ViewerCommand::Export(view) => match self.export(view) {
+                Ok(Some(summary)) => self.notice(Diagnostic::ok(summary)),
+                // Handed to the worker; its notice comes back through `built`.
+                Ok(None) => Ok(()),
+                Err(e) => self.notice(Diagnostic::error(e)),
+            },
             ViewerCommand::Settings(settings) => self.change_settings(settings),
         }
     }
@@ -957,10 +1076,6 @@ impl<W: Watcher> Session<W> {
         self.save()?;
         if old.view_quality == settings.view_quality {
             return Ok(());
-        }
-        match &mut self.model {
-            Some(model) => model.pipeline.set_quality(settings.view_quality),
-            None => return Ok(()),
         }
         self.evaluate("Rebuilding")
     }
@@ -1030,43 +1145,83 @@ impl<W: Watcher> Session<W> {
             Some(folder) => folder.root.clone(),
             None => project_root(&path),
         };
-        let mut pipeline = match Pipeline::new(&root) {
+        let pipeline = match Pipeline::new(&root) {
             Ok(pipeline) => pipeline,
             Err(e) => return self.notice(Diagnostic::error(e)),
         };
-        pipeline.set_quality(self.store.state.settings.view_quality);
+        // Replacing the old model drops its job sender, which ends its worker.
+        let id = self.next_model;
+        self.next_model += 1;
+        let (jobs, jobs_rx) = mpsc::channel();
+        spawn_worker(id, path.clone(), pipeline, jobs_rx, self.built_tx.clone());
         self.model = Some(OpenModel {
             path: path.clone(),
-            views_quality: pipeline.quality(),
-            pipeline,
+            id,
+            jobs,
+            dependencies: BTreeSet::from([path.clone()]),
+            requested: 0,
             views: None,
+            views_quality: self.store.state.settings.view_quality,
         });
         self.send(ViewerMessage::Model(Some(path)))?;
+        self.sync_watches()?;
         self.evaluate("Loading")
     }
 
-    /// Announces, evaluates and sends the open model, then re-syncs watches.
+    /// Announces a build of the open model at the view quality and hands it
+    /// to the worker; [`Session::built`] sends the result.
     fn evaluate(&mut self, verb: &str) -> Result<(), Stop> {
+        let quality = self.store.state.settings.view_quality;
         let Some(model) = &mut self.model else {
             return Ok(());
         };
         let name = model.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        self.tx
-            .send(SceneUpdate::loading(format!("{verb} {name}…")).into())
-            .map_err(|_| Stop::ViewerGone)?;
-        let update = model.pipeline.evaluate(&model.path);
-        report(&update);
-        if let Some(views) = &update.views {
-            model.views = Some(views.clone());
-            model.views_quality = model.pipeline.quality();
+        model.requested += 1;
+        let job = Job::Evaluate {
+            seq: model.requested,
+            quality,
+        };
+        if model.jobs.send(job).is_err() {
+            return self.send(SceneUpdate::error(format!("{name}: the build thread stopped; reopen the model")));
         }
-        self.send(update)?;
-        self.sync_watches()
+        self.send(SceneUpdate::loading(format!("{verb} {name}…")))
+    }
+
+    /// A worker's result: sent on if it's for the open model and still
+    /// wanted, else dropped.
+    fn built(&mut self, built: Built) -> Result<(), Stop> {
+        let Some(model) = self.model.as_mut().filter(|m| m.id == built.model) else {
+            return Ok(());
+        };
+        match built.outcome {
+            Outcome::Evaluated {
+                seq,
+                update,
+                quality,
+                dependencies,
+            } => {
+                if seq < model.requested {
+                    return Ok(()); // A newer build is on its way.
+                }
+                report(&update);
+                if let Some(views) = &update.views {
+                    model.views = Some(views.clone());
+                    model.views_quality = quality;
+                }
+                model.dependencies = dependencies;
+                self.send(update)?;
+                self.sync_watches()
+            }
+            Outcome::Exported(result) => self.notice(match result {
+                Ok(summary) => Diagnostic::ok(summary),
+                Err(e) => Diagnostic::error(e),
+            }),
+        }
     }
 
     fn sync_watches(&mut self) -> Result<(), Stop> {
         let empty = BTreeSet::new();
-        let dependencies = self.model.as_ref().map_or(&empty, |m| m.pipeline.dependencies());
+        let dependencies = self.model.as_ref().map_or(&empty, |m| &m.dependencies);
         let folder = self.folder.as_ref().map(|f| f.listing.path.as_path());
         self.watched.sync(dependencies, folder)?;
         Ok(())
@@ -1077,7 +1232,7 @@ impl<W: Watcher> Session<W> {
             reload: self
                 .model
                 .as_ref()
-                .is_some_and(|m| is_relevant(event, m.pipeline.dependencies())),
+                .is_some_and(|m| is_relevant(event, &m.dependencies)),
             listing: self
                 .folder
                 .as_ref()
@@ -1100,9 +1255,11 @@ impl<W: Watcher> Session<W> {
     }
 
     /// Writes the last good build's `view` to [`export_path`], meshed at the
-    /// export quality. A build at another quality is meshed again (announced
-    /// with a progress notice), without re-running the script.
-    fn export(&mut self, view: ViewMode) -> Result<String, String> {
+    /// export quality, and returns the notice. A build at another quality is
+    /// meshed again on the worker, without re-running the script: that's
+    /// announced with a progress notice, returns `None`, and the worker's
+    /// notice follows.
+    fn export(&mut self, view: ViewMode) -> Result<Option<String>, String> {
         let quality = self.store.state.settings.export_quality;
         let root = match (&self.folder, &self.model) {
             (Some(folder), _) => folder.root.clone(),
@@ -1116,34 +1273,28 @@ impl<W: Watcher> Session<W> {
             .as_ref()
             .ok_or_else(|| format!("{name} hasn't built yet, so there's nothing to export."))?;
         let no_print = || format!("{name} has no print view.");
-        let rebuilt;
-        let scene = if model.views_quality == quality {
-            match view {
-                ViewMode::Assembled => &views.assembled,
-                ViewMode::Print => views.print.as_ref().ok_or_else(no_print)?,
-            }
-        } else {
-            if view == ViewMode::Print && views.print.is_none() {
-                return Err(no_print());
-            }
-            let progress = format!("Exporting {name} with a {} mesh…", quality.label().to_lowercase());
-            let _ = self.tx.send(ViewerMessage::Notice(Diagnostic::ok(progress)));
-            rebuilt = model
-                .pipeline
-                .rebuild(view, quality)
-                .ok_or_else(no_print)?
-                .map_err(|e| format!("{name}: {e}"))?;
-            &rebuilt
+        let scene = match view {
+            ViewMode::Assembled => &views.assembled,
+            ViewMode::Print => views.print.as_ref().ok_or_else(no_print)?,
         };
         let out = export_path(&root, &model.path, view);
-        let objects = write_scene_3mf(scene, &out)?;
-        let shown = out.strip_prefix(&root).unwrap_or(&out);
-        Ok(format!(
-            "Wrote {} ({} view, {objects} objects, {} mesh)",
-            shown.display(),
-            view.label(),
-            quality.label().to_lowercase()
-        ))
+        if model.views_quality == quality {
+            let objects = write_scene_3mf(scene, &out)?;
+            return Ok(Some(export_summary(&root, &out, view, quality, objects)));
+        }
+        let job = Job::Export {
+            view,
+            quality,
+            out,
+            root,
+        };
+        model
+            .jobs
+            .send(job)
+            .map_err(|_| format!("{name}: the build thread stopped; reopen the model"))?;
+        let progress = format!("Exporting {name} with a {} mesh…", quality.label().to_lowercase());
+        let _ = self.tx.send(ViewerMessage::Notice(Diagnostic::ok(progress)));
+        Ok(None)
     }
 }
 
@@ -2864,6 +3015,76 @@ export default () => roundedBox({ wall: 3, radius: 3 });
         assert!(rx.recv_timeout(QUIET).is_err());
     }
 
+    /// A cube whose script spins for `ms` first, standing in for a slow build.
+    fn slow_cube_source(size: u32, ms: u32) -> String {
+        format!(
+            "import {{ cube }} from \"../dsl/cad.ts\";
+export default () => {{
+  const end = Date.now() + {ms};
+  while (Date.now() < end) {{}}
+  return cube({size});
+}};
+"
+        )
+    }
+
+    /// Waits for the "Loading…"/"Rebuilding…" announcement.
+    fn next_loading(rx: &Receiver<ViewerMessage>) {
+        next_matching(rx, |m| match m {
+            ViewerMessage::Scene(update) => update.loading,
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn commands_are_handled_while_a_model_builds() {
+        let project = Project::new(&slow_cube_source(5, 3000));
+        project.write("models/fast.ts", &cube_source(20));
+        let (rx, running) = start_session(Start::Model(project.model()));
+        next_loading(&rx);
+
+        // Opening another model doesn't wait for the slow build...
+        let asked = Instant::now();
+        running.send(ViewerCommand::OpenModel(project.root().join("models/fast.ts")));
+        let update = next_result(&rx).unwrap();
+        assert_eq!(max_extent(&update), 20.0, "{:?}", update.diagnostics);
+        assert!(asked.elapsed() < Duration::from_millis(2500), "waited {:?}", asked.elapsed());
+
+        // ...and the slow build's result, when it lands, is dropped.
+        let deadline = Instant::now() + Duration::from_secs(3) + QUIET;
+        while let Ok(message) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            if let ViewerMessage::Scene(update) = message {
+                assert!(update.views.is_none(), "a closed model's build was shown");
+            }
+        }
+    }
+
+    #[test]
+    fn builds_asked_for_during_a_build_collapse_into_the_newest() {
+        let project = Project::new(&slow_cube_source(5, 1500));
+        let (rx, running) = start_session(Start::Model(project.model()));
+        next_loading(&rx);
+
+        let started = Instant::now();
+        let mut settings = Settings::default();
+        for quality in [MeshQuality::Draft, MeshQuality::Fine] {
+            settings.view_quality = quality;
+            running.send(ViewerCommand::Settings(settings));
+        }
+        // The first build is overtaken, and Draft is skipped for Fine: one
+        // result, from the second build to run (three would take ~4.5 s).
+        let update = next_matching(&rx, |m| match m {
+            ViewerMessage::Scene(update) if update.loading.is_none() => Some(update),
+            _ => None,
+        });
+        assert!(update.diagnostics[0].message.contains("fine mesh"), "{:?}", update.diagnostics);
+        assert!(started.elapsed() < Duration::from_millis(4200), "took {:?}", started.elapsed());
+        assert!(
+            !matches!(rx.recv_timeout(QUIET), Ok(ViewerMessage::Scene(_))),
+            "a superseded build was shown"
+        );
+    }
+
     #[test]
     fn new_project_sets_up_the_folder_and_opens_its_starter_model() {
         let dir = tempfile::tempdir().unwrap();
@@ -2879,11 +3100,12 @@ export default () => roundedBox({ wall: 3, radius: 3 });
             _ => None,
         });
         assert_eq!(model, folder.join(STARTER_MODEL_PATH));
+        // The notice comes straight after the open; the build finishes later.
+        let notice = next_notice(&rx);
+        assert!(notice.ok && notice.message.starts_with("Created a project in"), "{notice:?}");
         let update = next_result(&rx).unwrap();
         assert!(update.diagnostics[0].ok, "{:?}", update.diagnostics);
         assert_eq!(max_extent(&update), 20.0);
-        let notice = next_notice(&rx);
-        assert!(notice.ok && notice.message.starts_with("Created a project in"), "{notice:?}");
         assert!(folder.join(PRINTER_CONFIG).is_file());
     }
 

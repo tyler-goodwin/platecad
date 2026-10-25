@@ -33,6 +33,11 @@ the improvement.
 - **Reproducible OCCT fetch.** The documented curl workaround is manual.
   Vendor a fetch script, or switch to cadrum's `source` build (official
   sources; needs CMake).
+- **Cancel superseded builds.** A build that's been overtaken (a newer save,
+  another model picked) runs to the end on its worker before its result is
+  dropped, holding a core. OCCT's booleans and meshing take a
+  `Message_ProgressRange` whose indicator can ask them to stop; cadrum
+  doesn't pass one through, so this is another cadrum patch.
 - **Parallel booleans.** cadrum runs each boolean as one
   `BOPAlgo_CellsBuilder` pass (`builder_cells` in its `src/ffi.cpp`) without
   calling `SetRunParallel(true)`, so a big union uses one core. It's a
