@@ -101,13 +101,15 @@ impl ViewportApp for ThreeDViewport {
                 }
             }
 
+            // Right edge of the files panel, in egui points; the 3D view fills the rest.
+            let mut files_right = 0.0;
             gui.update(
                 &mut frame_input.events,
                 frame_input.accumulated_time,
                 frame_input.viewport,
                 frame_input.device_pixel_ratio,
                 |ui| {
-                    egui::Panel::left("files")
+                    files_right = egui::Panel::left("files")
                         .resizable(true)
                         .default_size(220.0)
                         .show_inside(ui, |ui| {
@@ -134,7 +136,10 @@ impl ViewportApp for ThreeDViewport {
                                     ui.weak("Open a folder to list its models.");
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .rect
+                        .right();
                     egui::Window::new("Model")
                         .default_pos([240.0, 12.0])
                         .resizable(false)
@@ -208,7 +213,11 @@ impl ViewportApp for ThreeDViewport {
             );
 
             state.reframe_if_needed(&mut camera, &mut control);
-            camera.set_viewport(frame_input.viewport);
+            camera.set_viewport(scene_viewport(
+                frame_input.viewport,
+                files_right,
+                frame_input.device_pixel_ratio,
+            ));
             control.handle_events(&mut camera, &mut frame_input.events);
 
             frame_input
@@ -443,6 +452,19 @@ impl ViewState {
             }
         }
         objects
+    }
+}
+
+/// The part of the window right of the files panel, where the model is drawn
+/// and centered. `panel_right` is in egui points; viewports are in physical
+/// pixels. At least one pixel column is always left.
+fn scene_viewport(window: Viewport, panel_right: f32, device_pixel_ratio: f32) -> Viewport {
+    let left = ((panel_right * device_pixel_ratio).round().max(0.0) as u32).min(window.width.saturating_sub(1));
+    Viewport {
+        x: window.x + left as i32,
+        y: window.y,
+        width: window.width - left,
+        height: window.height,
     }
 }
 
@@ -764,6 +786,27 @@ mod tests {
         assert!(f.edge_radius * 2.0 < 18.0 / 4.0, "{}", f.edge_radius);
         // A 10 mm cube still gets a visible line.
         assert!(framing(aabb([0.0; 3], [10.0; 3])).edge_radius >= 1e-3);
+    }
+
+    #[test]
+    fn scene_viewport_starts_right_of_the_files_panel() {
+        let window = Viewport {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let scene = scene_viewport(window, 220.0, 1.0);
+        assert_eq!((scene.x, scene.y, scene.width, scene.height), (220, 0, 1060, 800));
+
+        // Points scale to pixels on high-DPI screens.
+        let hidpi = Viewport { width: 2560, height: 1600, ..window };
+        let scene = scene_viewport(hidpi, 220.4, 2.0);
+        assert_eq!((scene.x, scene.width, scene.height), (441, 2119, 1600));
+
+        // No panel yet, or a panel dragged wider than the window.
+        assert_eq!(scene_viewport(window, 0.0, 1.0), window);
+        assert_eq!(scene_viewport(window, 5000.0, 1.0).width, 1);
     }
 
     #[test]

@@ -300,6 +300,9 @@ outside the crate).
   files (not `.d.ts`), each sorted case-insensitively. Clicking a file opens
   it, and the open model is highlighted with its folders expanded. Nothing
   is skipped by name; empty folders just don't show.
+- The 3D view is drawn in the part of the window right of the panel
+  (`scene_viewport`), so models center in what's visible and the panel
+  can be resized without covering them.
 - Switching models drops the old meshes, diagnostics and notice, and frames
   the camera on the new model when it arrives.
 - The egui overlay has an **Export 3MF** button for the view on screen
