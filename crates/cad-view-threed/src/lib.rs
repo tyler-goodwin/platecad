@@ -1,17 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-use cad_ir::{Aabb, DEFAULT_COLOR, Diagnostic, Plate, TessellatedScene};
+use cad_ir::{Aabb, DEFAULT_COLOR, Diagnostic, MeshQuality, Plate, TessellatedScene};
 use std::time::Instant;
 
 use cad_view::{
-    FileEntry, FolderListing, SceneUpdate, ViewError, ViewMode, ViewSelection, ViewerCommand, ViewerMessage,
-    ViewportApp, loading_status,
+    FileEntry, FolderListing, SceneUpdate, Settings, ViewError, ViewMode, ViewSelection, ViewerCommand,
+    ViewerMessage, ViewportApp, loading_status,
 };
 use three_d::egui;
 use three_d::*;
+use winit::event_loop::EventLoopProxy;
+
+/// Wakes the render loop, which sleeps until the next window event.
+type Waker = EventLoopProxy<()>;
 
 /// Vertical field of view of the viewport camera.
 const FOV_Y_DEGREES: f32 = 45.0;
@@ -53,8 +57,12 @@ impl ViewportApp for ThreeDViewport {
         messages: Receiver<ViewerMessage>,
         commands: Sender<ViewerCommand>,
     ) -> Result<(), ViewError> {
-        let window = open_window(&self.title)?;
+        // Settings come first among the initial messages; the window needs
+        // the antialiasing choice before it opens.
+        let settings = initial_settings(&initial);
+        let (window, waker) = open_window(&self.title, surface_settings(&settings))?;
         let context = window.gl();
+        let messages = forward_waking(messages, waker.clone());
 
         let mut camera = Camera::new_perspective(
             window.viewport(),
@@ -84,12 +92,14 @@ impl ViewportApp for ThreeDViewport {
             folder: None,
             model: None,
             notice: None,
+            settings,
         };
         for message in initial {
             state.receive(message);
         }
         state.reframe_if_needed(&mut camera, &mut control);
         let picking = Arc::new(AtomicBool::new(false));
+        let mut settings_open = false;
 
         window.render_loop(move |mut frame_input| {
             loop {
@@ -119,7 +129,8 @@ impl ViewportApp for ThreeDViewport {
                             let folder = state.folder.as_ref().map(|f| f.path.clone());
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!busy, egui::Button::new("Open folder…")).clicked() {
-                                    pick_folder(Picker::Open, folder.clone(), picking.clone(), commands.clone());
+                                    let waker = waker.clone();
+                                    pick_folder(Picker::Open, folder.clone(), picking.clone(), commands.clone(), waker);
                                 }
                                 let new = ui
                                     .add_enabled(!busy, egui::Button::new("New project…"))
@@ -130,7 +141,8 @@ impl ViewportApp for ThreeDViewport {
                                 if new.clicked() {
                                     // Start beside the open folder: new projects are usually siblings.
                                     let start = folder.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-                                    pick_folder(Picker::NewProject, start, picking.clone(), commands.clone());
+                                    let waker = waker.clone();
+                                    pick_folder(Picker::NewProject, start, picking.clone(), commands.clone(), waker);
                                 }
                             });
                             ui.separator();
@@ -174,6 +186,10 @@ impl ViewportApp for ThreeDViewport {
                                 .on_disabled_hover_text(
                                     "This model has no print view. Export { assembled, print }.",
                                 );
+                                ui.separator();
+                                if ui.selectable_label(settings_open, "⚙").on_hover_text("Settings").clicked() {
+                                    settings_open = !settings_open;
+                                }
                             });
                             let can_export = state.active().is_some();
                             let export = ui
@@ -221,6 +237,17 @@ impl ViewportApp for ThreeDViewport {
                             ui.separator();
                             ui.weak("Drag to orbit, scroll to zoom");
                         });
+                    egui::Window::new("Settings")
+                        .open(&mut settings_open)
+                        .default_pos([240.0, 280.0])
+                        .resizable(false)
+                        .show(ui.ctx(), |ui| {
+                            let before = state.settings;
+                            settings_ui(ui, &mut state.settings);
+                            if state.settings != before {
+                                let _ = commands.send(ViewerCommand::Settings(state.settings));
+                            }
+                        });
                 },
             );
 
@@ -245,18 +272,92 @@ impl ViewportApp for ThreeDViewport {
                 .write(|| gui.render())
                 .unwrap();
 
-            FrameOutput::default()
+            FrameOutput {
+                wait_next_event: !keep_drawing(state.loading.is_some(), gui.context().has_requested_repaint()),
+                ..Default::default()
+            }
         });
 
         Ok(())
     }
 }
 
+/// Whether to draw the next frame right away instead of sleeping until an
+/// input event or app message: while a build runs (its timer ticks) and
+/// while egui animates or has a delayed repaint (a tooltip) pending.
+fn keep_drawing(loading: bool, gui_wants_repaint: bool) -> bool {
+    loading || gui_wants_repaint
+}
+
+/// The settings among the viewer's first messages, or the defaults.
+fn initial_settings(initial: &[ViewerMessage]) -> Settings {
+    initial
+        .iter()
+        .find_map(|m| match m {
+            ViewerMessage::Settings(settings) => Some(*settings),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// three-d's default surface, with multisampling only if antialiasing is on.
+fn surface_settings(settings: &Settings) -> SurfaceSettings {
+    SurfaceSettings {
+        multisamples: if settings.antialiasing { 4 } else { 0 },
+        ..Default::default()
+    }
+}
+
+/// Relays `incoming` to the returned receiver, waking the render loop for
+/// each message, and once more when `incoming` closes so the loop notices.
+fn forward_waking<T: Send + 'static>(incoming: Receiver<T>, waker: Waker) -> Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for message in incoming {
+            if tx.send(message).is_err() {
+                return;
+            }
+            let _ = waker.send_event(());
+        }
+        drop(tx);
+        let _ = waker.send_event(());
+    });
+    rx
+}
+
+/// The settings window's contents. Edits `settings` in place.
+fn settings_ui(ui: &mut egui::Ui, settings: &mut Settings) {
+    egui::Grid::new("settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Mesh on screen")
+            .on_hover_text("Coarser meshes rebuild and draw faster. Changing it rebuilds the model.");
+        quality_picker(ui, &mut settings.view_quality);
+        ui.end_row();
+        ui.label("Mesh for export")
+            .on_hover_text("Used by Export 3MF. A model on screen at another quality is meshed again.");
+        quality_picker(ui, &mut settings.export_quality);
+        ui.end_row();
+    });
+    ui.separator();
+    ui.checkbox(&mut settings.show_edges, "Show edges");
+    ui.checkbox(&mut settings.antialiasing, "Antialiasing")
+        .on_hover_text("Smooths jagged edges at some GPU cost. Applies the next time Plate CAD opens.");
+}
+
+fn quality_picker(ui: &mut egui::Ui, quality: &mut MeshQuality) {
+    ui.horizontal(|ui| {
+        for q in MeshQuality::ALL {
+            ui.selectable_value(quality, q, q.label())
+                .on_hover_text(format!("Within {} mm of the true surface", q.chord_tolerance()));
+        }
+    });
+}
+
 /// The window three-d would open for `WindowSettings { max_size: WINDOW_SIZE }`,
-/// built here so it can carry the app icon.
-fn open_window(title: &str) -> Result<Window, ViewError> {
+/// built here so it can carry the app icon, plus a way to wake its render loop.
+fn open_window(title: &str, surface: SurfaceSettings) -> Result<(Window, Waker), ViewError> {
     use winit::dpi::LogicalSize;
     let event_loop = winit::event_loop::EventLoop::new();
+    let waker = event_loop.create_proxy();
     let (width, height) = WINDOW_SIZE;
     let builder = winit::window::WindowBuilder::new()
         .with_title(title)
@@ -267,8 +368,9 @@ fn open_window(title: &str) -> Result<Window, ViewError> {
         .build(&event_loop)
         .map_err(|e| ViewError::Message(e.to_string()))?;
     window.focus_window();
-    Window::from_winit_window(window, event_loop, SurfaceSettings::default(), false)
-        .map_err(|e| ViewError::Message(e.to_string()))
+    let window =
+        Window::from_winit_window(window, event_loop, surface, false).map_err(|e| ViewError::Message(e.to_string()))?;
+    Ok((window, waker))
 }
 
 /// Title bar and taskbar icon from the executable's embedded icon resource.
@@ -363,8 +465,15 @@ impl Picker {
 }
 
 /// Shows the native folder picker on its own thread, so the window keeps
-/// drawing, and sends the choice as `picker`'s command.
-fn pick_folder(picker: Picker, start: Option<PathBuf>, picking: Arc<AtomicBool>, commands: Sender<ViewerCommand>) {
+/// drawing, and sends the choice as `picker`'s command. Wakes the render
+/// loop when the dialog closes, to re-enable the buttons.
+fn pick_folder(
+    picker: Picker,
+    start: Option<PathBuf>,
+    picking: Arc<AtomicBool>,
+    commands: Sender<ViewerCommand>,
+    waker: Waker,
+) {
     picking.store(true, Ordering::Relaxed);
     std::thread::spawn(move || {
         let mut dialog = rfd::FileDialog::new().set_title(picker.title());
@@ -375,6 +484,7 @@ fn pick_folder(picker: Picker, start: Option<PathBuf>, picking: Arc<AtomicBool>,
             let _ = commands.send(picker.command(folder));
         }
         picking.store(false, Ordering::Relaxed);
+        let _ = waker.send_event(());
     });
 }
 
@@ -452,6 +562,8 @@ struct ViewState {
     model: Option<PathBuf>,
     /// The last command outcome (e.g. "Wrote outputs/cube_print.3mf").
     notice: Option<Diagnostic>,
+    /// As shown in the settings window; the app saves every change.
+    settings: Settings,
 }
 
 impl ViewState {
@@ -472,6 +584,7 @@ impl ViewState {
                 self.model = model;
             }
             ViewerMessage::Notice(notice) => self.notice = Some(notice),
+            ViewerMessage::Settings(settings) => self.settings = settings,
         }
     }
 
@@ -514,7 +627,7 @@ impl ViewState {
             if let Some(model) = &scene.model {
                 objects.push(model);
             }
-            if let Some(edges) = &scene.edges {
+            if let Some(edges) = scene.edges.as_ref().filter(|_| self.settings.show_edges) {
                 objects.push(edges);
             }
             if let Some(plates) = &scene.plates {
@@ -675,6 +788,29 @@ fn to_vec3(p: [f32; 3]) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleeps_between_events_unless_building_or_animating() {
+        assert!(!keep_drawing(false, false));
+        assert!(keep_drawing(true, false));
+        assert!(keep_drawing(false, true));
+    }
+
+    #[test]
+    fn window_takes_initial_settings_for_antialiasing() {
+        let off = Settings {
+            antialiasing: false,
+            ..Default::default()
+        };
+        let initial = [
+            ViewerMessage::Scene(SceneUpdate::loading("Loading x.ts…")),
+            ViewerMessage::Settings(off),
+        ];
+        assert_eq!(initial_settings(&initial), off);
+        assert_eq!(surface_settings(&off).multisamples, 0);
+        assert_eq!(initial_settings(&[]), Settings::default());
+        assert_eq!(surface_settings(&Settings::default()).multisamples, 4);
+    }
 
     fn apply(m: Mat4, p: Vec3) -> Vec3 {
         let q = m * p.extend(1.0);

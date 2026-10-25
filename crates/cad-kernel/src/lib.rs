@@ -1,4 +1,4 @@
-use cad_ir::{Bed, EdgeSelector, ModelSpec, Plate, TessellatedScene};
+use cad_ir::{Bed, EdgeSelector, MeshQuality, ModelSpec, Plate, TessellatedScene};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,7 +14,14 @@ pub enum KernelError {
 pub trait Kernel {
     fn name(&self) -> &'static str;
 
-    fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError>;
+    /// Builds `spec` and meshes it at `quality`. Only the mesh depends on
+    /// `quality`: edge selection and arrange layouts don't.
+    fn build_with(&mut self, spec: &ModelSpec, quality: MeshQuality) -> Result<TessellatedScene, KernelError>;
+
+    /// [`Kernel::build_with`] at [`MeshQuality::Fine`].
+    fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError> {
+        self.build_with(spec, MeshQuality::Fine)
+    }
 }
 
 /// What [`edge_selected`] needs to know about an edge.

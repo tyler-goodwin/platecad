@@ -703,6 +703,7 @@ name = "cad-view"
 version = "0.1.0"
 dependencies = [
  "cad-ir",
+ "serde",
  "thiserror 2.0.21",
 ]
 

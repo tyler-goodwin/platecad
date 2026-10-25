@@ -8,12 +8,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use cad_ir::{Bed, Diagnostic, ModelSpec, TessellatedScene};
+use cad_ir::{Bed, Diagnostic, MeshQuality, ModelSpec, ModelViews, TessellatedScene};
 use cad_kernel::Kernel;
 use cad_kernel_occ::OccKernel;
 use cad_kernel_truck::TruckKernel;
 use cad_script::{RustyScriptHost, ScriptHost};
-use cad_view::{FileEntry, FolderListing, SceneUpdate, SceneViews, ViewMode, ViewerCommand, ViewerMessage};
+use cad_view::{
+    FileEntry, FolderListing, SceneUpdate, SceneViews, Settings, ViewMode, ViewerCommand, ViewerMessage,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -242,6 +244,10 @@ pub struct ExportArgs {
     #[arg(long, value_enum, default_value_t = ExportView::Auto)]
     pub view: ExportView,
 
+    /// How finely curved surfaces are meshed.
+    #[arg(long, value_enum, default_value_t = QualityArg::Fine)]
+    pub quality: QualityArg,
+
     /// Geometry kernel.
     #[arg(long, env = "PLATE_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
@@ -262,6 +268,27 @@ pub enum ExportView {
     Print,
     /// The model as assembled.
     Assembled,
+}
+
+/// [`MeshQuality`] on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QualityArg {
+    /// 0.1 mm from the true surface: fastest.
+    Draft,
+    /// 0.03 mm.
+    Normal,
+    /// 0.01 mm (default).
+    Fine,
+}
+
+impl From<QualityArg> for MeshQuality {
+    fn from(arg: QualityArg) -> Self {
+        match arg {
+            QualityArg::Draft => MeshQuality::Draft,
+            QualityArg::Normal => MeshQuality::Normal,
+            QualityArg::Fine => MeshQuality::Fine,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -353,9 +380,15 @@ pub struct Pipeline {
     /// Builds views the main kernel reports as unsupported (OCC: bare 2D profiles).
     fallback: Option<Box<dyn Kernel + Send>>,
     dependencies: BTreeSet<PathBuf>,
+    /// Mesh quality of [`Pipeline::evaluate`]'s scenes.
+    quality: MeshQuality,
+    /// The specs behind the last successful evaluation, print bed filled in,
+    /// so [`Pipeline::rebuild`] can mesh them again at another quality.
+    last_good: Option<ModelViews>,
 }
 
 impl Pipeline {
+    /// A pipeline meshing at [`MeshQuality::Fine`].
     pub fn new(root: &Path, kernel: KernelChoice) -> Result<Self, String> {
         let (kernel, fallback): (Box<dyn Kernel + Send>, Option<Box<dyn Kernel + Send>>) = match kernel {
             KernelChoice::Truck => (Box::new(TruckKernel), None),
@@ -368,7 +401,18 @@ impl Pipeline {
             kernel,
             fallback,
             dependencies: BTreeSet::new(),
+            quality: MeshQuality::Fine,
+            last_good: None,
         })
+    }
+
+    pub fn quality(&self) -> MeshQuality {
+        self.quality
+    }
+
+    /// Mesh quality for later evaluations.
+    pub fn set_quality(&mut self, quality: MeshQuality) {
+        self.quality = quality;
     }
 
     /// Files the model read on its last successful eval, plus anything a failed
@@ -404,17 +448,26 @@ impl Pipeline {
             None => views.print,
         };
         let kernel = self.kernel.name();
+        let quality = self.quality;
         let mut fell_back = false;
-        let assembled = match self.build(&views.assembled, &mut fell_back) {
+        let assembled = match self.build(&views.assembled, quality, &mut fell_back) {
             Ok(scene) => scene,
             Err(e) => return SceneUpdate::error(format!("{name}: {kernel} kernel: {e}")),
         };
-        let print = match print_spec.map(|spec| self.build(&spec, &mut fell_back)).transpose() {
+        let print = match print_spec
+            .as_ref()
+            .map(|spec| self.build(spec, quality, &mut fell_back))
+            .transpose()
+        {
             Ok(scene) => scene,
             Err(e) => {
                 return SceneUpdate::error(format!("{name}: {kernel} kernel (print view): {e}"));
             }
         };
+        self.last_good = Some(ModelViews {
+            assembled: views.assembled,
+            print: print_spec,
+        });
         let kernel = match (&self.fallback, fell_back) {
             (Some(fallback), true) => format!("{} (fallback: {kernel} can't build this view)", fallback.name()),
             _ => kernel.to_string(),
@@ -426,8 +479,9 @@ impl Pipeline {
             .map(|p| format!("; print {}", triangles(p)))
             .unwrap_or_default();
         let message = format!(
-            "{name} OK via {kernel} ({} triangles{print_note}, {} ms)",
+            "{name} OK via {kernel} ({} triangles{print_note}, {} mesh, {} ms)",
             triangles(&assembled),
+            quality.label().to_lowercase(),
             started.elapsed().as_millis()
         );
 
@@ -495,13 +549,34 @@ pub fn export_3mf(
 }
 
 impl Pipeline {
+    /// `view` of the last successful [`Pipeline::evaluate`], meshed again at
+    /// `quality` without re-running the script. `None` if nothing has built,
+    /// or the view is `Print` and the model has none.
+    pub fn rebuild(&mut self, view: ViewMode, quality: MeshQuality) -> Option<Result<TessellatedScene, String>> {
+        let last = self.last_good.as_ref()?;
+        let spec = match view {
+            ViewMode::Assembled => last.assembled.clone(),
+            ViewMode::Print => last.print.clone()?,
+        };
+        let kernel = self.kernel.name();
+        Some(
+            self.build(&spec, quality, &mut false)
+                .map_err(|e| format!("{kernel} kernel: {e}")),
+        )
+    }
+
     /// Builds with the main kernel; if it reports the spec unsupported, with
     /// the fallback (setting `fell_back`). If both fail, the main kernel's
     /// error is the one that explains.
-    fn build(&mut self, spec: &ModelSpec, fell_back: &mut bool) -> Result<TessellatedScene, cad_kernel::KernelError> {
-        match self.kernel.build(spec) {
+    fn build(
+        &mut self,
+        spec: &ModelSpec,
+        quality: MeshQuality,
+        fell_back: &mut bool,
+    ) -> Result<TessellatedScene, cad_kernel::KernelError> {
+        match self.kernel.build_with(spec, quality) {
             Err(e @ cad_kernel::KernelError::Unsupported(_)) => match &mut self.fallback {
-                Some(fallback) => match fallback.build(spec) {
+                Some(fallback) => match fallback.build_with(spec, quality) {
                     Ok(scene) => {
                         *fell_back = true;
                         Ok(scene)
@@ -703,17 +778,84 @@ pub fn write_scene_3mf(scene: &TessellatedScene, out: &Path) -> Result<usize, St
     })
 }
 
+/// File in [`plate_home`] that [`AppState`] is saved to.
+pub const SETTINGS_FILE: &str = "settings.toml";
+
+/// Folder for per-user state: `$PLATE_HOME` if set, else `.plate` in the
+/// home folder. `None` if there's no home folder to put it in.
+pub fn plate_home() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    var("PLATE_HOME").or_else(|| Some(var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?.join(".plate")))
+}
+
+/// What the viewer remembers between runs, as saved in [`SETTINGS_FILE`].
+/// Missing keys take their defaults, so older files keep loading.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AppState {
+    /// The folder opened last, reopened when `plate` starts without a path.
+    pub last_folder: Option<PathBuf>,
+    pub settings: Settings,
+}
+
+/// [`AppState`] plus the file it's saved to (none: kept in memory only).
+#[derive(Debug, Clone, Default)]
+pub struct Store {
+    path: Option<PathBuf>,
+    pub state: AppState,
+}
+
+impl Store {
+    /// Reads `path`. A missing file gives the defaults; an unreadable or
+    /// malformed one gives the defaults and a warning naming the file, which
+    /// the next save replaces.
+    pub fn load(path: PathBuf) -> (Self, Option<String>) {
+        let (state, warning) = match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(state) => (state, None),
+                Err(e) => (
+                    AppState::default(),
+                    Some(format!("{}: {}; using default settings", path.display(), e.message())),
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (AppState::default(), None),
+            Err(e) => (
+                AppState::default(),
+                Some(format!("{}: {e}; using default settings", path.display())),
+            ),
+        };
+        (Self { path: Some(path), state }, warning)
+    }
+
+    /// A store that never touches the disk.
+    pub fn in_memory(state: AppState) -> Self {
+        Self { path: None, state }
+    }
+
+    /// Writes the state to its file, creating the folder.
+    pub fn save(&self) -> Result<(), String> {
+        let Some(path) = &self.path else { return Ok(()) };
+        let text = toml::to_string(&self.state).map_err(|e| format!("cannot save settings: {e}"))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+}
+
 /// Runs the app side of the viewer until the viewer goes away: opens `start`,
 /// then handles [`ViewerCommand`]s and file changes, sending results on `tx`.
 ///
 /// The opened folder is watched recursively so the file list stays current;
 /// the model rebuilds only when one of its [`Pipeline::dependencies`] changes
 /// (which may be outside the folder, like a project's `dsl/cad.ts`). Change
-/// bursts are debounced by [`DEBOUNCE`]. Returns once `tx`'s receiver or
-/// `commands`' sender is dropped.
+/// bursts are debounced by [`DEBOUNCE`]. Settings changes and each opened
+/// folder are saved to `store`. Returns once `tx`'s receiver or `commands`'
+/// sender is dropped.
 pub fn run_session(
     start: Start,
     kernel: KernelChoice,
+    store: Store,
     commands: Receiver<ViewerCommand>,
     tx: Sender<ViewerMessage>,
 ) -> notify::Result<()> {
@@ -732,6 +874,7 @@ pub fn run_session(
     });
     let session = Session {
         kernel,
+        store,
         tx,
         watched: WatchSet::new(watcher),
         folder: None,
@@ -770,8 +913,11 @@ struct OpenFolder {
 struct OpenModel {
     path: PathBuf,
     pipeline: Pipeline,
-    /// The last good build: what the viewer shows, and what export writes.
+    /// The last good build: what the viewer shows, and what export writes
+    /// when the export quality matches.
     views: Option<SceneViews>,
+    /// The mesh quality `views` was built at.
+    views_quality: MeshQuality,
 }
 
 /// What a burst of file events calls for.
@@ -783,6 +929,7 @@ struct Change {
 
 struct Session<W: Watcher> {
     kernel: KernelChoice,
+    store: Store,
     tx: Sender<ViewerMessage>,
     watched: WatchSet<W>,
     folder: Option<OpenFolder>,
@@ -858,6 +1005,29 @@ impl<W: Watcher> Session<W> {
                 };
                 self.notice(notice)
             }
+            ViewerCommand::Settings(settings) => self.change_settings(settings),
+        }
+    }
+
+    /// Saves `settings`, and rebuilds the open model if its quality changed.
+    fn change_settings(&mut self, settings: Settings) -> Result<(), Stop> {
+        let old = std::mem::replace(&mut self.store.state.settings, settings);
+        self.save()?;
+        if old.view_quality == settings.view_quality {
+            return Ok(());
+        }
+        match &mut self.model {
+            Some(model) => model.pipeline.set_quality(settings.view_quality),
+            None => return Ok(()),
+        }
+        self.evaluate("Rebuilding")
+    }
+
+    /// Saves the store, telling the viewer if that fails.
+    fn save(&self) -> Result<(), Stop> {
+        match self.store.save() {
+            Ok(()) => Ok(()),
+            Err(e) => self.notice(Diagnostic::warning(e)),
         }
     }
 
@@ -892,7 +1062,12 @@ impl<W: Watcher> Session<W> {
         self.model = None;
         self.send(ViewerMessage::Folder(listing))?;
         self.send(ViewerMessage::Model(None))?;
-        self.sync_watches()
+        self.sync_watches()?;
+        if self.store.state.last_folder.as_ref() != Some(&path) {
+            self.store.state.last_folder = Some(path);
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Opens `model`, first opening its project root if it's outside the
@@ -913,12 +1088,14 @@ impl<W: Watcher> Session<W> {
             Some(folder) => folder.root.clone(),
             None => project_root(&path),
         };
-        let pipeline = match Pipeline::new(&root, self.kernel) {
+        let mut pipeline = match Pipeline::new(&root, self.kernel) {
             Ok(pipeline) => pipeline,
             Err(e) => return self.notice(Diagnostic::error(e)),
         };
+        pipeline.set_quality(self.store.state.settings.view_quality);
         self.model = Some(OpenModel {
             path: path.clone(),
+            views_quality: pipeline.quality(),
             pipeline,
             views: None,
         });
@@ -939,6 +1116,7 @@ impl<W: Watcher> Session<W> {
         report(&update);
         if let Some(views) = &update.views {
             model.views = Some(views.clone());
+            model.views_quality = model.pipeline.quality();
         }
         self.send(update)?;
         self.sync_watches()
@@ -979,32 +1157,50 @@ impl<W: Watcher> Session<W> {
         self.send(ViewerMessage::Folder(listing))
     }
 
-    /// Writes the last good build's `view` to [`export_path`].
-    fn export(&self, view: ViewMode) -> Result<String, String> {
-        let model = self.model.as_ref().ok_or("Open a model to export it.")?;
-        let name = model.path.file_name().unwrap_or_default().to_string_lossy();
+    /// Writes the last good build's `view` to [`export_path`], meshed at the
+    /// export quality. A build at another quality is meshed again (announced
+    /// with a progress notice), without re-running the script.
+    fn export(&mut self, view: ViewMode) -> Result<String, String> {
+        let quality = self.store.state.settings.export_quality;
+        let root = match (&self.folder, &self.model) {
+            (Some(folder), _) => folder.root.clone(),
+            (None, Some(model)) => project_root(&model.path),
+            (None, None) => PathBuf::new(),
+        };
+        let model = self.model.as_mut().ok_or("Open a model to export it.")?;
+        let name = model.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let views = model
             .views
             .as_ref()
             .ok_or_else(|| format!("{name} hasn't built yet, so there's nothing to export."))?;
-        let scene = match view {
-            ViewMode::Assembled => &views.assembled,
-            ViewMode::Print => views
-                .print
-                .as_ref()
-                .ok_or_else(|| format!("{name} has no print view."))?,
-        };
-        let root = match &self.folder {
-            Some(folder) => folder.root.clone(),
-            None => project_root(&model.path),
+        let no_print = || format!("{name} has no print view.");
+        let rebuilt;
+        let scene = if model.views_quality == quality {
+            match view {
+                ViewMode::Assembled => &views.assembled,
+                ViewMode::Print => views.print.as_ref().ok_or_else(no_print)?,
+            }
+        } else {
+            if view == ViewMode::Print && views.print.is_none() {
+                return Err(no_print());
+            }
+            let progress = format!("Exporting {name} with a {} mesh…", quality.label().to_lowercase());
+            let _ = self.tx.send(ViewerMessage::Notice(Diagnostic::ok(progress)));
+            rebuilt = model
+                .pipeline
+                .rebuild(view, quality)
+                .ok_or_else(no_print)?
+                .map_err(|e| format!("{name}: {e}"))?;
+            &rebuilt
         };
         let out = export_path(&root, &model.path, view);
         let objects = write_scene_3mf(scene, &out)?;
         let shown = out.strip_prefix(&root).unwrap_or(&out);
         Ok(format!(
-            "Wrote {} ({} view, {objects} objects)",
+            "Wrote {} ({} view, {objects} objects, {} mesh)",
             shown.display(),
-            view.label()
+            view.label(),
+            quality.label().to_lowercase()
         ))
     }
 }
@@ -1139,9 +1335,13 @@ mod tests {
     }
 
     fn start_session(start: Start) -> (Receiver<ViewerMessage>, Running) {
+        start_session_with(start, Store::default())
+    }
+
+    fn start_session_with(start: Start, store: Store) -> (Receiver<ViewerMessage>, Running) {
         let (tx, rx) = mpsc::channel();
         let (commands, commands_rx) = mpsc::channel();
-        let handle = thread::spawn(move || run_session(start, KernelChoice::Truck, commands_rx, tx));
+        let handle = thread::spawn(move || run_session(start, KernelChoice::Truck, store, commands_rx, tx));
         (rx, Running { commands, handle })
     }
 
@@ -1197,9 +1397,10 @@ mod tests {
         })
     }
 
+    /// The next notice, skipping progress ones ("Exporting…").
     fn next_notice(rx: &Receiver<ViewerMessage>) -> Diagnostic {
         next_matching(rx, |m| match m {
-            ViewerMessage::Notice(notice) => Some(notice),
+            ViewerMessage::Notice(notice) if !notice.message.ends_with('…') => Some(notice),
             _ => None,
         })
     }
@@ -2915,7 +3116,10 @@ export default () => roundedBox({ wall: 3, radius: 3 });
         let out = project.root().join("outputs/model_print.3mf");
         assert_eq!(
             notice.message,
-            format!("Wrote {} (print view, 1 objects)", Path::new("outputs").join("model_print.3mf").display())
+            format!(
+                "Wrote {} (print view, 1 objects, fine mesh)",
+                Path::new("outputs").join("model_print.3mf").display()
+            )
         );
         assert_eq!(exported_objects(&out), ["a"]);
 
@@ -2957,5 +3161,112 @@ export default () => roundedBox({ wall: 3, radius: 3 });
         running.send(ViewerCommand::Export(ViewMode::Assembled));
         assert!(next_notice(&rx).ok);
         assert!(project.root().join("outputs/model_assembled.3mf").is_file());
+    }
+
+    // --- Mesh quality and settings -----------------------------------------
+
+    const DISC_SOURCE: &str =
+        "import { circle, extrude } from \"../dsl/cad.ts\";\nexport default () => extrude(circle(40), { distance: 5 });\n";
+
+    fn triangles(update: &SceneUpdate) -> usize {
+        update.views.as_ref().expect("views").assembled.indices.len() / 3
+    }
+
+    #[test]
+    fn pipeline_meshes_at_its_quality_and_rebuilds_the_last_good_specs() {
+        let project = Project::new(DISC_SOURCE);
+        let mut pipeline = project.pipeline();
+        assert_eq!(pipeline.quality(), MeshQuality::Fine);
+        assert!(pipeline.rebuild(ViewMode::Assembled, MeshQuality::Fine).is_none(), "nothing built yet");
+
+        pipeline.set_quality(MeshQuality::Draft);
+        let draft = pipeline.evaluate(&project.model());
+        assert!(draft.diagnostics[0].message.contains("draft mesh"), "{:?}", draft.diagnostics);
+
+        // The script is broken now; the last good spec still rebuilds.
+        project.write_model(&cube_source(0));
+        assert!(pipeline.evaluate(&project.model()).views.is_none());
+        let fine = pipeline.rebuild(ViewMode::Assembled, MeshQuality::Fine).unwrap().unwrap();
+        assert!(fine.indices.len() / 3 > triangles(&draft), "{} vs {}", fine.indices.len() / 3, triangles(&draft));
+        assert!(pipeline.rebuild(ViewMode::Print, MeshQuality::Fine).is_none(), "no print view");
+    }
+
+    #[test]
+    fn export_cli_takes_a_quality() {
+        assert_eq!(parse_export(&["export", "m.ts"]).quality, QualityArg::Fine);
+        let args = parse_export(&["export", "m.ts", "--quality", "draft"]);
+        assert_eq!(MeshQuality::from(args.quality), MeshQuality::Draft);
+    }
+
+    #[test]
+    fn store_round_trips_and_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/settings.toml");
+
+        let (mut store, warning) = Store::load(path.clone());
+        assert_eq!((store.state.clone(), warning), (AppState::default(), None), "missing file");
+        store.state.last_folder = Some(dir.path().join("models"));
+        store.state.settings.view_quality = MeshQuality::Draft;
+        store.state.settings.antialiasing = false;
+        store.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("view_quality = \"draft\""), "{text}");
+        assert_eq!(Store::load(path.clone()).0.state, store.state);
+
+        // Older files without some keys load, with defaults for the rest.
+        std::fs::write(&path, "[settings]\nshow_edges = false\n").unwrap();
+        let (store, warning) = Store::load(path.clone());
+        assert_eq!(warning, None);
+        assert!(!store.state.settings.show_edges && store.state.last_folder.is_none());
+        assert_eq!(store.state.settings.view_quality, Settings::default().view_quality);
+
+        std::fs::write(&path, "[settings]\nview_quality = \"ultra\"\n").unwrap();
+        let (store, warning) = Store::load(path.clone());
+        assert_eq!(store.state, AppState::default());
+        assert!(warning.unwrap().contains("settings.toml"));
+    }
+
+    #[test]
+    fn opening_a_folder_remembers_it() {
+        let project = Project::new(&cube_source(1));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let (rx, running) = start_session_with(Start::Empty, Store::load(path.clone()).0);
+        running.send(ViewerCommand::OpenFolder(project.root().join("models")));
+        next_listing(&rx);
+        // Sent after the save, so the file is written by now.
+        running.send(ViewerCommand::Export(ViewMode::Assembled));
+        next_notice(&rx);
+        assert_eq!(Store::load(path).0.state.last_folder, Some(project.root().join("models")));
+    }
+
+    #[test]
+    fn changing_the_view_quality_rebuilds_and_saves_it() {
+        let project = Project::new(DISC_SOURCE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let (mut store, _) = Store::load(path.clone());
+        store.state.settings.view_quality = MeshQuality::Draft;
+        let draft_settings = store.state.settings;
+        let (rx, running) = start_session_with(Start::Model(project.model()), store);
+        let draft = next_result(&rx).unwrap();
+
+        // Settings that don't affect meshes don't rebuild.
+        running.send(ViewerCommand::Settings(Settings {
+            show_edges: false,
+            ..draft_settings
+        }));
+        assert!(rx.recv_timeout(QUIET).is_err(), "rebuilt for show_edges");
+
+        let fine_settings = Settings {
+            view_quality: MeshQuality::Fine,
+            show_edges: false,
+            ..draft_settings
+        };
+        running.send(ViewerCommand::Settings(fine_settings));
+        let fine = next_result(&rx).unwrap();
+        assert!(fine.diagnostics[0].message.contains("fine mesh"), "{:?}", fine.diagnostics);
+        assert!(triangles(&fine) > triangles(&draft));
+        assert_eq!(Store::load(path).0.state.settings, fine_settings);
     }
 }

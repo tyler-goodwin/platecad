@@ -5,16 +5,22 @@
 //! the top of a view (e.g. `models/square.ts`) is unsupported; OCC builds and
 //! meshes solids.
 
-use cad_ir::{DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
+use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{EdgeShape, Kernel, KernelError, edge_selected, pack, validate_polygon};
 use cadrum::{Boolean, DVec3, Edge, Solid, Tessellation};
 
-/// Absolute chord tolerance (mm), matching the truck kernel's tessellation.
-const TESSELLATION: Tessellation = Tessellation {
-    deflection_linear: 0.01,
-    deflection_angular: 0.5,
-    relative_linear: false,
-};
+/// Edge sampling for selection and bounds, at the finest quality whatever
+/// the mesh quality, so `fillet(..., { edges })` picks the same edges.
+const TESSELLATION: Tessellation = tessellation(MeshQuality::Fine);
+
+/// Absolute chord and angular tolerances for `quality`, as the truck kernel uses.
+const fn tessellation(quality: MeshQuality) -> Tessellation {
+    Tessellation {
+        deflection_linear: quality.chord_tolerance(),
+        deflection_angular: quality.angular_tolerance(),
+        relative_linear: false,
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct OccKernel;
@@ -24,12 +30,12 @@ impl Kernel for OccKernel {
         "occ"
     }
 
-    fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError> {
+    fn build_with(&mut self, spec: &ModelSpec, quality: MeshQuality) -> Result<TessellatedScene, KernelError> {
         let mut plates = Vec::new();
         let bodies = build_solids(spec, &Style::default(), &mut plates)?;
         let mut scene = TessellatedScene::default();
         for (solid, style) in &bodies {
-            tessellate_into(&mut scene, solid, style)?;
+            tessellate_into(&mut scene, solid, style, tessellation(quality))?;
         }
         scene.plates = plates;
         Ok(scene)
@@ -404,10 +410,16 @@ fn to_f32(v: DVec3) -> [f32; 3] {
     [v.x as f32, v.y as f32, v.z as f32]
 }
 
-/// Appends `solid`'s triangles (all painted `style.color`) and edges to
-/// `scene`, recording its vertex and index ranges under its part name.
-fn tessellate_into(scene: &mut TessellatedScene, solid: &Solid, style: &Style) -> Result<(), KernelError> {
-    let mesh = Solid::mesh([solid], TESSELLATION).map_err(occ("meshing"))?;
+/// Appends `solid`'s triangles (all painted `style.color`) and edges, meshed
+/// at `tessellation`, to `scene`, recording its vertex and index ranges under
+/// its part name.
+fn tessellate_into(
+    scene: &mut TessellatedScene,
+    solid: &Solid,
+    style: &Style,
+    tessellation: Tessellation,
+) -> Result<(), KernelError> {
+    let mesh = Solid::mesh([solid], tessellation).map_err(occ("meshing"))?;
     let vertex_start = scene.positions.len() as u32;
     let index_start = scene.indices.len() as u32;
 
@@ -457,5 +469,27 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, KernelError::Unsupported(_)), "{err}");
+    }
+
+    #[test]
+    fn coarser_quality_meshes_curves_with_fewer_triangles_within_tolerance() {
+        let disc = ModelSpec::Extrude {
+            profile: Box::new(ModelSpec::Circle { radius: 40.0 }),
+            distance: 5.0,
+            direction: None,
+        };
+        let triangles: Vec<usize> = MeshQuality::ALL
+            .iter()
+            .map(|&q| {
+                let scene = OccKernel.build_with(&disc, q).unwrap();
+                let aabb = scene.aabb().unwrap();
+                // Inscribed polygon: the rim comes in by at most the chord tolerance.
+                let tol = q.chord_tolerance() as f32 + 1e-4;
+                assert!(aabb.max[0] <= 40.0 + 1e-4 && aabb.max[0] >= 40.0 - tol, "{q:?}: {aabb:?}");
+                scene.indices.len() / 3
+            })
+            .collect();
+        assert!(triangles.windows(2).all(|w| w[0] < w[1]), "{triangles:?}");
+        assert_eq!(OccKernel.build(&disc).unwrap().indices.len() / 3, triangles[2]);
     }
 }

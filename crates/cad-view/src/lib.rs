@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
-use cad_ir::{Diagnostic, TessellatedScene, Views};
+use cad_ir::{Diagnostic, MeshQuality, TessellatedScene, Views};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Tessellated assembled view plus the optional print layout.
@@ -113,6 +114,32 @@ pub struct FolderListing {
     pub entries: Vec<FileEntry>,
 }
 
+/// What the user can change in the viewer's settings window. The app saves
+/// them; missing keys in a saved file take their defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Mesh quality of the models on screen. Changing it rebuilds the model.
+    pub view_quality: MeshQuality,
+    /// Mesh quality of 3MF exports from the viewer.
+    pub export_quality: MeshQuality,
+    /// Draw B-rep edges over the faces.
+    pub show_edges: bool,
+    /// 4x multisampling. Takes effect the next time the window opens.
+    pub antialiasing: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            view_quality: MeshQuality::Normal,
+            export_quality: MeshQuality::Fine,
+            show_edges: true,
+            antialiasing: true,
+        }
+    }
+}
+
 /// What the viewer asks the app to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewerCommand {
@@ -125,6 +152,9 @@ pub enum ViewerCommand {
     OpenModel(PathBuf),
     /// Write this view (the one on screen) to a 3MF file.
     Export(ViewMode),
+    /// The user changed the settings: save them, and rebuild if the view
+    /// quality changed.
+    Settings(Settings),
 }
 
 /// What the app tells the viewer.
@@ -138,6 +168,8 @@ pub enum ViewerMessage {
     Model(Option<PathBuf>),
     /// The outcome of a one-off command, such as an export.
     Notice(Diagnostic),
+    /// The saved settings, sent before the window opens.
+    Settings(Settings),
 }
 
 impl From<SceneUpdate> for ViewerMessage {

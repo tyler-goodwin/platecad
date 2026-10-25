@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use cad_ir::{DEFAULT_COLOR, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
+use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{Kernel, KernelError, pack, validate_polygon};
 use truck_meshalgo::tessellation::{MeshableShape, MeshedShape};
 use truck_modeling::{
@@ -8,7 +8,9 @@ use truck_modeling::{
     Rad, Shell, Solid, Vector3, Wire, builder,
 };
 
-const TESSELLATION_TOL: f64 = 0.01;
+/// Tessellation tolerance for measuring bounds, whatever the mesh quality, so
+/// `arrange` lays parts out the same way at every quality.
+const TESSELLATION_TOL: f64 = MeshQuality::Fine.chord_tolerance();
 /// Geometric tolerance for truck-shapeops, mm.
 const BOOLEAN_TOL: f64 = 0.05;
 /// Segments per curved edge when drawing edges and measuring bounds.
@@ -56,11 +58,11 @@ impl Kernel for TruckKernel {
         "truck"
     }
 
-    fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError> {
+    fn build_with(&mut self, spec: &ModelSpec, quality: MeshQuality) -> Result<TessellatedScene, KernelError> {
         let mut scene = TessellatedScene::default();
         let mut plates = Vec::new();
         for body in build_bodies(spec, &Style::default(), &mut plates)? {
-            tessellate_into(&mut scene, &body);
+            tessellate_into(&mut scene, &body, quality.chord_tolerance());
         }
         scene.plates = plates;
         Ok(scene)
@@ -599,14 +601,15 @@ fn to_vector([x, y, z]: [f64; 3]) -> Vector3 {
     Vector3::new(x, y, z)
 }
 
-/// Appends `body`'s triangles and edges to `scene`, and records its vertex and
-/// index ranges under its part name. A body continuing the previous body's
-/// part extends that range instead of starting a new one.
-fn tessellate_into(scene: &mut TessellatedScene, body: &Body) {
+/// Appends `body`'s triangles (meshed to `tolerance`, mm) and edges to
+/// `scene`, and records its vertex and index ranges under its part name. A
+/// body continuing the previous body's part extends that range instead of
+/// starting a new one.
+fn tessellate_into(scene: &mut TessellatedScene, body: &Body, tolerance: f64) {
     let vertex_start = scene.positions.len() as u32;
     let index_start = scene.indices.len() as u32;
 
-    let mesh = body.shell.triangulation(TESSELLATION_TOL).to_polygon();
+    let mesh = body.shell.triangulation(tolerance).to_polygon();
     let mesh_positions = mesh.positions();
     let mesh_normals = mesh.normals();
 
@@ -1491,6 +1494,22 @@ mod tests {
             outer: Box::new(outer),
             holes,
         }
+    }
+
+    #[test]
+    fn coarser_quality_meshes_curves_with_fewer_triangles_within_tolerance() {
+        let disc = extrude(circle(40.0), 5.0);
+        let triangles: Vec<usize> = MeshQuality::ALL
+            .iter()
+            .map(|&q| {
+                let scene = TruckKernel.build_with(&disc, q).unwrap();
+                let aabb = scene.aabb().unwrap();
+                let tol = q.chord_tolerance() as f32 + 1e-4;
+                assert!(aabb.max[0] <= 40.0 + tol && aabb.max[0] >= 40.0 - tol, "{q:?}: {aabb:?}");
+                scene.indices.len() / 3
+            })
+            .collect();
+        assert!(triangles.windows(2).all(|w| w[0] < w[1]), "{triangles:?}");
     }
 
     #[test]

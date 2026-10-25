@@ -146,6 +146,47 @@ pub struct Plate {
     pub size: [f32; 2],
 }
 
+/// How finely kernels mesh curved surfaces. Coarser meshes build and draw
+/// faster; [`MeshQuality::Fine`] (the default) is what exports use unless told
+/// otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshQuality {
+    Draft,
+    Normal,
+    #[default]
+    Fine,
+}
+
+impl MeshQuality {
+    pub const ALL: [MeshQuality; 3] = [MeshQuality::Draft, MeshQuality::Normal, MeshQuality::Fine];
+
+    /// Largest distance from the mesh to the true surface, mm. Every preset is
+    /// finer than an FDM printer resolves (about 0.1 mm).
+    pub const fn chord_tolerance(self) -> f64 {
+        match self {
+            MeshQuality::Draft => 0.1,
+            MeshQuality::Normal => 0.03,
+            MeshQuality::Fine => 0.01,
+        }
+    }
+
+    /// Largest angle between neighbouring facets, radians. Only matters for
+    /// curves too tight for the chord tolerance to subdivide.
+    pub const fn angular_tolerance(self) -> f64 {
+        0.5
+    }
+
+    /// Capitalized name, for menus.
+    pub fn label(self) -> &'static str {
+        match self {
+            MeshQuality::Draft => "Draft",
+            MeshQuality::Normal => "Normal",
+            MeshQuality::Fine => "Fine",
+        }
+    }
+}
+
 fn full_turn() -> f64 {
     360.0
 }
@@ -279,6 +320,16 @@ impl Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_quality_is_lowercase_and_gets_finer() {
+        assert_eq!(serde_json::to_value(MeshQuality::Normal).unwrap(), "normal");
+        assert_eq!(MeshQuality::default(), MeshQuality::Fine);
+        let tolerances = MeshQuality::ALL.map(MeshQuality::chord_tolerance);
+        assert!(tolerances.windows(2).all(|w| w[0] > w[1]), "{tolerances:?}");
+        // Fine is the tolerance exports have always used.
+        assert_eq!(MeshQuality::Fine.chord_tolerance(), 0.01);
+    }
 
     #[test]
     fn rect_spec_round_trips_ts_shape() {

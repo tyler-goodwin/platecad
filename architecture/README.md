@@ -20,7 +20,8 @@ flowchart LR
   occ -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
   truck --> update
   update --> view["cad-view-threed (three-d + egui)"]
-  view -->|"ViewerCommand: open folder / model, export"| session["platecad session"]
+  view -->|"ViewerCommand: open folder / model, export, settings"| session["platecad session"]
+  session <-->|"settings, last folder"| store["~/.plate/settings.toml"]
   session --> pipeline
   occ -->|"--export, Export 3MF"| export["cad-export (3MF)"]
   watch["notify watcher"] -->|"debounced reload, file list"| session
@@ -48,8 +49,8 @@ kernel and renderer can each be swapped without touching the others.
 
 | Crate | Role |
 |---|---|
-| `cad-ir` | Serde interchange: `ModelSpec`, `Views<T>`/`ModelViews`, `TessellatedScene`, `Diagnostic`, `Rgb`. No kernel or renderer types. |
-| `cad-kernel` | `trait Kernel { fn build(&mut self, &ModelSpec) -> Result<TessellatedScene> }`, `KernelError`, and logic every kernel shares: `pack` (arrange layout) and `validate_polygon`. |
+| `cad-ir` | Serde interchange: `ModelSpec`, `Views<T>`/`ModelViews`, `TessellatedScene`, `MeshQuality`, `Diagnostic`, `Rgb`. No kernel or renderer types. |
+| `cad-kernel` | `trait Kernel { fn build_with(&mut self, &ModelSpec, MeshQuality) -> Result<TessellatedScene> }` (plus `build`, at `Fine`), `KernelError`, and logic every kernel shares: `pack` (arrange layout) and `validate_polygon`. |
 | `cad-kernel-truck` | truck B-rep implementation: builds shells, tessellates, emits normals, colors and edges. |
 | `cad-kernel-occ` | OpenCascade backend via cadrum (statically linked OCCT 8.0.1). Spike: everything except bare 2D profiles at the top of a view. |
 | `cad-script` | `trait ScriptHost` plus the rustyscript implementation and its sandboxed import loader. |
@@ -118,6 +119,20 @@ their edges (a torus's outer equator isn't an edge), within the tessellation
 tolerance. Mesh
 bounds of curved shapes are within the tessellation tolerance (0.01 mm), so
 tests compare them with that tolerance.
+
+### Mesh quality
+
+`MeshQuality` sets how far a mesh may stray from the true surface: **Draft**
+0.1 mm, **Normal** 0.03 mm, **Fine** 0.01 mm (all with a 0.5 rad angular
+limit). Each kernel takes it in `build_with`, and `build` means Fine, so
+tests and the CLI keep their old meshes. Only the triangles depend on it.
+Edge selection (OCC's edge samples) and bounds for `arrange` (truck's
+bounds tessellation) always use Fine, so `fillet(..., { edges })` and print
+layouts don't change with quality. Halving the tolerance roughly doubles
+segments around a circle, and quadruples triangles on doubly curved
+surfaces like fillets. On `playing.ts` (two filleted cups on a filleted
+plate, debug build) an assembled export takes 1.0 s at Draft, 1.2 s at
+Normal and 2.2 s at Fine; the rest is script, booleans and fillets.
 
 `TessellatedScene` holds GPU-ready triangles: positions, normals and sRGB
 colors (one per vertex, de-indexed so corners stay crisp), plus indices and an
@@ -204,14 +219,16 @@ the repo with `cargo run -p platecad -- …`, or install it with
 
 ```
 plate [open] [PATH] [--kernel occ|truck]                       # open the viewer (default occ; PLATE_KERNEL env works too)
-plate export MODEL [-o FILE.3mf] [--view auto|print|assembled]  # write a 3MF and exit, no window
+plate export MODEL [-o FILE.3mf] [--view auto|print|assembled] [--quality draft|normal|fine]  # write a 3MF and exit (default fine)
 plate init [DIR]                                                # set up a new project (default: the cwd)
 ```
 
 `open` is the default subcommand, so `plate models/x.ts` works. PATH is a
 model file or a folder. A model opens with its project root in
 the file list; a folder opens with no model picked. Without PATH, the cwd
-is opened if it's a project root, and otherwise the viewer starts empty.
+is opened if it's a project root. Otherwise the last opened folder is
+reopened if it still exists (see Settings), and failing that the viewer
+starts empty.
 `--view auto` exports the print layout when the model has one, and the
 assembled view otherwise. Without `-o`, export writes
 `<project root>/outputs/<model>_<view>.3mf`, the same place as the viewer's
@@ -260,9 +277,40 @@ during a debounce waits its turn instead of being lost.
   project root.
 - **Export** writes the last good build of the view on screen to
   `<root>/outputs/<model>_<view>.3mf` (`export_path`), creating `outputs/`.
-  After a failed rebuild that's still what the viewer shows. The result
-  (or why there's nothing to export) comes back as a `ViewerMessage::Notice`.
+  After a failed rebuild that's still what the viewer shows. It's written
+  at the export quality: if the screen shows another quality, the pipeline
+  meshes the last good specs again (`Pipeline::rebuild`, no script run),
+  after an "Exporting model.ts with a fine mesh…" notice. The result (or
+  why there's nothing to export) comes back as a `ViewerMessage::Notice`.
+- **Settings.** `ViewerCommand::Settings` saves the new settings and, if the
+  view quality changed, rebuilds the open model at it. Each opened model's
+  pipeline starts at the view quality.
 - The session stops when the viewer drops either channel end.
+
+### Settings
+
+`Store` keeps an `AppState` in `~/.plate/settings.toml` (`$PLATE_HOME`
+overrides the folder; on Windows `~` is `%USERPROFILE%`):
+
+```toml
+last_folder = "C:\\Users\\me\\models"
+
+[settings]
+view_quality = "normal"   # draft | normal | fine: the meshes on screen
+export_quality = "fine"   # Export 3MF in the viewer
+show_edges = true
+antialiasing = true       # 4x MSAA; read when the window opens
+```
+
+- `plate` reads it at startup and sends `ViewerMessage::Settings` first, so
+  the window opens with the right multisampling. The session saves it when
+  settings change and whenever another folder is opened.
+- Missing keys take their defaults, so older files keep loading. An
+  unreadable or malformed file gives the defaults plus a warning (stderr and
+  the overlay), and the next save replaces it.
+- `plate export` doesn't read it; it takes `--quality` (default fine), so
+  scripted exports don't depend on viewer settings. Tests use
+  `Store::default()`, which never touches the disk.
 
 ### New projects
 
@@ -325,6 +373,18 @@ outside the crate).
   (see Session), with the outcome shown under it, an **Assembled/Print toggle** (Print is disabled when
   the model has no print view), a collapsible **part list** for the shown
   view (name and triangle count), reload diagnostics and an orbit hint.
+- A **⚙** next to the view toggle opens the settings window: mesh quality
+  on screen and for export (Draft/Normal/Fine), show edges, and antialiasing
+  (applies the next time the window opens). Each change goes to the session
+  as `ViewerCommand::Settings` to be saved; edges toggle at once.
+- **Redraw on demand.** The render loop sleeps until something happens
+  (`wait_next_event`). Input events wake it. So do app messages: a thread
+  forwards the session's channel and wakes the loop with an
+  `EventLoopProxy` event per message (`forward_waking`), and once more when
+  the channel closes. The folder picker wakes it when it closes. While a
+  build runs (its timer ticks) or egui wants a repaint, it keeps drawing
+  (`keep_drawing`). Before this it redrew every frame, keeping laptop GPUs
+  busy with a still model.
 - In Print view, build plates are outlined in blue at z = 0, and framing
   includes them.
 - The camera frames the shown view when it first appears and when you switch
