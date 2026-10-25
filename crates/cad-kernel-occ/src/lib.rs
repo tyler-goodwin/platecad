@@ -23,7 +23,16 @@ const fn tessellation(quality: MeshQuality) -> Tessellation {
 }
 
 #[derive(Debug, Default)]
-pub struct OccKernel;
+pub struct OccKernel {
+    cache: SolidCache,
+}
+
+impl OccKernel {
+    /// Booleans, fillets and chamfers answered from the cache so far.
+    pub fn cache_hits(&self) -> usize {
+        self.cache.hits
+    }
+}
 
 impl Kernel for OccKernel {
     fn name(&self) -> &'static str {
@@ -31,15 +40,87 @@ impl Kernel for OccKernel {
     }
 
     fn build_with(&mut self, spec: &ModelSpec, quality: MeshQuality) -> Result<TessellatedScene, KernelError> {
-        let mut plates = Vec::new();
-        let bodies = build_solids(spec, &Style::default(), &mut plates)?;
+        let mut build = Build {
+            plates: Vec::new(),
+            cache: &mut self.cache,
+        };
+        let bodies = build_solids(spec, &Style::default(), &mut build);
+        let plates = build.plates;
+        self.cache.end_build();
         let mut scene = TessellatedScene::default();
-        for (solid, style) in &bodies {
+        for (solid, style) in &bodies? {
             tessellate_into(&mut scene, solid, style, tessellation(quality))?;
         }
         scene.plates = plates;
         Ok(scene)
     }
+}
+
+/// How many builds an unused cache entry survives. A reload builds two views
+/// (assembled and print), so entries outlive one edit that skips them.
+const CACHE_BUILDS: u64 = 4;
+
+/// Results of the slow operations (booleans, fillets, chamfers), keyed by
+/// the subtree and the style it inherits. They're reused within a build,
+/// e.g. a print view that repeats the assembled parts, and across builds,
+/// so a reload only redoes the parts whose specs changed. Solids don't
+/// depend on mesh quality, so a quality change reuses them too.
+#[derive(Debug, Default)]
+struct SolidCache {
+    entries: std::collections::HashMap<String, CacheEntry>,
+    build: u64,
+    hits: usize,
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    bodies: Bodies,
+    last_used: u64,
+}
+
+impl SolidCache {
+    /// The cache key for `spec`, or `None` if it isn't worth caching or
+    /// can't be: an `arrange` inside records plates as it builds, which a
+    /// cache hit would skip. (Matching the debug text is crude but errs
+    /// safe: a part named "Arrange {" just goes uncached.)
+    fn key(spec: &ModelSpec, style: &Style) -> Option<String> {
+        let slow = matches!(
+            spec,
+            ModelSpec::Union { .. }
+                | ModelSpec::Intersect { .. }
+                | ModelSpec::Difference { .. }
+                | ModelSpec::Fillet { .. }
+                | ModelSpec::Chamfer { .. }
+        );
+        let key = format!("{style:?} {spec:?}");
+        (slow && !key.contains("Arrange {")).then_some(key)
+    }
+
+    /// A copy of the cached bodies (solids are deep-copied: cheap next to a boolean).
+    fn get(&mut self, key: &str) -> Option<Bodies> {
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = self.build;
+        self.hits += 1;
+        Some(entry.bodies.clone())
+    }
+
+    fn insert(&mut self, key: String, bodies: Bodies) {
+        let last_used = self.build;
+        self.entries.insert(key, CacheEntry { bodies, last_used });
+    }
+
+    /// Forgets entries no recent build has used.
+    fn end_build(&mut self) {
+        let build = self.build;
+        self.entries.retain(|_, e| build - e.last_used < CACHE_BUILDS);
+        self.build += 1;
+    }
+}
+
+/// One build's state: the plates `arrange` lays out, and the kernel's cache.
+struct Build<'a> {
+    plates: Vec<Plate>,
+    cache: &'a mut SolidCache,
 }
 
 /// Presentation inherited down the spec tree. The innermost `Color`/`Part` wins.
@@ -171,7 +252,19 @@ fn profile_points(loops: &[Vec<Edge>]) -> Vec<DVec3> {
 
 type Bodies = Vec<(Solid, Style)>;
 
-fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Result<Bodies, KernelError> {
+fn build_solids(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bodies, KernelError> {
+    let Some(key) = SolidCache::key(spec, style) else {
+        return build_uncached(spec, style, build);
+    };
+    if let Some(bodies) = build.cache.get(&key) {
+        return Ok(bodies);
+    }
+    let bodies = build_uncached(spec, style, build)?;
+    build.cache.insert(key, bodies.clone());
+    Ok(bodies)
+}
+
+fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bodies, KernelError> {
     match spec {
         ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } | ModelSpec::Circle { .. } | ModelSpec::Cutout { .. } => {
             Err(KernelError::Unsupported(
@@ -224,7 +317,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
         }
         ModelSpec::Translate { offset, shape } => {
             let v = vec3(*offset);
-            Ok(build_solids(shape, style, plates)?
+            Ok(build_solids(shape, style, build)?
                 .into_iter()
                 .map(|(s, st)| (s.translate(v), st))
                 .collect())
@@ -236,7 +329,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             shape,
         } => {
             let (axis, angle, origin) = rotation(*axis, *degrees, *origin)?;
-            Ok(build_solids(shape, style, plates)?
+            Ok(build_solids(shape, style, build)?
                 .into_iter()
                 .map(|(s, st)| (s.rotate(origin, axis, angle), st))
                 .collect())
@@ -247,7 +340,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             }
             let mut bodies = Vec::new();
             for child in children {
-                bodies.extend(build_solids(child, style, plates)?);
+                bodies.extend(build_solids(child, style, build)?);
             }
             Ok(bodies)
         }
@@ -257,7 +350,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
                 color: *rgb,
                 ..style.clone()
             },
-            plates,
+            build,
         ),
         ModelSpec::Part { name, shape } => build_solids(
             shape,
@@ -265,7 +358,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
                 part: Some(part_name(name)?),
                 ..style.clone()
             },
-            plates,
+            build,
         ),
         ModelSpec::Fillet { shape, radius, edges } | ModelSpec::Chamfer { shape, distance: radius, edges } => {
             let fillet = matches!(spec, ModelSpec::Fillet { .. });
@@ -274,7 +367,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
                 return Err(invalid(format!("{op} {size} must be positive")));
             }
             let mut result = Vec::new();
-            for (solid, body_style) in build_solids(shape, style, plates)? {
+            for (solid, body_style) in build_solids(shape, style, build)? {
                 let (min, max) = edge_bounds(&solid);
                 let picked: Vec<&Edge> = solid
                     .iter_edge()
@@ -306,7 +399,7 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             let op = if matches!(spec, ModelSpec::Union { .. }) { "union" } else { "intersect" };
             let mut operands = Vec::new();
             for child in children {
-                operands.extend(build_solids(child, style, plates)?);
+                operands.extend(build_solids(child, style, build)?);
             }
             let Some((first, first_style)) = operands.first() else {
                 return Err(invalid(format!("{op} needs at least one shape")));
@@ -327,10 +420,10 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             }
             let mut cutters = Vec::new();
             for tool in tools {
-                cutters.extend(build_solids(tool, style, plates)?);
+                cutters.extend(build_solids(tool, style, build)?);
             }
             let mut result = Vec::new();
-            for (base, base_style) in build_solids(shape, style, plates)? {
+            for (base, base_style) in build_solids(shape, style, build)? {
                 let mut expr = Boolean::from(&base);
                 for (cutter, _) in &cutters {
                     expr = expr - cutter;
@@ -356,13 +449,13 @@ fn build_solids(spec: &ModelSpec, style: &Style, plates: &mut Vec<Plate>) -> Res
             let mut built = Vec::new();
             let mut footprints = Vec::new();
             for child in children {
-                let bodies = build_solids(child, style, plates)?;
+                let bodies = build_solids(child, style, build)?;
                 let (min, max) = bounds(&bodies).ok_or_else(|| invalid("arrange child has no geometry"))?;
                 footprints.push([max.x - min.x, max.y - min.y]);
                 built.push((bodies, min));
             }
             let packing = pack(&footprints, *gap, bed.as_ref());
-            plates.extend(packing.plates);
+            build.plates.extend(packing.plates);
             let mut arranged = Vec::new();
             for ((bodies, min), [x, y]) in built.into_iter().zip(packing.positions) {
                 let offset = DVec3::new(x - min.x, y - min.y, -min.z);
@@ -462,7 +555,7 @@ mod tests {
 
     #[test]
     fn bare_profiles_are_unsupported_for_now() {
-        let err = OccKernel
+        let err = OccKernel::default()
             .build(&ModelSpec::Rect {
                 width: 10.0,
                 height: 10.0,
@@ -481,7 +574,7 @@ mod tests {
         let triangles: Vec<usize> = MeshQuality::ALL
             .iter()
             .map(|&q| {
-                let scene = OccKernel.build_with(&disc, q).unwrap();
+                let scene = OccKernel::default().build_with(&disc, q).unwrap();
                 let aabb = scene.aabb().unwrap();
                 // Inscribed polygon: the rim comes in by at most the chord tolerance.
                 let tol = q.chord_tolerance() as f32 + 1e-4;
@@ -490,6 +583,90 @@ mod tests {
             })
             .collect();
         assert!(triangles.windows(2).all(|w| w[0] < w[1]), "{triangles:?}");
-        assert_eq!(OccKernel.build(&disc).unwrap().indices.len() / 3, triangles[2]);
+        assert_eq!(OccKernel::default().build(&disc).unwrap().indices.len() / 3, triangles[2]);
+    }
+
+    fn cuboid(at: [f64; 3], size: f64) -> ModelSpec {
+        ModelSpec::Translate {
+            offset: at,
+            shape: Box::new(ModelSpec::Extrude {
+                profile: Box::new(ModelSpec::Rect {
+                    width: size,
+                    height: size,
+                }),
+                distance: size,
+                direction: None,
+            }),
+        }
+    }
+
+    fn fused(shift: f64) -> ModelSpec {
+        ModelSpec::Union {
+            children: vec![cuboid([0.0; 3], 10.0), cuboid([5.0 + shift, 5.0, 5.0], 10.0)],
+        }
+    }
+
+    fn moved(spec: ModelSpec) -> ModelSpec {
+        ModelSpec::Translate {
+            offset: [100.0, 0.0, 0.0],
+            shape: Box::new(spec),
+        }
+    }
+
+    #[test]
+    fn booleans_are_cached_across_builds_and_views_but_not_across_styles() {
+        let mut kernel = OccKernel::default();
+        let first = kernel.build(&fused(0.0)).unwrap();
+        assert_eq!(kernel.cache_hits(), 0);
+
+        // The same union again, moved (as a print view moves parts): one hit, same mesh.
+        let again = kernel.build(&moved(fused(0.0))).unwrap();
+        assert_eq!(kernel.cache_hits(), 1);
+        assert_eq!(again.indices, first.indices);
+        assert_eq!(again.aabb().unwrap().min[0], first.aabb().unwrap().min[0] + 100.0);
+
+        // A coarser mesh reuses the solids too.
+        kernel.build_with(&fused(0.0), MeshQuality::Draft).unwrap();
+        assert_eq!(kernel.cache_hits(), 2);
+
+        // A changed operand or a different color is a different solid.
+        kernel.build(&fused(1.0)).unwrap();
+        let red = ModelSpec::Color {
+            rgb: [255, 0, 0],
+            shape: Box::new(fused(0.0)),
+        };
+        assert_eq!(kernel.build(&red).unwrap().colors[0], [255, 0, 0]);
+        assert_eq!(kernel.cache_hits(), 2);
+    }
+
+    #[test]
+    fn unused_cache_entries_are_dropped_after_a_few_builds() {
+        let mut kernel = OccKernel::default();
+        kernel.build(&fused(0.0)).unwrap();
+        for _ in 0..CACHE_BUILDS {
+            kernel.build(&cuboid([0.0; 3], 1.0)).unwrap();
+        }
+        assert!(kernel.cache.entries.is_empty());
+        kernel.build(&fused(0.0)).unwrap();
+        assert_eq!(kernel.cache_hits(), 0);
+    }
+
+    #[test]
+    fn booleans_holding_an_arrange_are_rebuilt_so_plates_come_back() {
+        let arranged = ModelSpec::Union {
+            children: vec![ModelSpec::Arrange {
+                gap: 5.0,
+                children: vec![cuboid([0.0; 3], 10.0)],
+                bed: Some(cad_ir::Bed {
+                    width: 200.0,
+                    depth: 200.0,
+                    height: 200.0,
+                }),
+            }],
+        };
+        let mut kernel = OccKernel::default();
+        assert_eq!(kernel.build(&arranged).unwrap().plates.len(), 1);
+        assert_eq!(kernel.build(&arranged).unwrap().plates.len(), 1);
+        assert_eq!(kernel.cache_hits(), 0);
     }
 }

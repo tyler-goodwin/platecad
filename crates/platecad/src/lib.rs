@@ -392,7 +392,7 @@ impl Pipeline {
     pub fn new(root: &Path, kernel: KernelChoice) -> Result<Self, String> {
         let (kernel, fallback): (Box<dyn Kernel + Send>, Option<Box<dyn Kernel + Send>>) = match kernel {
             KernelChoice::Truck => (Box::new(TruckKernel), None),
-            KernelChoice::Occ => (Box::new(OccKernel), Some(Box::new(TruckKernel))),
+            KernelChoice::Occ => (Box::new(OccKernel::default()), Some(Box::new(TruckKernel))),
         };
         let script = RustyScriptHost::new(root).map_err(|e| e.to_string())?;
         Ok(Self {

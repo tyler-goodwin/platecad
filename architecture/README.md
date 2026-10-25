@@ -183,6 +183,29 @@ plates, with every exported object closed.
 | Fillets, chamfers | No | Yes, with edge selectors |
 | Loft, sweep, shell, STEP | No | Available in cadrum, not exposed yet |
 | Build | Pure Rust | Links a 118 MB prebuilt static OCCT; see below |
+| Solid cache | No | Yes; see below |
+
+**OCC solid cache.** The slow steps are booleans, fillets and chamfers. One
+`CellsBuilder` pass intersects every face of every operand, so its cost grows
+with face count. `OccKernel` therefore keeps the solids each of those nodes
+built, keyed by the subtree's debug text plus the color and part name it
+inherits. Hits come from three places:
+
+- Within a build: the same subtree twice.
+- Across the two views: a print view that `arrange`s the assembled parts
+  hits the solids the assembled build just made, since only the outer
+  transform differs.
+- Across reloads: only subtrees whose spec text changed are rebuilt.
+
+Solids don't depend on mesh quality, so a quality change or a Fine export
+rebuild only re-meshes. A hit returns deep copies (cheap next to a boolean).
+Entries unused for 4 builds (two reloads) are dropped. Subtrees containing
+an `Arrange` are never cached, because a hit would skip recording plates.
+truck has no cache.
+
+On `cat.ts` (a fused union of many curved solids, debug build), caching
+takes an export from 21.9 s to 11.8 s, because the print view reuses the
+assembled fur.
 
 **Building with OCC.** cadrum's build script downloads a prebuilt static
 OCCT from the cadrum author's GitHub releases (a third-party binary, not

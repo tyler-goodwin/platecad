@@ -175,7 +175,7 @@ fn cases() -> Vec<(&'static str, ModelSpec)> {
 fn occ_matches_truck() {
     for (name, spec) in cases() {
         let truck = summarize(&TruckKernel.build(&spec).unwrap_or_else(|e| panic!("{name}: truck: {e}")));
-        let occ = summarize(&OccKernel.build(&spec).unwrap_or_else(|e| panic!("{name}: occ: {e}")));
+        let occ = summarize(&OccKernel::default().build(&spec).unwrap_or_else(|e| panic!("{name}: occ: {e}")));
 
         for i in 0..3 {
             assert!((truck.min[i] - occ.min[i]).abs() < 0.05, "{name}: min {:?} vs {:?}", truck.min, occ.min);
@@ -225,7 +225,7 @@ fn occ_handles_lined_up_faces() {
         ),
     ];
     for (name, spec, volume) in cases {
-        let scene = OccKernel.build(&part("x", spec)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let scene = OccKernel::default().build(&part("x", spec)).unwrap_or_else(|e| panic!("{name}: {e}"));
         let object = &objects(&scene)[0];
         assert!(object.is_closed(), "{name}: not closed");
         assert!(
@@ -252,7 +252,7 @@ fn occ_validates_like_truck() {
     ];
     for spec in bad {
         assert!(TruckKernel.build(&spec).is_err(), "truck accepted {spec:?}");
-        assert!(OccKernel.build(&spec).is_err(), "occ accepted {spec:?}");
+        assert!(OccKernel::default().build(&spec).is_err(), "occ accepted {spec:?}");
     }
 }
 
@@ -274,7 +274,7 @@ fn chamfer(shape: ModelSpec, distance: f64, edges: Vec<EdgeSelector>) -> ModelSp
 
 /// Closed, and the exported volume within 0.5% of `volume`.
 fn assert_solid(name: &str, spec: ModelSpec, volume: f64) -> TessellatedScene {
-    let scene = OccKernel.build(&part("x", spec)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let scene = OccKernel::default().build(&part("x", spec)).unwrap_or_else(|e| panic!("{name}: {e}"));
     let object = &objects(&scene)[0];
     assert!(object.is_closed(), "{name}: not closed");
     let got = object.signed_volume();
@@ -300,7 +300,7 @@ fn fillets_and_chamfers_remove_the_right_volume() {
 fn selectors_keep_unselected_faces_intact() {
     use EdgeSelector::*;
     // Only the top edges: the bottom face stays a full 10 x 10 square.
-    let scene = OccKernel
+    let scene = OccKernel::default()
         .build(&part("x", fillet(cuboid([0.0; 3], [10.0; 3]), 1.0, vec![MaxZ])))
         .unwrap();
     let on_bottom: Vec<_> = scene.positions.iter().filter(|p| p[2].abs() < 1e-4).collect();
@@ -333,13 +333,13 @@ fn fillet_errors_explain() {
     use EdgeSelector::*;
     // No edge of a box turned 45 degrees is parallel to X.
     let turned = rotate([0.0, 0.0, 1.0], 45.0, cuboid([0.0; 3], [10.0; 3]));
-    let err = OccKernel.build(&fillet(turned, 1.0, vec![ParallelX])).unwrap_err().to_string();
+    let err = OccKernel::default().build(&fillet(turned, 1.0, vec![ParallelX])).unwrap_err().to_string();
     assert!(err.contains("no edges match"), "{err}");
     // A radius bigger than the part.
-    let err = OccKernel
+    let err = OccKernel::default()
         .build(&fillet(cuboid([0.0; 3], [2.0; 3]), 5.0, vec![]))
         .unwrap_err()
         .to_string();
     assert!(err.contains("too large"), "{err}");
-    assert!(OccKernel.build(&fillet(cuboid([0.0; 3], [2.0; 3]), 0.0, vec![])).is_err());
+    assert!(OccKernel::default().build(&fillet(cuboid([0.0; 3], [2.0; 3]), 0.0, vec![])).is_err());
 }

@@ -44,6 +44,14 @@ the improvement.
   sources; needs CMake).
 - **Drop truck's workarounds** (explicit curves, coplanar hints) if OCC
   becomes the only kernel.
+- **Parallel booleans.** cadrum runs each boolean as one
+  `BOPAlgo_CellsBuilder` pass (`builder_cells` in its `src/ffi.cpp`) without
+  calling `SetRunParallel(true)`, so a big union uses one core. It's a
+  one-line change, but inside cadrum's C++, so it needs a `[patch]` or
+  vendored fork (or an upstream PR). `SetUseOBB(true)` (oriented bounding
+  boxes, to skip non-touching face pairs sooner) is worth trying at the
+  same time. Measure on `cat.ts`: its fused fur is a single heavy
+  `CellsBuilder` pass.
 
 ## Print workflow
 
