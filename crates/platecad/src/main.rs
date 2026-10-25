@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use caddy::{
+use platecad::{
     Cli, Command, ExportArgs, InitArgs, OpenArgs, PROJECT_MARKER, Pipeline, Start, export_3mf, init_project,
     project_root, resolve_model, resolve_start, run_session,
 };
@@ -91,7 +91,7 @@ fn init(args: InitArgs, cwd: std::path::PathBuf) -> ExitCode {
             for path in written {
                 println!("created {}", path.strip_prefix(&cwd).unwrap_or(&path).display());
             }
-            println!("\nOpen it with: caddy {}", args.dir.display());
+            println!("\nOpen it with: plate {}", args.dir.display());
             ExitCode::SUCCESS
         }
         Err(e) => {

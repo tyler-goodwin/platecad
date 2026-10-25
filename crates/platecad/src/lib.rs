@@ -1,4 +1,4 @@
-//! Library behind the `caddy` binary: the CLI, `caddy init`, the reload
+//! Library behind the `plate` binary: the CLI, `plate init`, the reload
 //! pipeline (TS file -> script host -> kernel -> `SceneUpdate`) and the viewer
 //! session that re-runs it whenever watched sources change. Kept windowless so
 //! it can be tested headless.
@@ -190,9 +190,9 @@ pub fn oversize_warning(scene: &TessellatedScene, bed: Bed) -> Option<String> {
 /// Code-first CAD: write models in TypeScript, see them hot-reload in a 3D
 /// viewport, and export 3MF for slicers.
 ///
-/// `caddy [PATH]` is short for `caddy open [PATH]`.
+/// `plate [PATH]` is short for `plate open [PATH]`.
 #[derive(Debug, Parser)]
-#[command(name = "caddy", version, args_conflicts_with_subcommands = true)]
+#[command(name = "plate", version, args_conflicts_with_subcommands = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -225,7 +225,7 @@ pub struct OpenArgs {
     pub path: Option<PathBuf>,
 
     /// Geometry kernel.
-    #[arg(long, env = "CADDY_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
+    #[arg(long, env = "PLATE_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
 }
 
@@ -243,7 +243,7 @@ pub struct ExportArgs {
     pub view: ExportView,
 
     /// Geometry kernel.
-    #[arg(long, env = "CADDY_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
+    #[arg(long, env = "PLATE_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
 }
 
@@ -1268,7 +1268,7 @@ export default () => fillet(cube(2), 5);
     // --- CLI -----------------------------------------------------------------
 
     fn parse(args: &[&str]) -> Result<Command, clap::Error> {
-        Cli::try_parse_from(std::iter::once("caddy").chain(args.iter().copied())).map(Cli::into_command)
+        Cli::try_parse_from(std::iter::once("plate").chain(args.iter().copied())).map(Cli::into_command)
     }
 
     fn parse_open(args: &[&str]) -> OpenArgs {
@@ -1289,8 +1289,8 @@ export default () => fillet(cube(2), 5);
     fn cli_path_is_optional_and_kernel_defaults_to_occ() {
         let args = parse_open(&[]);
         assert_eq!(args.path, None);
-        // A CADDY_KERNEL in the developer's shell legitimately changes the default.
-        if std::env::var_os("CADDY_KERNEL").is_none() {
+        // A PLATE_KERNEL in the developer's shell legitimately changes the default.
+        if std::env::var_os("PLATE_KERNEL").is_none() {
             assert_eq!(args.kernel, KernelChoice::Occ);
         }
     }
@@ -1362,11 +1362,11 @@ export default () => fillet(cube(2), 5);
             err.to_string()
         };
         let top = help(&["--help"]);
-        for needle in ["caddy", "open", "export", "init", "[PATH]", "--kernel", "CADDY_KERNEL", "truck", "occ"] {
+        for needle in ["plate", "open", "export", "init", "[PATH]", "--kernel", "PLATE_KERNEL", "truck", "occ"] {
             assert!(top.contains(needle), "help is missing {needle}:\n{top}");
         }
         let export = help(&["export", "--help"]);
-        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "CADDY_KERNEL"] {
+        for needle in ["<MODEL>", "--output", "outputs/<model>_<view>.3mf", "--view", "PLATE_KERNEL"] {
             assert!(export.contains(needle), "export help is missing {needle}:\n{export}");
         }
     }

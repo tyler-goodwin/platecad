@@ -717,26 +717,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "caddy"
-version = "0.1.0"
-dependencies = [
- "cad-export",
- "cad-ir",
- "cad-kernel",
- "cad-kernel-occ",
- "cad-kernel-truck",
- "cad-script",
- "cad-view",
- "cad-view-threed",
- "clap",
- "notify",
- "serde",
- "tempfile",
- "toml",
- "zip",
-]
-
-[[package]]
 name = "cadrum"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3146,6 +3126,26 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "platecad"
+version = "0.1.0"
+dependencies = [
+ "cad-export",
+ "cad-ir",
+ "cad-kernel",
+ "cad-kernel-occ",
+ "cad-kernel-truck",
+ "cad-script",
+ "cad-view",
+ "cad-view-threed",
+ "clap",
+ "notify",
+ "serde",
+ "tempfile",
+ "toml",
+ "zip",
+]
 
 [[package]]
 name = "png"

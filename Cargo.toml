@@ -9,7 +9,7 @@ members = [
     "crates/cad-script",
     "crates/cad-view",
     "crates/cad-view-threed",
-    "crates/caddy",
+    "crates/platecad",
 ]
 
 [workspace.package]

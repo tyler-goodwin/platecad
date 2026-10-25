@@ -1,6 +1,6 @@
 # Architecture
 
-`caddy` is a code-first CAD playground: write a model in TypeScript, see it
+platecad is a code-first CAD playground: write a model in TypeScript, see it
 as a B-rep solid in a native 3D viewport that hot-reloads on save, and lay
 it out for 3D printing.
 
@@ -13,14 +13,14 @@ in the same change as the code. Ideas not yet scheduled live in
 ```mermaid
 flowchart LR
   ts["models/*.ts + dsl/cad.ts"] --> script["cad-script (rustyscript)"]
-  script -->|"ModelViews: assembled + print? (serde IR)"| pipeline["caddy Pipeline"]
+  script -->|"ModelViews: assembled + print? (serde IR)"| pipeline["platecad Pipeline"]
   pipeline -->|"ModelSpec per view"| kernel["Kernel trait"]
   kernel --> occ["cad-kernel-occ (default, OCCT via cadrum)"]
   kernel -.->|"--kernel truck, or fallback for bare 2D"| truck["cad-kernel-truck"]
   occ -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
   truck --> update
   update --> view["cad-view-threed (three-d + egui)"]
-  view -->|"ViewerCommand: open folder / model, export"| session["caddy session"]
+  view -->|"ViewerCommand: open folder / model, export"| session["platecad session"]
   session --> pipeline
   occ -->|"--export, Export 3MF"| export["cad-export (3MF)"]
   watch["notify watcher"] -->|"debounced reload, file list"| session
@@ -56,7 +56,7 @@ kernel and renderer can each be swapped without touching the others.
 | `cad-view` | `SceneUpdate`, `SceneViews`, `ViewMode`/`ViewSelection` (pure view logic), the viewer protocol (`ViewerMessage`, `ViewerCommand`, `FolderListing`) and `trait ViewportApp`. |
 | `cad-view-threed` | three-d window: orbit camera, lighting, edge cylinders, egui overlay. |
 | `cad-export` | `TessellatedScene` to 3MF: one watertight object per part, with base-material colors. |
-| `caddy` | The `caddy` binary plus library: CLI, project root discovery, `Pipeline`, the viewer session (commands, folder listing, watcher, export). The library half is what the tests drive. |
+| `platecad` | The `plate` binary plus library: CLI, project root discovery, `Pipeline`, the viewer session (commands, folder listing, watcher, export). The library half is what the tests drive. |
 
 `dsl/cad.ts` and `models/` are TypeScript, not crates.
 
@@ -198,16 +198,17 @@ local use, but distributing the binary carries relinking obligations.
 
 ## App, CLI and hot reload
 
-Run it from the repo with `cargo run -p caddy -- …`, or install it with
-`cargo install --path crates/caddy`.
+The command is `plate` (the package and repo are `platecad`). Run it from
+the repo with `cargo run -p platecad -- …`, or install it with
+`cargo install --path crates/platecad`.
 
 ```
-caddy [open] [PATH] [--kernel occ|truck]                       # open the viewer (default occ; CADDY_KERNEL env works too)
-caddy export MODEL [-o FILE.3mf] [--view auto|print|assembled]  # write a 3MF and exit, no window
-caddy init [DIR]                                                # set up a new project (default: the cwd)
+plate [open] [PATH] [--kernel occ|truck]                       # open the viewer (default occ; PLATE_KERNEL env works too)
+plate export MODEL [-o FILE.3mf] [--view auto|print|assembled]  # write a 3MF and exit, no window
+plate init [DIR]                                                # set up a new project (default: the cwd)
 ```
 
-`open` is the default subcommand, so `caddy models/x.ts` works. PATH is a
+`open` is the default subcommand, so `plate models/x.ts` works. PATH is a
 model file or a folder. A model opens with its project root in
 the file list; a folder opens with no model picked. Without PATH, the cwd
 is opened if it's a project root, and otherwise the viewer starts empty.
@@ -265,7 +266,7 @@ during a debounce waits its turn instead of being lost.
 
 ### New projects
 
-`caddy init DIR`, or the viewer's "New project…" button, writes a project
+`plate init DIR`, or the viewer's "New project…" button, writes a project
 that opens, builds and exports as is:
 
 | File | Contents |
@@ -278,8 +279,8 @@ that opens, builds and exports as is:
 
 It creates DIR if needed, and refuses (writing nothing) if any of those
 files exists; other files are fine. A project keeps the DSL it was created
-with, so upgrading `caddy` doesn't change an existing project's DSL.
-Building the DSL into the binary means `cargo install --path crates/caddy`
+with, so upgrading platecad doesn't change an existing project's DSL.
+Building the DSL into the binary means `cargo install --path crates/platecad`
 works, but the crate can't be published to crates.io as is (the file lives
 outside the crate).
 
@@ -371,7 +372,7 @@ holding `[Content_Types].xml`, `_rels/.rels` and `3D/3dmodel.model`.
   `displaycolor`. Each object points at its first triangle's color, and
   triangles with a different color carry `p1`. How a slicer maps these to
   filaments varies.
-- `export_3mf` in `caddy` evaluates, picks the view, writes the file, and
+- `export_3mf` in `platecad` evaluates, picks the view, writes the file, and
   deletes a partial file on failure.
 
 ## Example models
