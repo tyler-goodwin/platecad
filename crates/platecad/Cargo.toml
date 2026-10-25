@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The command is `plate`; the package and repo are `platecad`.
+# Plate CAD: the command is `plate`; the package and repo are `platecad`.
 [[bin]]
 name = "plate"
 path = "src/main.rs"

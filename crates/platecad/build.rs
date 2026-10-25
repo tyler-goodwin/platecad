@@ -10,8 +10,8 @@ fn main() {
     // loads this one for its window (cad_view_threed::ICON_RESOURCE_ID).
     resource
         .set_icon_with_id("../../assets/plate.ico", "1")
-        .set("ProductName", "platecad")
-        .set("FileDescription", "platecad: code-first CAD for 3D printing")
+        .set("ProductName", "Plate CAD")
+        .set("FileDescription", "Plate CAD: code-first CAD for 3D printing")
         .set("LegalCopyright", "Copyright (c) 2026 Tyler Goodwin");
     resource.compile().expect("embedding the Windows icon resource");
 }

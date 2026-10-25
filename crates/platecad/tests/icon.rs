@@ -47,7 +47,7 @@ fn plate_exe_embeds_the_icon_and_version_details() {
     for (size, image) in ico_entries(&asset("plate.ico")) {
         assert!(contains(image), "{size} px icon missing from plate.exe");
     }
-    let description: Vec<u8> = "platecad: code-first CAD"
+    let description: Vec<u8> = "Plate CAD: code-first CAD"
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect();

@@ -1,4 +1,4 @@
-# <img src="assets/plate.png" width="48" alt=""> platecad
+# <img src="assets/plate.png" width="48" alt=""> Plate CAD
 
 Code-first CAD for 3D printing. You write models in TypeScript and see them
 as solids in a native 3D viewer that reloads every time you save. When a
@@ -44,7 +44,7 @@ export default () => ({
 
 ## Getting started
 
-platecad is written in Rust and is currently developed on Windows. You need
+Plate CAD is written in Rust and is currently developed on Windows. You need
 a Rust toolchain and the MSVC build tools.
 
 ```sh
@@ -124,11 +124,11 @@ agents working in the repo. Run the tests with `cargo test --workspace`.
 
 ## License
 
-platecad is MIT licensed. See [LICENSE](LICENSE).
+Plate CAD is MIT licensed. See [LICENSE](LICENSE).
 
 ## Third-party software
 
-platecad uses facilities provided by
+Plate CAD uses facilities provided by
 **[Open CASCADE Technology](https://dev.opencascade.org/)** (OCCT) for its
 geometry. OCCT is licensed under the
 [GNU LGPL 2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html)
@@ -136,7 +136,7 @@ with the
 [Open CASCADE exception](https://github.com/Open-Cascade-SAS/OCCT/blob/master/OCCT_LGPL_EXCEPTION.txt).
 Its source is at [Open-Cascade-SAS/OCCT](https://github.com/Open-Cascade-SAS/OCCT).
 The `plate` binary statically links an unmodified prebuilt OCCT 8.0.1
-fetched by [cadrum](https://github.com/lzpel/cadrum). Since platecad's
+fetched by [cadrum](https://github.com/lzpel/cadrum). Since Plate CAD's
 source is public, you can rebuild it against a modified OCCT. If you
 distribute builds, ship `LICENSE_LGPL_21.txt` and `OCCT_LGPL_EXCEPTION.txt`
 (found in the OCCT download under `target/`) alongside them.

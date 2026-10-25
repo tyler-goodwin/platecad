@@ -1,6 +1,6 @@
 # Architecture
 
-platecad is a code-first CAD playground: write a model in TypeScript, see it
+Plate CAD is a code-first CAD playground: write a model in TypeScript, see it
 as a B-rep solid in a native 3D viewport that hot-reloads on save, and lay
 it out for 3D printing.
 
@@ -198,7 +198,7 @@ local use, but distributing the binary carries relinking obligations.
 
 ## App, CLI and hot reload
 
-The command is `plate` (the package and repo are `platecad`). Run it from
+Plate CAD's command is `plate` (the crate and repo are `platecad`). Run it from
 the repo with `cargo run -p platecad -- …`, or install it with
 `cargo install --path crates/platecad`.
 
@@ -279,7 +279,7 @@ that opens, builds and exports as is:
 
 It creates DIR if needed, and refuses (writing nothing) if any of those
 files exists; other files are fine. A project keeps the DSL it was created
-with, so upgrading platecad doesn't change an existing project's DSL.
+with, so upgrading Plate CAD doesn't change an existing project's DSL.
 Building the DSL into the binary means `cargo install --path crates/platecad`
 works, but the crate can't be published to crates.io as is (the file lives
 outside the crate).

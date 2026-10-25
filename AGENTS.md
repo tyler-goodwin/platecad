@@ -6,7 +6,7 @@ Guide for coding agents working in this repo. For the full design, read
 
 ## What this is
 
-platecad is a code-first CAD playground. You write a model in TypeScript
+Plate CAD is a code-first CAD playground. You write a model in TypeScript
 (`models/*.ts`, using the DSL in `dsl/cad.ts`). Rust evaluates it with
 rustyscript (V8), builds B-rep geometry with OpenCascade (or the truck
 kernel), and shows it in a three-d window that hot-reloads on save. It can
