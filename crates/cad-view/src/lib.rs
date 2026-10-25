@@ -1,4 +1,5 @@
-use std::sync::mpsc::Receiver;
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use cad_ir::{Diagnostic, TessellatedScene, Views};
@@ -88,10 +89,69 @@ pub enum ViewError {
     Message(String),
 }
 
-/// A windowed viewport. Blocks the calling (main) thread until the window closes,
-/// polling `updates` each frame.
+impl ViewMode {
+    /// Lowercase name, as used in export file names.
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Assembled => "assembled",
+            ViewMode::Print => "print",
+        }
+    }
+}
+
+/// A folder or `.ts` file in the opened folder's file browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileEntry {
+    Dir { name: String, children: Vec<FileEntry> },
+    File { name: String, path: PathBuf },
+}
+
+/// The opened folder and the model files under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderListing {
+    pub path: PathBuf,
+    pub entries: Vec<FileEntry>,
+}
+
+/// What the viewer asks the app to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewerCommand {
+    /// Browse this folder and hot-reload from it. Closes the open model.
+    OpenFolder(PathBuf),
+    /// Load this model and watch its dependencies.
+    OpenModel(PathBuf),
+    /// Write this view (the one on screen) to a 3MF file.
+    Export(ViewMode),
+}
+
+/// What the app tells the viewer.
+#[derive(Debug, Clone)]
+pub enum ViewerMessage {
+    Scene(SceneUpdate),
+    /// A folder was opened, or model files were added or removed under it.
+    Folder(FolderListing),
+    /// The model now shown (`None`: none). The viewer drops the old meshes,
+    /// and frames the new ones when they arrive.
+    Model(Option<PathBuf>),
+    /// The outcome of a one-off command, such as an export.
+    Notice(Diagnostic),
+}
+
+impl From<SceneUpdate> for ViewerMessage {
+    fn from(update: SceneUpdate) -> Self {
+        Self::Scene(update)
+    }
+}
+
+/// A windowed viewport. Blocks the calling (main) thread until the window
+/// closes, polling `messages` each frame and sending user actions on `commands`.
 pub trait ViewportApp {
-    fn run(self, initial: SceneUpdate, updates: Receiver<SceneUpdate>) -> Result<(), ViewError>;
+    fn run(
+        self,
+        initial: Vec<ViewerMessage>,
+        messages: Receiver<ViewerMessage>,
+        commands: Sender<ViewerCommand>,
+    ) -> Result<(), ViewError>;
 }
 
 #[cfg(test)]

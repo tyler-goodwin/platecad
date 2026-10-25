@@ -1,9 +1,15 @@
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use cad_ir::{Aabb, DEFAULT_COLOR, Diagnostic, Plate, TessellatedScene};
 use std::time::Instant;
 
-use cad_view::{SceneUpdate, ViewError, ViewMode, ViewSelection, ViewportApp, loading_status};
+use cad_view::{
+    FileEntry, FolderListing, SceneUpdate, ViewError, ViewMode, ViewSelection, ViewerCommand, ViewerMessage,
+    ViewportApp, loading_status,
+};
 use three_d::egui;
 use three_d::*;
 
@@ -34,7 +40,12 @@ impl Default for ThreeDViewport {
 }
 
 impl ViewportApp for ThreeDViewport {
-    fn run(self, initial: SceneUpdate, updates: Receiver<SceneUpdate>) -> Result<(), ViewError> {
+    fn run(
+        self,
+        initial: Vec<ViewerMessage>,
+        messages: Receiver<ViewerMessage>,
+        commands: Sender<ViewerCommand>,
+    ) -> Result<(), ViewError> {
         let window = Window::new(WindowSettings {
             title: self.title,
             max_size: Some((1280, 800)),
@@ -68,14 +79,20 @@ impl ViewportApp for ThreeDViewport {
             diagnostics: Vec::new(),
             loading: None,
             disconnected: false,
+            folder: None,
+            model: None,
+            notice: None,
         };
-        state.apply(initial);
+        for message in initial {
+            state.receive(message);
+        }
         state.reframe_if_needed(&mut camera, &mut control);
+        let picking = Arc::new(AtomicBool::new(false));
 
         window.render_loop(move |mut frame_input| {
             loop {
-                match updates.try_recv() {
-                    Ok(update) => state.apply(update),
+                match messages.try_recv() {
+                    Ok(message) => state.receive(message),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         state.disconnected = true;
@@ -90,8 +107,36 @@ impl ViewportApp for ThreeDViewport {
                 frame_input.viewport,
                 frame_input.device_pixel_ratio,
                 |ui| {
+                    egui::Panel::left("files")
+                        .resizable(true)
+                        .default_size(220.0)
+                        .show_inside(ui, |ui| {
+                            let busy = picking.load(Ordering::Relaxed);
+                            if ui.add_enabled(!busy, egui::Button::new("Open folder…")).clicked() {
+                                pick_folder(
+                                    state.folder.as_ref().map(|f| f.path.clone()),
+                                    picking.clone(),
+                                    commands.clone(),
+                                );
+                            }
+                            ui.separator();
+                            match &state.folder {
+                                Some(folder) => {
+                                    ui.strong(folder_label(&folder.path));
+                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                        if folder.entries.is_empty() {
+                                            ui.weak("No .ts files here.");
+                                        }
+                                        file_tree(ui, &folder.entries, state.model.as_deref(), &commands);
+                                    });
+                                }
+                                None => {
+                                    ui.weak("Open a folder to list its models.");
+                                }
+                            }
+                        });
                     egui::Window::new("Model")
-                        .default_pos([12.0, 12.0])
+                        .default_pos([240.0, 12.0])
                         .resizable(false)
                         .show(ui.ctx(), |ui| {
                             let has_print = state.print.is_some();
@@ -113,6 +158,19 @@ impl ViewportApp for ThreeDViewport {
                                     "This model has no print view. Export { assembled, print }.",
                                 );
                             });
+                            let can_export = state.active().is_some();
+                            let export = ui
+                                .add_enabled(can_export, egui::Button::new("Export 3MF"))
+                                .on_hover_text("Writes the view on screen to outputs/<model>_<view>.3mf")
+                                .on_disabled_hover_text("Open a model that builds to export it.");
+                            if export.clicked() {
+                                let view = state.selection.active(state.print.is_some());
+                                let _ = commands.send(ViewerCommand::Export(view));
+                            }
+                            if let Some(notice) = &state.notice {
+                                let [r, g, b] = diagnostic_color(notice);
+                                ui.colored_label(egui::Color32::from_rgb(r, g, b), &notice.message);
+                            }
                             ui.separator();
                             if let Some((message, since)) = &state.loading {
                                 ui.horizontal(|ui| {
@@ -136,6 +194,9 @@ impl ViewportApp for ThreeDViewport {
                             for d in &state.diagnostics {
                                 let [r, g, b] = diagnostic_color(d);
                                 ui.colored_label(egui::Color32::from_rgb(r, g, b), &d.message);
+                            }
+                            if state.model.is_none() && state.loading.is_none() {
+                                ui.weak("Pick a model from the file list.");
                             }
                             if state.disconnected {
                                 ui.label("Reload thread stopped.");
@@ -222,6 +283,57 @@ fn plate_segments(plates: &[Plate]) -> Vec<([f32; 3], [f32; 3])> {
         .collect()
 }
 
+/// Shows the native folder picker on its own thread, so the window keeps
+/// drawing, and sends the choice as [`ViewerCommand::OpenFolder`].
+fn pick_folder(start: Option<PathBuf>, picking: Arc<AtomicBool>, commands: Sender<ViewerCommand>) {
+    picking.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("Open folder");
+        if let Some(start) = start {
+            dialog = dialog.set_directory(start);
+        }
+        if let Some(folder) = dialog.pick_folder() {
+            let _ = commands.send(ViewerCommand::OpenFolder(folder));
+        }
+        picking.store(false, Ordering::Relaxed);
+    });
+}
+
+/// Heading for the file list: the folder's name, or the whole path for a drive root.
+fn folder_label(path: &Path) -> String {
+    match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => path.display().to_string(),
+    }
+}
+
+/// Folders as collapsible headers, files as rows that open the model on click.
+fn file_tree(ui: &mut egui::Ui, entries: &[FileEntry], open: Option<&Path>, commands: &Sender<ViewerCommand>) {
+    for entry in entries {
+        match entry {
+            FileEntry::Dir { name, children } => {
+                egui::CollapsingHeader::new(name.as_str())
+                    .default_open(contains(children, open))
+                    .show(ui, |ui| file_tree(ui, children, open, commands));
+            }
+            FileEntry::File { name, path } => {
+                if ui.selectable_label(open == Some(path.as_path()), name.as_str()).clicked() {
+                    let _ = commands.send(ViewerCommand::OpenModel(path.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// Whether `open` is somewhere in `entries`, so its folders start expanded.
+fn contains(entries: &[FileEntry], open: Option<&Path>) -> bool {
+    let Some(open) = open else { return false };
+    entries.iter().any(|entry| match entry {
+        FileEntry::Dir { children, .. } => contains(children, Some(open)),
+        FileEntry::File { path, .. } => path == open,
+    })
+}
+
 /// Overlay text color: green for OK, amber for warnings, red for errors.
 fn diagnostic_color(d: &Diagnostic) -> [u8; 3] {
     match (d.ok, d.warning) {
@@ -256,9 +368,34 @@ struct ViewState {
     /// An evaluation in progress, and when it started.
     loading: Option<(String, Instant)>,
     disconnected: bool,
+    folder: Option<FolderListing>,
+    /// The model shown, highlighted in the file list.
+    model: Option<PathBuf>,
+    /// The last command outcome (e.g. "Wrote outputs/cube_print.3mf").
+    notice: Option<Diagnostic>,
 }
 
 impl ViewState {
+    fn receive(&mut self, message: ViewerMessage) {
+        match message {
+            ViewerMessage::Scene(update) => self.apply(update),
+            ViewerMessage::Folder(listing) => self.folder = Some(listing),
+            ViewerMessage::Model(model) => {
+                if model != self.model {
+                    // A different model: drop the old meshes and frame the next ones.
+                    self.assembled = None;
+                    self.print = None;
+                    self.framed = None;
+                    self.diagnostics.clear();
+                    self.loading = None;
+                    self.notice = None;
+                }
+                self.model = model;
+            }
+            ViewerMessage::Notice(notice) => self.notice = Some(notice),
+        }
+    }
+
     fn apply(&mut self, update: SceneUpdate) {
         if let Some(message) = update.loading {
             self.loading = Some((message, Instant::now()));
@@ -458,6 +595,40 @@ mod tests {
 
     fn aabb(min: [f32; 3], max: [f32; 3]) -> Aabb {
         Aabb { min, max }
+    }
+
+    fn file(path: &str) -> FileEntry {
+        let path = PathBuf::from(path);
+        FileEntry::File {
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+        }
+    }
+
+    fn dir(name: &str, children: Vec<FileEntry>) -> FileEntry {
+        FileEntry::Dir {
+            name: name.into(),
+            children,
+        }
+    }
+
+    #[test]
+    fn folders_holding_the_open_model_start_expanded() {
+        let tree = vec![
+            dir("models", vec![dir("parts", vec![file("/p/models/parts/leg.ts")]), file("/p/models/a.ts")]),
+            file("/p/b.ts"),
+        ];
+        let FileEntry::Dir { children, .. } = &tree[0] else { unreachable!() };
+        assert!(contains(children, Some(Path::new("/p/models/parts/leg.ts"))));
+        assert!(contains(children, Some(Path::new("/p/models/a.ts"))));
+        assert!(!contains(children, Some(Path::new("/p/b.ts"))));
+        assert!(!contains(children, None));
+    }
+
+    #[test]
+    fn folder_label_is_the_folder_name() {
+        assert_eq!(folder_label(Path::new("/home/me/shelves")), "shelves");
+        assert_eq!(folder_label(Path::new("/")), "/");
     }
 
     #[test]

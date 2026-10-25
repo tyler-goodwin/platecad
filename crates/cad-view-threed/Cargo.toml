@@ -8,3 +8,4 @@ license.workspace = true
 cad-ir.workspace = true
 cad-view.workspace = true
 three-d = { version = "0.19", features = ["egui-gui"] }
+rfd = "0.15"

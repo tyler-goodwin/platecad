@@ -2,9 +2,9 @@
 //! -> `SceneUpdate`, re-run whenever watched sources change. Kept windowless so it
 //! can be tested headless.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use cad_ir::{Bed, Diagnostic, ModelSpec, TessellatedScene};
@@ -12,11 +12,11 @@ use cad_kernel::Kernel;
 use cad_kernel_occ::OccKernel;
 use cad_kernel_truck::TruckKernel;
 use cad_script::{RustyScriptHost, ScriptHost};
-use cad_view::{SceneUpdate, SceneViews};
+use cad_view::{FileEntry, FolderListing, SceneUpdate, SceneViews, ViewMode, ViewerCommand, ViewerMessage};
 use clap::{Parser, ValueEnum};
+use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode, Watcher};
 
-pub const DEFAULT_MODEL: &str = "models/cube.ts";
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
 /// A directory containing this file is a project root (imports and watching are scoped to it).
 pub const PROJECT_MARKER: &str = "dsl/cad.ts";
@@ -190,17 +190,17 @@ pub fn oversize_warning(scene: &TessellatedScene, bed: Bed) -> Option<String> {
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Args {
-    /// Model script to open. The project root is found by walking up from it
-    /// to the directory containing `dsl/cad.ts`.
-    #[arg(default_value = DEFAULT_MODEL)]
-    pub model: PathBuf,
+    /// Model script or folder to open. A model opens with its project root
+    /// (the nearest folder up containing `dsl/cad.ts`) in the file list.
+    /// Without one, the current folder is opened if it's a project root.
+    pub path: Option<PathBuf>,
 
     /// Geometry kernel.
     #[arg(long, env = "CAD_KERNEL", value_enum, default_value_t = KernelChoice::Occ)]
     pub kernel: KernelChoice,
 
     /// Write a 3MF file for slicers instead of opening the viewer.
-    #[arg(long, value_name = "FILE.3mf")]
+    #[arg(long, value_name = "FILE.3mf", requires = "path")]
     pub export: Option<PathBuf>,
 
     /// Which view to export.
@@ -249,16 +249,21 @@ pub fn project_root(model: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Directories to watch so every dependency's changes are seen, mapped to
-/// whether the watch must be recursive.
+/// Directories to watch so every dependency's changes are seen, and the
+/// opened `folder` (recursively) so the file list is, mapped to whether the
+/// watch must be recursive.
 ///
 /// A file is watched through its folder (non-recursively), not directly:
 /// editors that save via write-temp-then-rename replace the file, which would
 /// drop a watch on the file itself. A dependency whose folder doesn't exist
 /// yet (a missing import) is watched through its nearest existing ancestor,
-/// recursively, so creating the folder and file is still seen.
-pub fn watch_targets(dependencies: &BTreeSet<PathBuf>) -> BTreeMap<PathBuf, bool> {
+/// recursively, so creating the folder and file is still seen. Folders inside
+/// `folder` need no watch of their own.
+pub fn watch_targets(dependencies: &BTreeSet<PathBuf>, folder: Option<&Path>) -> BTreeMap<PathBuf, bool> {
     let mut targets: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    if let Some(folder) = folder {
+        targets.insert(folder.to_path_buf(), true);
+    }
     for dep in dependencies {
         let Some(dir) = dep.parent() else { continue };
         let (dir, recursive) = if dir.is_dir() {
@@ -269,6 +274,9 @@ pub fn watch_targets(dependencies: &BTreeSet<PathBuf>) -> BTreeMap<PathBuf, bool
                 None => continue,
             }
         };
+        if folder.is_some_and(|f| dir.starts_with(f)) {
+            continue;
+        }
         *targets.entry(dir.to_path_buf()).or_default() |= recursive;
     }
     targets
@@ -427,21 +435,11 @@ pub fn export_3mf(
         }
     };
 
-    let write = || -> Result<usize, String> {
-        let file = std::fs::File::create(out)
-            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
-        cad_export::write_3mf(&scene, std::io::BufWriter::new(file)).map_err(|e| e.to_string())
-    };
-    match write() {
-        Ok(objects) => Ok(format!(
-            "wrote {} ({label} view, {objects} objects){warnings}",
-            out.display()
-        )),
-        Err(e) => {
-            let _ = std::fs::remove_file(out);
-            Err(e)
-        }
-    }
+    let objects = write_scene_3mf(&scene, out)?;
+    Ok(format!(
+        "wrote {} ({label} view, {objects} objects){warnings}",
+        out.display()
+    ))
 }
 
 impl Pipeline {
@@ -477,71 +475,387 @@ pub fn report(update: &SceneUpdate) {
     }
 }
 
-/// The reload thread's whole job: tells the viewer `model` is loading,
-/// evaluates it, sends the result, then [`watch_and_reload`]s. The window can
-/// open before any of this finishes. Returns once the viewer is gone.
-pub fn load_and_watch(
-    model: &Path,
-    mut pipeline: Pipeline,
-    tx: Sender<SceneUpdate>,
-) -> notify::Result<()> {
-    let name = model.file_name().unwrap_or_default().to_string_lossy();
-    if tx.send(SceneUpdate::loading(format!("Loading {name}…"))).is_err() {
-        return Ok(());
-    }
-    let update = pipeline.evaluate(model);
-    report(&update);
-    if tx.send(update).is_err() {
-        return Ok(());
-    }
-    watch_and_reload(model, pipeline, tx)
+/// What the viewer opens with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// Nothing yet: the user picks a folder in the viewer.
+    Empty,
+    /// Browse a folder, with no model open.
+    Folder(PathBuf),
+    /// Open a model, browsing its project root.
+    Model(PathBuf),
 }
 
-/// Re-evaluates `model` whenever one of its [`Pipeline::dependencies`] changes,
-/// waiting for `DEBOUNCE` of quiet so editor save bursts cause one rebuild.
-/// The watched set follows the model's imports after every eval. `pipeline`
-/// should already have evaluated `model` once (that's what seeds the set).
-/// Returns once the receiving end of `tx` (the viewer) is gone.
-pub fn watch_and_reload(
-    model: &Path,
-    mut pipeline: Pipeline,
-    tx: Sender<SceneUpdate>,
-) -> notify::Result<()> {
-    let (events_tx, events_rx) = mpsc::channel();
-    let mut watched = WatchSet::new(notify::recommended_watcher(events_tx)?);
-    if pipeline.dependencies().is_empty() {
-        pipeline.evaluate(model);
+/// What a CLI path opens: a folder or a model file. Resolved against `cwd`
+/// and checked to exist, like [`resolve_model`].
+pub fn resolve_start(path: &Path, cwd: &Path) -> Result<Start, String> {
+    let path = normalize(&cwd.join(path));
+    if path.is_dir() {
+        Ok(Start::Folder(path))
+    } else if path.is_file() {
+        Ok(Start::Model(path))
+    } else {
+        Err(format!("{} not found", path.display()))
     }
-    watched.sync(pipeline.dependencies())?;
+}
 
-    loop {
-        // Block until a dependency changes (or the watcher goes away).
-        let Ok(event) = events_rx.recv() else {
-            return Ok(());
-        };
-        if !is_relevant(&event?, pipeline.dependencies()) {
-            continue;
+/// Project root for an opened folder: the folder itself or its nearest
+/// ancestor containing [`PROJECT_MARKER`], else the folder. Every file under
+/// the folder can then import within the project.
+pub fn folder_root(folder: &Path) -> PathBuf {
+    folder
+        .ancestors()
+        .find(|d| d.join(PROJECT_MARKER).is_file())
+        .unwrap_or(folder)
+        .to_path_buf()
+}
+
+/// Model files under `folder` for the file browser: `.ts` files (not `.d.ts`)
+/// and the folders that contain some, at any depth. Folders come first, then
+/// files, each sorted case-insensitively. Symlinked folders aren't followed.
+pub fn list_models(folder: &Path) -> Vec<FileEntry> {
+    let Ok(read) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            let children = list_models(&entry.path());
+            if !children.is_empty() {
+                dirs.push(FileEntry::Dir { name, children });
+            }
+        } else if name.ends_with(".ts") && !name.ends_with(".d.ts") {
+            files.push(FileEntry::File {
+                name,
+                path: entry.path(),
+            });
         }
-        // Swallow the rest of the burst.
-        loop {
-            match events_rx.recv_timeout(DEBOUNCE) {
-                Ok(_) => continue,
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+    }
+    let key = |e: &FileEntry| match e {
+        FileEntry::Dir { name, .. } | FileEntry::File { name, .. } => name.to_lowercase(),
+    };
+    dirs.sort_by_key(key);
+    files.sort_by_key(key);
+    dirs.extend(files);
+    dirs
+}
+
+/// Folder under the project root that viewer exports go to.
+pub const OUTPUTS_DIR: &str = "outputs";
+
+/// Where the viewer exports `view` of `model`: `<root>/outputs/<model>_<view>.3mf`.
+pub fn export_path(root: &Path, model: &Path, view: ViewMode) -> PathBuf {
+    let stem = model.file_stem().unwrap_or_default().to_string_lossy();
+    root.join(OUTPUTS_DIR)
+        .join(format!("{stem}_{}.3mf", view.label()))
+}
+
+/// Writes `scene` to `out` as 3MF, creating its folder. Returns the object
+/// count. Nothing is left at `out` on failure.
+pub fn write_scene_3mf(scene: &TessellatedScene, out: &Path) -> Result<usize, String> {
+    let write = || -> Result<usize, String> {
+        if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let file = std::fs::File::create(out)
+            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+        cad_export::write_3mf(scene, std::io::BufWriter::new(file)).map_err(|e| e.to_string())
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(out);
+    })
+}
+
+/// Runs the app side of the viewer until the viewer goes away: opens `start`,
+/// then handles [`ViewerCommand`]s and file changes, sending results on `tx`.
+///
+/// The opened folder is watched recursively so the file list stays current;
+/// the model rebuilds only when one of its [`Pipeline::dependencies`] changes
+/// (which may be outside the folder, like a project's `dsl/cad.ts`). Change
+/// bursts are debounced by [`DEBOUNCE`]. Returns once `tx`'s receiver or
+/// `commands`' sender is dropped.
+pub fn run_session(
+    start: Start,
+    kernel: KernelChoice,
+    commands: Receiver<ViewerCommand>,
+    tx: Sender<ViewerMessage>,
+) -> notify::Result<()> {
+    let (input_tx, inputs) = mpsc::channel();
+    let fs_tx = input_tx.clone();
+    let watcher = notify::recommended_watcher(move |event| {
+        let _ = fs_tx.send(Input::Fs(event));
+    })?;
+    std::thread::spawn(move || {
+        for command in commands {
+            if input_tx.send(Input::Command(command)).is_err() {
+                return;
             }
         }
+        let _ = input_tx.send(Input::ViewerClosed);
+    });
+    let session = Session {
+        kernel,
+        tx,
+        watched: WatchSet::new(watcher),
+        folder: None,
+        model: None,
+    };
+    match session.run(start, inputs) {
+        Ok(()) | Err(Stop::ViewerGone) => Ok(()),
+        Err(Stop::Watch(e)) => Err(e),
+    }
+}
 
-        let name = model.file_name().unwrap_or_default().to_string_lossy();
-        if tx.send(SceneUpdate::loading(format!("Rebuilding {name}…"))).is_err() {
-            return Ok(());
+enum Input {
+    Fs(notify::Result<notify::Event>),
+    Command(ViewerCommand),
+    ViewerClosed,
+}
+
+/// Why a session stops.
+enum Stop {
+    ViewerGone,
+    Watch(notify::Error),
+}
+
+impl From<notify::Error> for Stop {
+    fn from(e: notify::Error) -> Self {
+        Stop::Watch(e)
+    }
+}
+
+struct OpenFolder {
+    listing: FolderListing,
+    /// Import root and export base: [`folder_root`] of the folder.
+    root: PathBuf,
+}
+
+struct OpenModel {
+    path: PathBuf,
+    pipeline: Pipeline,
+    /// The last good build: what the viewer shows, and what export writes.
+    views: Option<SceneViews>,
+}
+
+/// What a burst of file events calls for.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Change {
+    reload: bool,
+    listing: bool,
+}
+
+struct Session<W: Watcher> {
+    kernel: KernelChoice,
+    tx: Sender<ViewerMessage>,
+    watched: WatchSet<W>,
+    folder: Option<OpenFolder>,
+    model: Option<OpenModel>,
+}
+
+impl<W: Watcher> Session<W> {
+    fn run(mut self, start: Start, inputs: Receiver<Input>) -> Result<(), Stop> {
+        match start {
+            Start::Empty => {}
+            Start::Folder(folder) => self.open_folder(&folder)?,
+            Start::Model(model) => self.open_model(&model)?,
         }
-        let update = pipeline.evaluate(model);
+        // Commands that arrive mid-debounce wait here, in order.
+        let mut queued = VecDeque::new();
+        loop {
+            let input = match queued.pop_front() {
+                Some(input) => input,
+                None => match inputs.recv() {
+                    Ok(input) => input,
+                    Err(_) => return Ok(()),
+                },
+            };
+            match input {
+                Input::ViewerClosed => return Err(Stop::ViewerGone),
+                Input::Command(command) => self.handle(command)?,
+                Input::Fs(event) => {
+                    let mut change = self.classify(&event?);
+                    if change == Change::default() {
+                        continue;
+                    }
+                    // Swallow the rest of the burst, noting what it touched.
+                    loop {
+                        match inputs.recv_timeout(DEBOUNCE) {
+                            Ok(Input::Fs(event)) => {
+                                let more = self.classify(&event?);
+                                change.reload |= more.reload;
+                                change.listing |= more.listing;
+                            }
+                            Ok(other) => queued.push_back(other),
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                        }
+                    }
+                    if change.listing {
+                        self.refresh_listing()?;
+                    }
+                    if change.reload {
+                        self.evaluate("Rebuilding")?;
+                    }
+                }
+            }
+        }
+    }
+
+    fn send(&self, message: impl Into<ViewerMessage>) -> Result<(), Stop> {
+        self.tx.send(message.into()).map_err(|_| Stop::ViewerGone)
+    }
+
+    fn notice(&self, notice: Diagnostic) -> Result<(), Stop> {
+        self.send(ViewerMessage::Notice(notice))
+    }
+
+    fn handle(&mut self, command: ViewerCommand) -> Result<(), Stop> {
+        match command {
+            ViewerCommand::OpenFolder(folder) => self.open_folder(&folder),
+            ViewerCommand::OpenModel(model) => self.open_model(&model),
+            ViewerCommand::Export(view) => {
+                let notice = match self.export(view) {
+                    Ok(summary) => Diagnostic::ok(summary),
+                    Err(e) => Diagnostic::error(e),
+                };
+                self.notice(notice)
+            }
+        }
+    }
+
+    fn open_folder(&mut self, folder: &Path) -> Result<(), Stop> {
+        let path = match std::path::absolute(folder) {
+            Ok(path) if path.is_dir() => normalize(&path),
+            _ => return self.notice(Diagnostic::error(format!("{} is not a folder", folder.display()))),
+        };
+        let listing = FolderListing {
+            entries: list_models(&path),
+            path: path.clone(),
+        };
+        self.folder = Some(OpenFolder {
+            root: folder_root(&path),
+            listing: listing.clone(),
+        });
+        self.model = None;
+        self.send(ViewerMessage::Folder(listing))?;
+        self.send(ViewerMessage::Model(None))?;
+        self.sync_watches()
+    }
+
+    /// Opens `model`, first opening its project root if it's outside the
+    /// opened folder.
+    fn open_model(&mut self, model: &Path) -> Result<(), Stop> {
+        let path = match std::path::absolute(model) {
+            Ok(path) => normalize(&path),
+            Err(e) => return self.notice(Diagnostic::error(format!("{}: {e}", model.display()))),
+        };
+        let inside = self
+            .folder
+            .as_ref()
+            .is_some_and(|f| path.starts_with(&f.listing.path));
+        if !inside {
+            self.open_folder(&project_root(&path))?;
+        }
+        let root = match &self.folder {
+            Some(folder) => folder.root.clone(),
+            None => project_root(&path),
+        };
+        let pipeline = match Pipeline::new(&root, self.kernel) {
+            Ok(pipeline) => pipeline,
+            Err(e) => return self.notice(Diagnostic::error(e)),
+        };
+        self.model = Some(OpenModel {
+            path: path.clone(),
+            pipeline,
+            views: None,
+        });
+        self.send(ViewerMessage::Model(Some(path)))?;
+        self.evaluate("Loading")
+    }
+
+    /// Announces, evaluates and sends the open model, then re-syncs watches.
+    fn evaluate(&mut self, verb: &str) -> Result<(), Stop> {
+        let Some(model) = &mut self.model else {
+            return Ok(());
+        };
+        let name = model.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.tx
+            .send(SceneUpdate::loading(format!("{verb} {name}…")).into())
+            .map_err(|_| Stop::ViewerGone)?;
+        let update = model.pipeline.evaluate(&model.path);
         report(&update);
-        watched.sync(pipeline.dependencies())?;
-        if tx.send(update).is_err() {
-            // Viewer closed.
+        if let Some(views) = &update.views {
+            model.views = Some(views.clone());
+        }
+        self.send(update)?;
+        self.sync_watches()
+    }
+
+    fn sync_watches(&mut self) -> Result<(), Stop> {
+        let empty = BTreeSet::new();
+        let dependencies = self.model.as_ref().map_or(&empty, |m| m.pipeline.dependencies());
+        let folder = self.folder.as_ref().map(|f| f.listing.path.as_path());
+        self.watched.sync(dependencies, folder)?;
+        Ok(())
+    }
+
+    fn classify(&self, event: &notify::Event) -> Change {
+        Change {
+            reload: self
+                .model
+                .as_ref()
+                .is_some_and(|m| is_relevant(event, m.pipeline.dependencies())),
+            listing: self
+                .folder
+                .as_ref()
+                .is_some_and(|f| may_change_listing(event, &f.listing.path)),
+        }
+    }
+
+    /// Re-lists the folder, telling the viewer only if something changed.
+    fn refresh_listing(&mut self) -> Result<(), Stop> {
+        let Some(folder) = &mut self.folder else {
+            return Ok(());
+        };
+        let entries = list_models(&folder.listing.path);
+        if entries == folder.listing.entries {
             return Ok(());
         }
+        folder.listing.entries = entries;
+        let listing = folder.listing.clone();
+        self.send(ViewerMessage::Folder(listing))
+    }
+
+    /// Writes the last good build's `view` to [`export_path`].
+    fn export(&self, view: ViewMode) -> Result<String, String> {
+        let model = self.model.as_ref().ok_or("Open a model to export it.")?;
+        let name = model.path.file_name().unwrap_or_default().to_string_lossy();
+        let views = model
+            .views
+            .as_ref()
+            .ok_or_else(|| format!("{name} hasn't built yet, so there's nothing to export."))?;
+        let scene = match view {
+            ViewMode::Assembled => &views.assembled,
+            ViewMode::Print => views
+                .print
+                .as_ref()
+                .ok_or_else(|| format!("{name} has no print view."))?,
+        };
+        let root = match &self.folder {
+            Some(folder) => folder.root.clone(),
+            None => project_root(&model.path),
+        };
+        let out = export_path(&root, &model.path, view);
+        let objects = write_scene_3mf(scene, &out)?;
+        let shown = out.strip_prefix(&root).unwrap_or(&out);
+        Ok(format!(
+            "Wrote {} ({} view, {objects} objects)",
+            shown.display(),
+            view.label()
+        ))
     }
 }
 
@@ -559,9 +873,9 @@ impl<W: Watcher> WatchSet<W> {
         }
     }
 
-    /// Updates the watches to [`watch_targets`] of `dependencies`.
-    fn sync(&mut self, dependencies: &BTreeSet<PathBuf>) -> notify::Result<()> {
-        let wanted = watch_targets(dependencies);
+    /// Updates the watches to [`watch_targets`].
+    fn sync(&mut self, dependencies: &BTreeSet<PathBuf>, folder: Option<&Path>) -> notify::Result<()> {
+        let wanted = watch_targets(dependencies, folder);
         for (dir, recursive) in &self.current {
             if wanted.get(dir) != Some(recursive) {
                 // The directory may already be gone; nothing to clean up then.
@@ -589,6 +903,15 @@ pub fn is_relevant(event: &notify::Event, dependencies: &BTreeSet<PathBuf>) -> b
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     ) && event.paths.iter().any(|p| dependencies.contains(p))
+}
+
+/// A create, remove or rename under `folder`, which may add or drop entries
+/// in [`list_models`]. Content edits never do.
+pub fn may_change_listing(event: &notify::Event, folder: &Path) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    ) && event.paths.iter().any(|p| p.starts_with(folder))
 }
 
 #[cfg(test)]
@@ -647,21 +970,38 @@ mod tests {
             std::fs::write(path, source).unwrap();
         }
 
-        /// Starts the watcher thread and waits until it is watching.
-        fn watch(&self) -> (Receiver<SceneUpdate>, JoinHandle<notify::Result<()>>) {
+        /// Opens the model in a session and waits until it is built and watched.
+        fn watch(&self) -> (Receiver<ViewerMessage>, Running) {
             watch_model(self.model())
         }
     }
 
-    /// Evaluates `model` once (as main() does), then starts the watcher on it.
-    fn watch_model(model: PathBuf) -> (Receiver<SceneUpdate>, JoinHandle<notify::Result<()>>) {
+    /// A session thread, plus the viewer's command channel keeping it alive.
+    struct Running {
+        commands: Sender<ViewerCommand>,
+        handle: JoinHandle<notify::Result<()>>,
+    }
+
+    impl Running {
+        fn send(&self, command: ViewerCommand) {
+            self.commands.send(command).unwrap();
+        }
+    }
+
+    fn start_session(start: Start) -> (Receiver<ViewerMessage>, Running) {
         let (tx, rx) = mpsc::channel();
-        let mut pipeline = Pipeline::new(&project_root(&model), KernelChoice::Truck).unwrap();
-        pipeline.evaluate(&model);
-        let handle = thread::spawn(move || watch_and_reload(&model, pipeline, tx));
-        // The watcher registers asynchronously; give it a moment before editing.
+        let (commands, commands_rx) = mpsc::channel();
+        let handle = thread::spawn(move || run_session(start, KernelChoice::Truck, commands_rx, tx));
+        (rx, Running { commands, handle })
+    }
+
+    /// Opens `model` (as main() does), waits for its first build, then gives
+    /// the watcher a moment to register before the test edits anything.
+    fn watch_model(model: PathBuf) -> (Receiver<ViewerMessage>, Running) {
+        let (rx, running) = start_session(Start::Model(model));
+        next_result(&rx).expect("first build");
         thread::sleep(Duration::from_millis(300));
-        (rx, handle)
+        (rx, running)
     }
 
     fn cube_source(size: u32) -> String {
@@ -670,16 +1010,48 @@ mod tests {
         )
     }
 
-    /// The next evaluation result, skipping "loading" announcements.
-    fn next_result(rx: &Receiver<SceneUpdate>) -> Result<SceneUpdate, RecvTimeoutError> {
+    /// The next evaluation result, skipping "loading" announcements and
+    /// other messages.
+    fn next_result(rx: &Receiver<ViewerMessage>) -> Result<SceneUpdate, RecvTimeoutError> {
         let deadline = Instant::now() + RELOAD_TIMEOUT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let update = rx.recv_timeout(left)?;
-            if update.loading.is_none() {
-                return Ok(update);
+            if let ViewerMessage::Scene(update) = rx.recv_timeout(left)? {
+                if update.loading.is_none() {
+                    return Ok(update);
+                }
             }
         }
+    }
+
+    /// The next message, within [`RELOAD_TIMEOUT`].
+    fn next_message(rx: &Receiver<ViewerMessage>) -> ViewerMessage {
+        rx.recv_timeout(RELOAD_TIMEOUT).expect("message")
+    }
+
+    /// The next message that `pick` accepts, skipping others.
+    fn next_matching<T>(rx: &Receiver<ViewerMessage>, pick: impl Fn(ViewerMessage) -> Option<T>) -> T {
+        let deadline = Instant::now() + RELOAD_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Some(found) = pick(rx.recv_timeout(left).expect("message")) {
+                return found;
+            }
+        }
+    }
+
+    fn next_listing(rx: &Receiver<ViewerMessage>) -> FolderListing {
+        next_matching(rx, |m| match m {
+            ViewerMessage::Folder(listing) => Some(listing),
+            _ => None,
+        })
+    }
+
+    fn next_notice(rx: &Receiver<ViewerMessage>) -> Diagnostic {
+        next_matching(rx, |m| match m {
+            ViewerMessage::Notice(notice) => Some(notice),
+            _ => None,
+        })
     }
 
         fn max_extent(update: &SceneUpdate) -> f32 {
@@ -750,9 +1122,9 @@ export default () => fillet(cube(2), 5);
     }
 
     #[test]
-    fn cli_defaults_to_cube_on_occ() {
+    fn cli_path_is_optional_and_kernel_defaults_to_occ() {
         let args = parse(&[]).unwrap();
-        assert_eq!(args.model, PathBuf::from(DEFAULT_MODEL));
+        assert_eq!(args.path, None);
         // A CAD_KERNEL in the developer's shell legitimately changes the default.
         if std::env::var_os("CAD_KERNEL").is_none() {
             assert_eq!(args.kernel, KernelChoice::Occ);
@@ -798,7 +1170,7 @@ export default () => fillet(cube(2), 5);
     #[test]
     fn cli_takes_model_and_kernel() {
         let args = parse(&["models/bookshelf.ts", "--kernel", "occ"]).unwrap();
-        assert_eq!(args.model, PathBuf::from("models/bookshelf.ts"));
+        assert_eq!(args.path, Some(PathBuf::from("models/bookshelf.ts")));
         assert_eq!(args.kernel, KernelChoice::Occ);
     }
 
@@ -817,7 +1189,7 @@ export default () => fillet(cube(2), 5);
         let err = parse(&["--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         let help = err.to_string();
-        for needle in ["[MODEL]", "--kernel", "CAD_KERNEL", "truck", "occ"] {
+        for needle in ["[PATH]", "--kernel", "CAD_KERNEL", "truck", "occ"] {
             assert!(help.contains(needle), "help is missing {needle}:\n{help}");
         }
     }
@@ -828,8 +1200,12 @@ export default () => fillet(cube(2), 5);
         assert_eq!(args.export, Some(PathBuf::from("out.3mf")));
         assert_eq!(args.view, ExportView::Auto);
 
-        let args = parse(&["--export", "out.3mf", "--view", "assembled"]).unwrap();
+        let args = parse(&["m.ts", "--export", "out.3mf", "--view", "assembled"]).unwrap();
         assert_eq!(args.view, ExportView::Assembled);
+
+        // Export needs a model.
+        let err = parse(&["--export", "out.3mf"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
 
         // --view only means something for export.
         let err = parse(&["--view", "print"]).unwrap_err();
@@ -1746,12 +2122,15 @@ export default () => roundedBox({ wall: 3, radius: 3 });
         project.write("lib/a.ts", "");
         project.write("lib/b.ts", "");
 
-        let targets = watch_targets(&BTreeSet::from([
-            project.model(),
-            root.join("dsl/cad.ts"),
-            root.join("lib/a.ts"),
-            root.join("lib/b.ts"),
-        ]));
+        let targets = watch_targets(
+            &BTreeSet::from([
+                project.model(),
+                root.join("dsl/cad.ts"),
+                root.join("lib/a.ts"),
+                root.join("lib/b.ts"),
+            ]),
+            None,
+        );
         assert_eq!(
             targets,
             BTreeMap::from([
@@ -1766,10 +2145,10 @@ export default () => roundedBox({ wall: 3, radius: 3 });
     fn missing_folders_are_watched_from_nearest_existing_ancestor() {
         let project = Project::new(&cube_source(10));
         let root = project.root();
-        let targets = watch_targets(&BTreeSet::from([
-            project.model(),
-            root.join("parts/new/thing.ts"),
-        ]));
+        let targets = watch_targets(
+            &BTreeSet::from([project.model(), root.join("parts/new/thing.ts")]),
+            None,
+        );
         assert_eq!(
             targets,
             BTreeMap::from([(root.to_path_buf(), true), (root.join("models"), false)])
@@ -2004,40 +2383,313 @@ export default () => roundedBox({ wall: 3, radius: 3 });
     }
 
     #[test]
-    fn load_and_watch_announces_then_delivers_then_watches() {
+    fn opening_a_model_lists_its_project_then_announces_delivers_and_watches() {
         let project = Project::new(&cube_source(2));
-        let (tx, rx) = mpsc::channel();
-        let (model, pipeline) = (project.model(), project.pipeline());
-        thread::spawn(move || load_and_watch(&model, pipeline, tx));
+        let (rx, _running) = start_session(Start::Model(project.model()));
 
-        let first = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        let ViewerMessage::Folder(listing) = next_message(&rx) else { panic!("folder first") };
+        assert_eq!(listing.path, project.root());
+        assert!(matches!(next_message(&rx), ViewerMessage::Model(None)));
+        let ViewerMessage::Model(Some(open)) = next_message(&rx) else { panic!("then the model") };
+        assert_eq!(open, project.model());
+
+        let ViewerMessage::Scene(first) = next_message(&rx) else { panic!("loading") };
         assert_eq!(first.loading.as_deref(), Some("Loading model.ts…"));
-        let result = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        let ViewerMessage::Scene(result) = next_message(&rx) else { panic!("result") };
         assert!(result.loading.is_none());
         assert_eq!(max_extent(&result), 2.0);
 
         // Then it's watching: an edit is announced as a rebuild before its result.
         thread::sleep(Duration::from_millis(300));
         project.write_model(&cube_source(3));
-        let announce = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        let ViewerMessage::Scene(announce) = next_message(&rx) else { panic!("announce") };
         assert_eq!(announce.loading.as_deref(), Some("Rebuilding model.ts…"));
-        let rebuilt = rx.recv_timeout(RELOAD_TIMEOUT).unwrap();
+        let ViewerMessage::Scene(rebuilt) = next_message(&rx) else { panic!("rebuilt") };
         assert_eq!(max_extent(&rebuilt), 3.0);
     }
 
         #[test]
     fn stops_once_viewer_is_gone() {
         let project = Project::new(&cube_source(10));
-        let (rx, handle) = project.watch();
+        let (rx, running) = project.watch();
         drop(rx);
 
         project.write_model(&cube_source(11));
+        assert_stops(running.handle);
+    }
 
+    fn assert_stops(handle: JoinHandle<notify::Result<()>>) {
         let deadline = Instant::now() + RELOAD_TIMEOUT;
         while !handle.is_finished() {
-            assert!(Instant::now() < deadline, "watcher thread kept running");
+            assert!(Instant::now() < deadline, "session thread kept running");
             thread::sleep(Duration::from_millis(20));
         }
         assert!(handle.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn stops_when_viewer_drops_its_command_channel() {
+        // Closing the window drops both ends; this one alone is enough, even
+        // with no file changes to notice the dead message channel by.
+        let project = Project::new(&cube_source(10));
+        let (_rx, running) = project.watch();
+        drop(running.commands);
+        assert_stops(running.handle);
+    }
+
+    // --- Folders, file list and export from the viewer ----------------------
+
+    fn names(entries: &[FileEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match e {
+                FileEntry::Dir { name, children } => format!("{name}/[{}]", names(children).join(", ")),
+                FileEntry::File { name, .. } => name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_models_shows_folders_then_ts_files_sorted() {
+        let project = Project::new(&cube_source(1));
+        project.write("models/Bracket.ts", "");
+        project.write("models/parts/leg.ts", "");
+        project.write("models/parts/deep/er/nut.ts", "");
+        project.write("models/parts/notes.md", "");
+        project.write("models/types.d.ts", "");
+        project.write("outputs/model_print.3mf", "");
+        project.write("zebra.ts", "");
+        std::fs::create_dir_all(project.root().join("empty")).unwrap();
+
+        assert_eq!(
+            names(&list_models(project.root())),
+            [
+                "dsl/[cad.ts]",
+                "models/[parts/[deep/[er/[nut.ts]], leg.ts], Bracket.ts, model.ts]",
+                "zebra.ts",
+            ]
+        );
+        let FileEntry::File { path, .. } = &list_models(&project.root().join("models"))[1] else {
+            panic!("file")
+        };
+        assert_eq!(path, &project.root().join("models/Bracket.ts"));
+    }
+
+    #[test]
+    fn folder_root_is_the_enclosing_project() {
+        let project = Project::new(&cube_source(1));
+        assert_eq!(folder_root(project.root()), project.root());
+        assert_eq!(folder_root(&project.root().join("models")), project.root());
+        let loose = tempfile::tempdir().unwrap();
+        assert_eq!(folder_root(loose.path()), loose.path());
+    }
+
+    #[test]
+    fn resolve_start_tells_folders_from_models() {
+        let project = Project::new(&cube_source(1));
+        assert_eq!(
+            resolve_start(Path::new("models"), project.root()),
+            Ok(Start::Folder(project.root().join("models")))
+        );
+        assert_eq!(
+            resolve_start(Path::new("models/../models/model.ts"), project.root()),
+            Ok(Start::Model(project.model()))
+        );
+        assert!(resolve_start(Path::new("nope.ts"), project.root()).unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn export_path_is_outputs_model_view() {
+        let root = Path::new("/p");
+        assert_eq!(
+            export_path(root, Path::new("/p/models/shelf.ts"), ViewMode::Print),
+            Path::new("/p/outputs/shelf_print.3mf")
+        );
+        assert_eq!(
+            export_path(root, Path::new("/p/a/b.c.ts"), ViewMode::Assembled),
+            Path::new("/p/outputs/b.c_assembled.3mf")
+        );
+    }
+
+    #[test]
+    fn opened_folder_covers_watches_inside_it() {
+        let project = Project::new(&cube_source(10));
+        let root = project.root();
+        let deps = BTreeSet::from([project.model(), root.join("dsl/cad.ts"), root.join("lib/a.ts")]);
+        project.write("lib/a.ts", "");
+
+        assert_eq!(
+            watch_targets(&deps, Some(root)),
+            BTreeMap::from([(root.to_path_buf(), true)])
+        );
+        // A subfolder: dependencies outside it still need their own watches.
+        assert_eq!(
+            watch_targets(&deps, Some(&root.join("models"))),
+            BTreeMap::from([
+                (root.join("dsl"), false),
+                (root.join("lib"), false),
+                (root.join("models"), true),
+            ])
+        );
+    }
+
+    #[test]
+    fn only_structural_changes_in_the_folder_can_change_the_listing() {
+        let folder = Path::new("/p");
+        let rename = EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::To));
+        let edit = EventKind::Modify(ModifyKind::Data(DataChange::Content));
+        assert!(may_change_listing(&event(EventKind::Create(CreateKind::File), "/p/a.ts"), folder));
+        assert!(may_change_listing(&event(EventKind::Remove(notify::event::RemoveKind::Any), "/p/x"), folder));
+        assert!(may_change_listing(&event(rename, "/p/m/b.ts"), folder));
+        assert!(!may_change_listing(&event(edit, "/p/a.ts"), folder));
+        assert!(!may_change_listing(&event(EventKind::Create(CreateKind::File), "/q/a.ts"), folder));
+    }
+
+    #[test]
+    fn opening_a_folder_lists_it_with_no_model() {
+        let project = Project::new(&cube_source(1));
+        let (rx, running) = start_session(Start::Empty);
+        running.send(ViewerCommand::OpenFolder(project.root().join("models")));
+
+        let ViewerMessage::Folder(listing) = next_message(&rx) else { panic!("folder") };
+        assert_eq!(listing.path, project.root().join("models"));
+        assert_eq!(names(&listing.entries), ["model.ts"]);
+        assert!(matches!(next_message(&rx), ViewerMessage::Model(None)));
+        // Nothing is built until a model is picked.
+        assert!(rx.recv_timeout(QUIET).is_err());
+    }
+
+    #[test]
+    fn opening_a_missing_folder_is_a_notice() {
+        let project = Project::new(&cube_source(1));
+        let (rx, running) = start_session(Start::Empty);
+        running.send(ViewerCommand::OpenFolder(project.root().join("nope")));
+        let notice = next_notice(&rx);
+        assert!(!notice.ok && notice.message.contains("is not a folder"), "{notice:?}");
+    }
+
+    #[test]
+    fn file_list_follows_files_added_and_removed_but_not_edits() {
+        let project = Project::new(&cube_source(1));
+        let (rx, _running) = start_session(Start::Folder(project.root().to_path_buf()));
+        next_listing(&rx);
+        thread::sleep(Duration::from_millis(300));
+
+        project.write("models/parts/new.ts", &cube_source(2));
+        assert_eq!(
+            names(&next_listing(&rx).entries),
+            ["dsl/[cad.ts]", "models/[parts/[new.ts], model.ts]"]
+        );
+
+        // Editing a file, or adding a non-model file, changes nothing listed.
+        project.write("models/parts/new.ts", &cube_source(3));
+        project.write("models/notes.md", "hi");
+        assert!(rx.recv_timeout(QUIET).is_err(), "listing resent without a change");
+
+        std::fs::remove_file(project.root().join("models/parts/new.ts")).unwrap();
+        assert_eq!(names(&next_listing(&rx).entries), ["dsl/[cad.ts]", "models/[model.ts]"]);
+    }
+
+    #[test]
+    fn picking_a_model_builds_it_and_switching_stops_the_old_ones_reloads() {
+        let project = Project::new(&cube_source(1));
+        project.write("models/other.ts", &cube_source(2));
+        let (rx, running) = start_session(Start::Folder(project.root().to_path_buf()));
+
+        running.send(ViewerCommand::OpenModel(project.model()));
+        assert_eq!(max_extent(&next_result(&rx).unwrap()), 1.0);
+        running.send(ViewerCommand::OpenModel(project.root().join("models/other.ts")));
+        assert_eq!(max_extent(&next_result(&rx).unwrap()), 2.0);
+        thread::sleep(Duration::from_millis(300));
+
+        project.write_model(&cube_source(5));
+        assert!(rx.recv_timeout(QUIET).is_err(), "closed model still reloads");
+        project.write("models/other.ts", &cube_source(6));
+        assert_eq!(max_extent(&next_result(&rx).unwrap()), 6.0);
+    }
+
+    #[test]
+    fn dependencies_outside_an_opened_subfolder_still_reload() {
+        let project = Project::new(&cube_source(10));
+        let (rx, running) = start_session(Start::Folder(project.root().join("models")));
+        running.send(ViewerCommand::OpenModel(project.model()));
+        assert_eq!(max_extent(&next_result(&rx).unwrap()), 10.0);
+        thread::sleep(Duration::from_millis(300));
+
+        let dsl = project.root().join("dsl/cad.ts");
+        let source = std::fs::read_to_string(&dsl).unwrap();
+        std::fs::write(&dsl, format!("{source}
+// touched
+")).unwrap();
+        assert_eq!(max_extent(&next_result(&rx).unwrap()), 10.0);
+    }
+
+    #[test]
+    fn opening_a_model_outside_the_folder_opens_its_project() {
+        let project = Project::new(&cube_source(1));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (rx, running) = start_session(Start::Folder(elsewhere.path().to_path_buf()));
+        next_listing(&rx);
+
+        running.send(ViewerCommand::OpenModel(project.model()));
+        assert_eq!(next_listing(&rx).path, project.root());
+        assert_eq!(max_extent(&next_result(&rx).unwrap()), 1.0);
+    }
+
+    #[test]
+    fn exports_the_view_on_screen_to_outputs() {
+        let project = Project::new(&print_model(&coaster("a", 40)));
+        let (rx, running) = start_session(Start::Folder(project.root().join("models")));
+        running.send(ViewerCommand::OpenModel(project.model()));
+        next_result(&rx).unwrap();
+
+        running.send(ViewerCommand::Export(ViewMode::Print));
+        let notice = next_notice(&rx);
+        assert!(notice.ok, "{notice:?}");
+        let out = project.root().join("outputs/model_print.3mf");
+        assert_eq!(
+            notice.message,
+            format!("Wrote {} (print view, 1 objects)", Path::new("outputs").join("model_print.3mf").display())
+        );
+        assert_eq!(exported_objects(&out), ["a"]);
+
+        running.send(ViewerCommand::Export(ViewMode::Assembled));
+        assert!(next_notice(&rx).ok);
+        assert!(project.root().join("outputs/model_assembled.3mf").is_file());
+    }
+
+    #[test]
+    fn export_explains_what_is_missing() {
+        let project = Project::new(&cube_source(0));
+        let (rx, running) = start_session(Start::Empty);
+
+        running.send(ViewerCommand::Export(ViewMode::Assembled));
+        assert_eq!(next_notice(&rx).message, "Open a model to export it.");
+
+        // cube(0) fails to build: nothing on screen to export.
+        running.send(ViewerCommand::OpenModel(project.model()));
+        assert!(next_result(&rx).unwrap().views.is_none());
+        running.send(ViewerCommand::Export(ViewMode::Assembled));
+        let notice = next_notice(&rx);
+        assert!(!notice.ok && notice.message.contains("hasn't built yet"), "{notice:?}");
+
+        thread::sleep(Duration::from_millis(300));
+        project.write_model(&cube_source(3));
+        next_result(&rx).unwrap();
+        running.send(ViewerCommand::Export(ViewMode::Print));
+        assert_eq!(next_notice(&rx).message, "model.ts has no print view.");
+        assert!(!project.root().join("outputs").exists());
+    }
+
+    #[test]
+    fn export_keeps_the_last_good_build_after_an_error() {
+        let project = Project::new(&cube_source(4));
+        let (rx, running) = project.watch();
+        project.write_model(&cube_source(0));
+        assert!(next_result(&rx).unwrap().views.is_none());
+
+        running.send(ViewerCommand::Export(ViewMode::Assembled));
+        assert!(next_notice(&rx).ok);
+        assert!(project.root().join("outputs/model_assembled.3mf").is_file());
     }
 }

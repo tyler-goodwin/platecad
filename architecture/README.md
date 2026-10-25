@@ -20,18 +20,23 @@ flowchart LR
   occ -->|"TessellatedScene per view"| update["SceneUpdate (channel)"]
   truck --> update
   update --> view["cad-view-threed (three-d + egui)"]
-  occ -->|"--export"| export["cad-export (3MF)"]
-  watch["notify watcher"] -->|"debounced reload"| pipeline
+  view -->|"ViewerCommand: open folder / model, export"| session["cad-app session"]
+  session --> pipeline
+  occ -->|"--export, Export 3MF"| export["cad-export (3MF)"]
+  watch["notify watcher"] -->|"debounced reload, file list"| session
 ```
 
-0. The window opens immediately. The reload thread (`load_and_watch`)
-   announces "Loading model.ts…", then runs steps 1 to 3.
+0. The window opens immediately. The session thread (`run_session`) opens
+   the folder or model it was started with, announces "Loading model.ts…",
+   then runs steps 1 to 3.
 1. The script host evaluates the model file's default export into
    `ModelViews { assembled, print? }`.
 2. The pipeline asks the kernel to build each view into a `TessellatedScene`.
-3. A background thread sends `SceneUpdate { views, diagnostics }` over a
-   channel; the viewer drains it every frame and swaps GPU meshes.
-4. A file watcher re-runs steps 1 to 3 after edits settle.
+3. The session sends `SceneUpdate { views, diagnostics }` over a channel
+   (wrapped in a `ViewerMessage`); the viewer drains it every frame and
+   swaps GPU meshes.
+4. A file watcher re-runs steps 1 to 3 after edits settle. The viewer's
+   buttons send `ViewerCommand`s back on a second channel.
 
 On any failure the update carries only a diagnostic, and the viewer keeps the
 last good meshes.
@@ -48,10 +53,10 @@ kernel and renderer can each be swapped without touching the others.
 | `cad-kernel-truck` | truck B-rep implementation: builds shells, tessellates, emits normals, colors and edges. |
 | `cad-kernel-occ` | OpenCascade backend via cadrum (statically linked OCCT 8.0.1). Spike: everything except bare 2D profiles at the top of a view. |
 | `cad-script` | `trait ScriptHost` plus the rustyscript implementation and its sandboxed import loader. |
-| `cad-view` | `SceneUpdate`, `SceneViews`, `ViewMode`/`ViewSelection` (pure view logic) and `trait ViewportApp`. |
+| `cad-view` | `SceneUpdate`, `SceneViews`, `ViewMode`/`ViewSelection` (pure view logic), the viewer protocol (`ViewerMessage`, `ViewerCommand`, `FolderListing`) and `trait ViewportApp`. |
 | `cad-view-threed` | three-d window: orbit camera, lighting, edge cylinders, egui overlay. |
 | `cad-export` | `TessellatedScene` to 3MF: one watertight object per part, with base-material colors. |
-| `cad-app` | Binary plus library: CLI, project root discovery, `Pipeline`, watcher. The library half is what the tests drive. |
+| `cad-app` | Binary plus library: CLI, project root discovery, `Pipeline`, the viewer session (commands, folder listing, watcher, export). The library half is what the tests drive. |
 
 `dsl/cad.ts` and `models/` are TypeScript, not crates.
 
@@ -194,18 +199,23 @@ local use, but distributing the binary carries relinking obligations.
 ## App, CLI and hot reload
 
 ```
-cad-app [MODEL] [--kernel occ|truck]                         # open the viewer (default occ; CAD_KERNEL env works too)
-cad-app [MODEL] --export out.3mf [--view auto|print|assembled]  # write a 3MF and exit, no window
+cad-app [PATH] [--kernel occ|truck]                         # open the viewer (default occ; CAD_KERNEL env works too)
+cad-app MODEL --export out.3mf [--view auto|print|assembled]  # write a 3MF and exit, no window
 ```
 
-MODEL defaults to `models/cube.ts`. `--view auto` exports the print layout
-when the model has one, and the assembled view otherwise.
+PATH is a model file or a folder. A model opens with its project root in
+the file list; a folder opens with no model picked. Without PATH, the cwd
+is opened if it's a project root, and otherwise the viewer starts empty.
+`--view auto` exports the print layout when the model has one, and the
+assembled view otherwise.
 
-- The model path is resolved against the cwd and must exist, or the app exits
+- The path is resolved against the cwd and must exist, or the app exits
   with code 2 before opening a window.
 - The **project root** is the nearest ancestor of the model that contains
-  `dsl/cad.ts`, or the model's own folder for a standalone script. It bounds
-  what scripts can import.
+  `dsl/cad.ts`, or the model's own folder for a standalone script. For an
+  opened folder it's the folder or its nearest such ancestor, or else the
+  folder itself (`folder_root`). It bounds what scripts can import, and
+  viewer exports go under it.
 - **Import-aware watching.** The script host records every file an eval
   reads: the model plus its transitive imports, including ones that failed
   to load. The pipeline keeps this as the model's dependencies. A successful
@@ -223,6 +233,29 @@ when the model has one, and the assembled view otherwise.
 - Imports whose bindings are never used are dropped by the TS transpiler and
   never loaded, so they're correctly not dependencies.
 
+### Session
+
+`run_session` is the app side of the viewer. One thread handles commands
+and file events from a single input channel, so a command that arrives
+during a debounce waits its turn instead of being lost.
+
+- **Opened folder.** It's watched recursively (dependency folders inside it
+  need no watch of their own). Only creates, removes and renames under it
+  re-list it, and the viewer hears about it only if the listing changed.
+  Content edits never re-list.
+- **Targeted reloads.** Events reload the open model only if they touch one
+  of its dependencies, which may lie outside the folder (opening `models/`
+  still watches `dsl/cad.ts`). Other models in the folder are never built
+  until picked.
+- **Opening a model** outside the opened folder opens its project root
+  first. Each opened model gets a fresh `Pipeline` rooted at the folder's
+  project root.
+- **Export** writes the last good build of the view on screen to
+  `<root>/outputs/<model>_<view>.3mf` (`export_path`), creating `outputs/`.
+  After a failed rebuild that's still what the viewer shows. The result
+  (or why there's nothing to export) comes back as a `ViewerMessage::Notice`.
+- The session stops when the viewer drops either channel end.
+
 ## Viewer
 
 - three-d physical material, lit by ambient plus key and fill lights. Vertex
@@ -236,7 +269,16 @@ when the model has one, and the assembled view otherwise.
   shows a spinner and "Loading model.ts… 2.3 s" until the result arrives,
   keeping the current meshes. A slow or stuck build shows as a timer that
   keeps counting, never as a missing window.
-- The egui overlay has an **Assembled/Print toggle** (Print is disabled when
+- A left **Files panel** has an "Open folder…" button (the native picker
+  via `rfd`, run on its own thread so the window keeps drawing) and the
+  folder's tree: folders that contain `.ts` files, at any depth, then `.ts`
+  files (not `.d.ts`), each sorted case-insensitively. Clicking a file opens
+  it, and the open model is highlighted with its folders expanded. Nothing
+  is skipped by name; empty folders just don't show.
+- Switching models drops the old meshes, diagnostics and notice, and frames
+  the camera on the new model when it arrives.
+- The egui overlay has an **Export 3MF** button for the view on screen
+  (see Session), with the outcome shown under it, an **Assembled/Print toggle** (Print is disabled when
   the model has no print view), a collapsible **part list** for the shown
   view (name and triangle count), reload diagnostics and an orbit hint.
 - In Print view, build plates are outlined in blue at z = 0, and framing

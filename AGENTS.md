@@ -19,7 +19,7 @@ models/*.ts --(cad-script)--> ModelViews IR --(Kernel)--> TessellatedScene --> v
 
 ```sh
 cargo test --workspace                                # the main way to verify anything
-cargo run -p cad-app -- models/bookshelf.ts           # opens the viewer window (OCC kernel by default)
+cargo run -p cad-app -- models/bookshelf.ts           # opens the viewer window (OCC kernel by default); a folder works too
 cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|assembled]  # headless
 ```
 
@@ -41,10 +41,10 @@ cargo run -p cad-app -- models/bookshelf.ts --export out.3mf [--view auto|print|
 | `crates/cad-kernel-truck` | The real kernel: spec tree to bodies (`build_bodies`), then tessellation (normals, colors, edges, part ranges). |
 | `crates/cad-kernel-occ` | OpenCascade kernel via cadrum. `tests/conformance.rs` keeps it in step with truck. |
 | `crates/cad-script` | `ScriptHost` trait and the rustyscript host: sandboxed imports and dependency tracking. |
-| `crates/cad-view` | `SceneUpdate`, view selection logic, `ViewportApp` trait (no GPU code). |
+| `crates/cad-view` | `SceneUpdate`, view selection logic, viewer protocol (`ViewerMessage`/`ViewerCommand`), `ViewportApp` trait (no GPU code). |
 | `crates/cad-view-threed` | three-d + egui window. |
 | `crates/cad-export` | `TessellatedScene` to 3MF (welded, watertight, one object per part). |
-| `crates/cad-app` | Binary plus library: CLI (clap), `Pipeline`, file watcher, `export_3mf`. Most integration tests live here. |
+| `crates/cad-app` | Binary plus library: CLI (clap), `Pipeline`, `run_session` (viewer commands, file list, watcher), `export_3mf`. Most integration tests live here. |
 | `dsl/cad.ts` | The TS DSL: `rect`, `polygon`, `circle`, `cutout`, `extrude`, `revolve`, `box`, `cube`, `translate`, `rotate`, `group`, `union`, `difference`, `intersect`, `fillet`, `chamfer`, `color`, `part`, `arrange`. |
 | `models/` | Example models (`cube`, `square`, `bookshelf`, `coasters`, `desk_organizer`, `rounded_box`). The user edits these live. |
 | `printer.toml` | Optional bed size, used by `arrange` in print views. Watched like an import. |
