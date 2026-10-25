@@ -124,6 +124,23 @@ agents working in the repo. Run the tests with `cargo test --workspace`.
 
 ## License
 
-MIT. The binary statically links OpenCascade (OCCT), which is LGPL-2.1 with
-the OCCT exception. That's fine for personal use, but distributing builds
-carries LGPL relinking obligations.
+platecad is MIT licensed. See [LICENSE](LICENSE).
+
+## Third-party software
+
+platecad uses facilities provided by
+**[Open CASCADE Technology](https://dev.opencascade.org/)** (OCCT) for its
+geometry. OCCT is licensed under the
+[GNU LGPL 2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html)
+with the
+[Open CASCADE exception](https://github.com/Open-Cascade-SAS/OCCT/blob/master/OCCT_LGPL_EXCEPTION.txt).
+Its source is at [Open-Cascade-SAS/OCCT](https://github.com/Open-Cascade-SAS/OCCT).
+The `plate` binary statically links an unmodified prebuilt OCCT 8.0.1
+fetched by [cadrum](https://github.com/lzpel/cadrum). Since platecad's
+source is public, you can rebuild it against a modified OCCT. If you
+distribute builds, ship `LICENSE_LGPL_21.txt` and `OCCT_LGPL_EXCEPTION.txt`
+(found in the OCCT download under `target/`) alongside them.
+
+The other dependencies (Rust crates, including V8 via rustyscript) are under
+permissive licenses such as MIT, Apache-2.0, BSD, ISC and Zlib, with a few
+MPL-2.0 crates.
