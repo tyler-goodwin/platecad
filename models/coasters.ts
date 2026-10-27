@@ -2,10 +2,11 @@ import {
   arrange,
   box,
   color,
-  difference,
   group,
   part,
+  pipeline,
   rotate,
+  step,
   translate,
   type ColorInput,
   type Model,
@@ -101,7 +102,7 @@ function holder(p: CoasterParams, stack: number): ModelSpec {
     height: stack + OVERSHOOT,
     at: [t, -OVERSHOOT, p.floor],
   });
-  return color(part("holder", difference(block, cutter)), p.baseColor);
+  return pipeline(block, step.cut(cutter), step.part("holder"), step.color(p.baseColor));
 }
 
 /** Coaster `i` (0-based): base plus stripes, stripes turned 90 degrees on every other one. */

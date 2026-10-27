@@ -1,20 +1,19 @@
 import {
   arrange,
+  bounds,
   box,
-  chamfer,
   circle,
   color,
   cutout,
-  difference,
   extrude,
-  fillet,
   group,
   part,
+  pipeline,
   polygon,
   rect,
-  revolve,
+  roundedRect,
+  step,
   translate,
-  union,
   type ColorInput,
   type Model,
   type ModelSpec,
@@ -26,10 +25,12 @@ import {
  * - Pen cup: an L-shaped polygon (wall plus floor) revolved into a cup.
  * - Card holder: a base block fused with a back rest leaning at `lean`
  *   degrees (a slanted extrude), with slanted card slots cut into the base.
- * - Base plate: a plate with round holes for press-fit magnets (a cutout).
+ * - Base plate: a rounded rectangle with round holes for press-fit magnets
+ *   (a cutout), so its corners need no fillet.
  *
- * Fillets round the plate's and holder's corners, and a small chamfer on
- * the cup's bottom edge keeps the first layer from flaring (OCC kernel).
+ * A fillet rounds the holder's corners, and a small chamfer on the cup's
+ * bottom edge keeps the first layer from flaring. The cup and holder are
+ * stood on the plate at its measured height (`bounds`).
  *
  * Booleans need faces that cross rather than line up, so the back rest
  * starts inside the base block and stops short of its sides, and the slot
@@ -82,7 +83,7 @@ function cup(p: OrganizerParams): ModelSpec {
     [r - w, w],
     [0, w],
   ]);
-  return chamfer(revolve(section), 0.8, { edges: "<Z" });
+  return pipeline(section, step.revolve(), step.chamfer(0.8, { edges: "<Z" }));
 }
 
 /** Direction leaning back (toward +Y) by `degrees` from vertical. */
@@ -109,7 +110,12 @@ function cardHolder(p: OrganizerParams): ModelSpec {
     translate(extrude(rect({ width: w - 6, height: 3 }), { distance: 20, direction }), [3, 8 + i * 10, h - 6]),
   );
 
-  return fillet(difference(union(base, rest), ...cutters), 3, { edges: "|Z" });
+  return pipeline(
+    base,
+    step.add(rest),
+    ...(cutters.length > 0 ? [step.cut(...cutters)] : []),
+    step.fillet(3, { edges: "|Z" }),
+  );
 }
 
 function basePlate(p: OrganizerParams, width: number, depth: number): ModelSpec {
@@ -120,8 +126,7 @@ function basePlate(p: OrganizerParams, width: number, depth: number): ModelSpec 
     [inset, depth - inset],
     [width - inset, depth - inset],
   ].map(([x, y]) => circle(p.magnet / 2, { at: [x, y] }));
-  const plate = extrude(cutout(rect({ width, height: depth }), ...holes), { distance: PLATE_THICKNESS });
-  return fillet(plate, 6, { edges: "|Z" });
+  return extrude(cutout(roundedRect({ width, height: depth, radius: 6 }), ...holes), { distance: PLATE_THICKNESS });
 }
 
 export function organizer(overrides: Partial<OrganizerParams> = {}): Model {
@@ -142,7 +147,7 @@ export function organizer(overrides: Partial<OrganizerParams> = {}): Model {
   const plateDepth = GAP + Math.max(cupSize, p.holderDepth) + GAP;
   const platePart = color(part("base plate", basePlate(p, plateWidth, plateDepth)), p.colors.plate);
 
-  const onPlate = PLATE_THICKNESS;
+  const onPlate = bounds(platePart).max[2];
   return {
     assembled: group(
       platePart,

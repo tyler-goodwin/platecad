@@ -5,13 +5,14 @@ import {
   color,
   cone,
   cylinder,
-  difference,
   group,
   part,
+  pipeline,
   polygon,
   revolve,
   rotate,
   sphere,
+  step,
   torus,
   translate,
   union,
@@ -115,7 +116,7 @@ function fur(p: CatParams): ModelSpec {
   ]);
   const solid = union(body(p.segments), sphere(HEAD_R, { at: HEAD }), ear(-1), ear(1), ...legs, tail());
   const ground = box({ width: 200, depth: 200, height: 10, at: [-100, -100, -10] });
-  return color(part("fur", difference(solid, ground)), p.fur);
+  return pipeline(solid, step.cut(ground), step.part("fur"), step.color(p.fur));
 }
 
 /** A point on the head's surface, `out` mm beyond it, in the direction of `toward`. */
