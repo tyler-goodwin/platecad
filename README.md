@@ -6,15 +6,20 @@ model is ready, you lay its parts out on your printer's bed and export a
 3MF for your slicer.
 
 ```ts
-import { arrange, box, circle, color, difference, extrude, fillet, part, translate } from "../dsl/cad.ts";
+import { arrange, circle, extrude, pipeline, roundedRect, step, translate } from "../dsl/cad";
 
 const size = 90; // mm
 
 // A rounded square with a pocket underneath for a 10 mm magnet.
 function coaster(name: string) {
-  const body = fillet(box({ width: size, depth: size, height: 5 }), 8, { edges: "|Z" });
   const pocket = translate(extrude(circle(5.1), { distance: 3 }), [size / 2, size / 2, -1]);
-  return part(name, color(difference(body, pocket), "#2f6f9f"));
+  return pipeline(
+    roundedRect({ width: size, height: size, radius: 8 }),
+    step.extrude({ distance: 5 }),
+    step.cut(pocket),
+    step.color("#2f6f9f"),
+    step.part(name),
+  );
 }
 
 const set = ["one", "two", "three", "four"].map(coaster);
@@ -28,10 +33,14 @@ export default () => ({
 ## Features
 
 - **TypeScript models.** Models are plain functions, so loops, parameters
-  and helper modules all just work. Your editor type-checks them against
-  the DSL.
+  and helper modules all just work. Imports resolve the way TypeScript's
+  do, so `.ts` is optional. Your editor type-checks them against the DSL.
 - **Real solids.** Geometry is B-rep, built with OpenCascade, with booleans,
-  fillets, chamfers, extrude and revolve.
+  fillets, chamfers, extrude, revolve, and true spheres, cylinders, cones
+  and tori.
+- **Measure as you build.** `bounds(shape)` asks the kernel how big a shape
+  really came out, so parts can be fitted to each other instead of to
+  hand-worked numbers.
 - **Hot reload.** Saving a model, or any file it imports, rebuilds it in the
   viewer. Errors show in the viewer and keep the last good model on screen.
 - **Two views per model.** `assembled` shows how the parts go together, and
@@ -40,7 +49,8 @@ export default () => ({
 - **3MF export.** Each named part becomes its own watertight object, with
   colors, ready for multi-material slicing.
 - **Sandboxed scripts.** Models can only import files inside their project.
-  They get no filesystem or network access.
+  They get no filesystem or network access, and a script stuck in an
+  endless loop is stopped after 10 seconds.
 
 ## Getting started
 
@@ -99,16 +109,32 @@ All lengths are millimeters, and +Z is up.
 
 | | |
 |---|---|
-| 2D profiles | `rect`, `circle`, `polygon`, `cutout` (a profile with holes) |
-| Solids | `extrude`, `revolve`, `box`, `cube` |
+| 2D profiles | `rect`, `roundedRect`, `slot`, `circle`, `polygon`, `cutout` (a profile with holes) |
+| Solids | `extrude`, `revolve`, `box`, `cube`, `sphere`, `cylinder`, `cone`, `torus` |
 | Placement | `translate`, `rotate`, `group` |
 | Booleans | `union`, `difference`, `intersect` |
 | Edges | `fillet`, `chamfer`, with edge selectors such as `"\|Z"` and `">Z"` |
 | Printing | `part` (names an exported object), `color`, `arrange` (packs parts onto the bed) |
+| Steps | `pipeline` with `step.extrude`, `step.cut`, `step.fillet`, … (see below) |
+| Measuring | `bounds` (a shape's `min`, `max`, `size` and `center`, from the kernel) |
+
+`pipeline` runs a shape through a list of steps, so a chain of operations
+reads top to bottom instead of inside out, as in the coaster above. The
+`step.*` helpers are the usual operations minus the shape they act on
+(`cut`, `add` and `intersect` are the booleans), and any function from
+shape to shape works as a step too.
+
+`bounds` builds the shape to measure it, and the result is cached for the
+real build, so measuring costs little:
+
+```ts
+const b = bounds(body);
+const lid = box({ width: b.size[0], depth: b.size[1], height: 2, at: [b.min[0], b.min[1], b.max[2]] });
+```
 
 See [`dsl/cad.ts`](dsl/cad.ts) for the details, and [`models/`](models)
-for examples: a bookshelf, coasters with a holder, a desk organizer and a
-rounded box.
+for examples: a bookshelf, coasters with a holder, a desk organizer, a
+rounded box, and a cat that stress-tests the kernel.
 
 ## How it works
 
