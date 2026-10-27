@@ -1,4 +1,4 @@
-use cad_ir::{Bed, EdgeSelector, MeshQuality, ModelSpec, Plate, TessellatedScene};
+use cad_ir::{Bed, Bounds, EdgeSelector, MeshQuality, ModelSpec, Plate, TessellatedScene};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,6 +20,12 @@ pub trait Kernel {
     fn build(&mut self, spec: &ModelSpec) -> Result<TessellatedScene, KernelError> {
         self.build_with(spec, MeshQuality::Fine)
     }
+
+    /// The tight bounds of `spec`'s solids, as `arrange` measures them: within
+    /// the fine chord tolerance of exact, and exact on flat faces. Solids it
+    /// builds are cached for the next build, so measuring a shape a model
+    /// then uses costs nothing extra.
+    fn bounds(&mut self, spec: &ModelSpec) -> Result<Bounds, KernelError>;
 }
 
 /// What [`edge_selected`] needs to know about an edge.

@@ -8,6 +8,14 @@ pub type Rgb = [u8; 3];
 /// Color for geometry no `Color` node applies to.
 pub const DEFAULT_COLOR: Rgb = [150, 175, 210];
 
+/// An axis-aligned box around a shape, mm: what a script's `bounds()` query
+/// returns.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Bounds {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
 /// Kernel-agnostic model description produced by the TypeScript DSL.
 /// All lengths are millimeters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

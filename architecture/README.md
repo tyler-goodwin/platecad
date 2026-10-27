@@ -146,9 +146,11 @@ Scripts return a serde document rather than calling the kernel as they run.
   or FFI.
 - **History later.** A spec tree is already a parametric feature tree.
 
-The cost is that scripts can't query geometry (bounding boxes, areas, edge
-picks). That's why `Arrange` is a kernel node rather than DSL code. The way
-out is a hybrid: keep emitting specs, and add query ops later.
+The cost is that scripts can't see geometry while they build the tree. The
+way out is a hybrid: scripts still emit specs, and can ask the kernel about
+a subtree mid-eval (see "Geometry queries" under Script host). Only
+`bounds` exists so far. `Arrange` stays a kernel node: it predates queries,
+and keeping it in the kernel lets it reuse the cache.
 
 ## Kernel
 
@@ -174,10 +176,16 @@ exported object closed.
 **Solid cache.** The slow steps are booleans, fillets and chamfers. One
 `CellsBuilder` pass intersects every face of every operand, so its cost grows
 with face count. `OccKernel` therefore keeps the solids each of those nodes
-built, keyed by the subtree's debug text plus the color and part name it
-inherits. Hits come from three places:
+built, keyed by the subtree's debug text alone. Entries are stored
+unstyled (built with no inherited color or part name), and a hit fills in
+whatever the caller inherits for each body that didn't set its own. The
+innermost `Color`/`Part` always wins, so that matches building it styled.
+Hits come from four places:
 
-- Within a build: the same subtree twice.
+- Within a build: the same subtree twice, even under different colors or
+  part names.
+- From a script's `bounds` query: it measures the bare shape during the
+  eval, and the build hits it even after the model wraps it in `part`.
 - Across the two views: a print view that `arrange`s the assembled parts
   hits the solids the assembled build just made, since only the outer
   transform differs.
@@ -226,6 +234,20 @@ local use, but distributing the binary carries relinking obligations.
   on the isolate, which stops synchronous loops too, at the top level or in
   the export. The eval fails with `ScriptError::Timeout`; the next eval gets
   a fresh runtime as usual.
+- **Geometry queries.** The DSL's `bounds(shape)` returns `{ min, max,
+  size, center }` while the script runs, so models can fit parts to what
+  the kernel actually built. It calls `rustyscript.functions.plate_bounds`,
+  a Rust function the host registers on each runtime. That forwards to a
+  `GeometryQueries` trait object (`cad-script`); `platecad` implements it
+  with the pipeline's own kernel (`Kernel::bounds`), shared through an
+  `Arc<Mutex<..>>` because the eval and the build never overlap. The
+  kernel measures with the same tight bounds as `arrange`, and doesn't
+  call `end_build`, so the solids a query builds are cache hits in the
+  build right after. Kernel errors come back as script exceptions prefixed
+  `bounds:`. The watchdog is paused during a query, so a slow boolean
+  doesn't count toward the eval timeout. A host without queries still
+  registers the function, which throws "bounds needs a kernel", because
+  rustyscript's `functions` proxy returns a function for any name.
 - **Pipelines are DSL sugar.** `pipeline(shape, ...steps)` threads a shape
   through `(shape) => shape` functions, so `fillet(extrude(rect(...)))`
   reads top to bottom. `step.*` (`extrude`, `revolve`, `translate`,
@@ -516,8 +538,7 @@ launching the window:
 Planned next, roughly in order. Move items into the sections above as they
 land.
 
-1. **Geometry queries from scripts** (see the Modeling section of
-   improvements.md).
+Nothing scheduled right now; pick from improvements.md.
 
 Out of scope for now: picking and measurements, constraint sketching,
 per-face painting.

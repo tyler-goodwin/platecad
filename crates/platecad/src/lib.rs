@@ -6,12 +6,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cad_ir::{Bed, Diagnostic, MeshQuality, ModelSpec, ModelViews, TessellatedScene};
+use cad_ir::{Bed, Bounds, Diagnostic, MeshQuality, ModelSpec, ModelViews, TessellatedScene};
 use cad_kernel::Kernel;
 use cad_kernel_occ::OccKernel;
-use cad_script::{RustyScriptHost, ScriptHost};
+use cad_script::{GeometryQueries, RustyScriptHost, ScriptHost};
 use cad_view::{
     FileEntry, FolderListing, SceneUpdate, SceneViews, Settings, ViewMode, ViewerCommand, ViewerMessage,
 };
@@ -360,12 +361,32 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+type SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>;
+
+/// Answers a script's geometry queries with the pipeline's own kernel, so
+/// what a query builds is in the kernel's cache for the build after the eval.
+struct KernelQueries(SharedKernel);
+
+impl GeometryQueries for KernelQueries {
+    fn bounds(&mut self, spec: &ModelSpec) -> Result<Bounds, String> {
+        lock(&self.0).bounds(spec).map_err(|e| e.to_string())
+    }
+}
+
+/// The kernel, even if a panic poisoned its lock (a panicking build leaves
+/// at worst some stale cache entries).
+fn lock(kernel: &SharedKernel) -> std::sync::MutexGuard<'_, Box<dyn Kernel + Send>> {
+    kernel.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Script host + kernel: one TS file in, one `SceneUpdate` out. Also tracks
 /// which files the model depends on, for the watcher.
 pub struct Pipeline {
     root: PathBuf,
     script: RustyScriptHost,
-    kernel: Box<dyn Kernel + Send>,
+    /// Shared with the script host, which uses it for geometry queries
+    /// during an eval. The two never run at once.
+    kernel: SharedKernel,
     dependencies: BTreeSet<PathBuf>,
     /// Mesh quality of [`Pipeline::evaluate`]'s scenes.
     quality: MeshQuality,
@@ -377,11 +398,14 @@ pub struct Pipeline {
 impl Pipeline {
     /// A pipeline meshing at [`MeshQuality::Fine`].
     pub fn new(root: &Path) -> Result<Self, String> {
-        let script = RustyScriptHost::new(root).map_err(|e| e.to_string())?;
+        let kernel: SharedKernel = Arc::new(Mutex::new(Box::new(OccKernel::default())));
+        let script = RustyScriptHost::new(root)
+            .map_err(|e| e.to_string())?
+            .with_queries(Arc::new(Mutex::new(KernelQueries(kernel.clone()))));
         Ok(Self {
             root: normalize(&std::path::absolute(root).map_err(|e| e.to_string())?),
             script,
-            kernel: Box::new(OccKernel::default()),
+            kernel,
             dependencies: BTreeSet::new(),
             quality: MeshQuality::Fine,
             last_good: None,
@@ -430,13 +454,13 @@ impl Pipeline {
             None => views.print,
         };
         let quality = self.quality;
-        let assembled = match self.kernel.build_with(&views.assembled, quality) {
+        let assembled = match lock(&self.kernel).build_with(&views.assembled, quality) {
             Ok(scene) => scene,
             Err(e) => return SceneUpdate::error(format!("{name}: {e}")),
         };
         let print = match print_spec
             .as_ref()
-            .map(|spec| self.kernel.build_with(spec, quality))
+            .map(|spec| lock(&self.kernel).build_with(spec, quality))
             .transpose()
         {
             Ok(scene) => scene,
@@ -532,7 +556,7 @@ impl Pipeline {
             ViewMode::Assembled => last.assembled.clone(),
             ViewMode::Print => last.print.clone()?,
         };
-        Some(self.kernel.build_with(&spec, quality).map_err(|e| e.to_string()))
+        Some(lock(&self.kernel).build_with(&spec, quality).map_err(|e| e.to_string()))
     }
 }
 
@@ -1549,6 +1573,42 @@ export default () => fillet(cube(2), 5);
         assert!(update.views.is_none());
         let message = &update.diagnostics[0].message;
         assert!(message.starts_with("model.ts: ") && message.contains("too large"), "{message}");
+    }
+
+    #[test]
+    fn models_can_measure_shapes_with_the_kernel() {
+        // A lid sized and placed from a filleted body's measured bounds.
+        let project = Project::new(
+            "import { bounds, box, fillet, group, part, sphere, union } from \"../dsl/cad.ts\";
+const body = fillet(union(box({ width: 30, depth: 20, height: 12 }), sphere(4, { at: [15, 10, 12] })), 1, { edges: \"|Z\" });
+const b = bounds(body);
+const lid = box({ width: b.size[0], depth: b.size[1], height: 2, at: [b.min[0], b.min[1], b.max[2]] });
+export default () => group(part(\"body\", body), part(\"lid\", lid));
+",
+        );
+        let mut pipeline = Pipeline::new(project.root()).unwrap();
+        let update = pipeline.evaluate(&project.model());
+        assert!(update.diagnostics[0].ok, "{}", update.diagnostics[0].message);
+
+        let scene = update.views.unwrap().assembled;
+        let lid = scene.parts.iter().find(|p| p.name == "lid").unwrap();
+        let lid_z: Vec<f32> = scene.positions[lid.vertices.start as usize..lid.vertices.end as usize]
+            .iter()
+            .map(|p| p[2])
+            .collect();
+        // The sphere pokes 4 mm above the 12 mm box, so the lid sits at 16.
+        let (low, high) = lid_z.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &z| (lo.min(z), hi.max(z)));
+        assert!((low - 16.0).abs() < 0.01 && (high - 18.0).abs() < 0.01, "lid z {low}..{high}");
+
+        // Measuring needs a shape the kernel can build, and says why not.
+        let project = Project::new(
+            "import { bounds, cube, fillet } from \"../dsl/cad.ts\";
+export default () => { bounds(fillet(cube(2), 5)); return cube(2); };
+",
+        );
+        let update = Pipeline::new(project.root()).unwrap().evaluate(&project.model());
+        let message = &update.diagnostics[0].message;
+        assert!(message.contains("bounds:") && message.contains("too large"), "{message}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! It builds solids only. A bare 2D profile (e.g. `models/square.ts`) is
 //! shown as a plate `FLAT_THICKNESS` thick.
 
-use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
+use cad_ir::{Bounds, DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
 use cad_kernel::{
     EdgeShape, Kernel, KernelError, ROUND_END_SLACK, edge_selected, pack, validate_polygon, validate_primitive,
 };
@@ -58,6 +58,24 @@ impl Kernel for OccKernel {
         scene.plates = plates;
         Ok(scene)
     }
+
+    fn bounds(&mut self, spec: &ModelSpec) -> Result<Bounds, KernelError> {
+        // No `end_build`: queries run during a script's eval, and what they
+        // build should stay warm for the build that follows it.
+        let mut build = Build {
+            plates: Vec::new(),
+            cache: &mut self.cache,
+        };
+        let bodies = build_solids(spec, &Style::default(), &mut build)?;
+        let (min, max) = self
+            .cache
+            .bounds(SolidCache::any_key(spec), &bodies)?
+            .ok_or_else(|| invalid("bounds of a shape with no solids"))?;
+        Ok(Bounds {
+            min: min.to_array(),
+            max: max.to_array(),
+        })
+    }
 }
 
 /// How many builds an unused cache entry survives. A reload builds two views
@@ -65,7 +83,7 @@ impl Kernel for OccKernel {
 const CACHE_BUILDS: u64 = 4;
 
 /// Results of the slow operations (booleans, fillets, chamfers), keyed by
-/// the subtree and the style it inherits. They're reused within a build,
+/// the subtree alone and stored unstyled (see [`Style::under`]). They're reused within a build,
 /// e.g. a print view that repeats the assembled parts, and across builds,
 /// so a reload only redoes the parts whose specs changed. Solids don't
 /// depend on mesh quality, so a quality change reuses them too. The tight
@@ -90,7 +108,7 @@ impl SolidCache {
     /// can't be: an `arrange` inside records plates as it builds, which a
     /// cache hit would skip. (Matching the debug text is crude but errs
     /// safe: a part named "Arrange {" just goes uncached.)
-    fn key(spec: &ModelSpec, style: &Style) -> Option<String> {
+    fn key(spec: &ModelSpec) -> Option<String> {
         let slow = matches!(
             spec,
             ModelSpec::Union { .. }
@@ -99,12 +117,12 @@ impl SolidCache {
                 | ModelSpec::Fillet { .. }
                 | ModelSpec::Chamfer { .. }
         );
-        if slow { Self::any_key(spec, style) } else { None }
+        if slow { Self::any_key(spec) } else { None }
     }
 
     /// The key for any subtree, or `None` if it holds an `arrange` (see `key`).
-    fn any_key(spec: &ModelSpec, style: &Style) -> Option<String> {
-        let key = format!("{style:?} {spec:?}");
+    fn any_key(spec: &ModelSpec) -> Option<String> {
+        let key = format!("{spec:?}");
         (!key.contains("Arrange {")).then_some(key)
     }
 
@@ -150,18 +168,25 @@ struct Build<'a> {
     cache: &'a mut SolidCache,
 }
 
-/// Presentation inherited down the spec tree. The innermost `Color`/`Part` wins.
-#[derive(Debug, Clone, PartialEq)]
+/// Presentation inherited down the spec tree. The innermost `Color`/`Part`
+/// wins; `None` means nothing inside set it, so it's whatever the outside
+/// says (and finally the default color, unnamed).
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Style {
-    color: Rgb,
+    color: Option<Rgb>,
     part: Option<String>,
 }
 
-impl Default for Style {
-    fn default() -> Self {
-        Self {
-            color: DEFAULT_COLOR,
-            part: None,
+impl Style {
+    /// This style inside `outer`: fields set here win, the rest are `outer`'s.
+    /// Building a subtree with the default style and then putting each body
+    /// under the inherited one gives what building it inherited would, since
+    /// the innermost setting always wins. That's what lets the cache ignore
+    /// styles.
+    fn under(self, outer: &Style) -> Style {
+        Style {
+            color: self.color.or(outer.color),
+            part: self.part.or_else(|| outer.part.clone()),
         }
     }
 }
@@ -242,7 +267,13 @@ fn build_profile(spec: &ModelSpec, style: Style) -> Result<(Vec<Vec<Edge>>, Styl
             let (loops, style) = build_profile(shape, style)?;
             Ok((map_edges(loops, |e| e.rotate(origin, axis, angle)), style))
         }
-        ModelSpec::Color { rgb, shape } => build_profile(shape, Style { color: *rgb, ..style }),
+        ModelSpec::Color { rgb, shape } => build_profile(
+            shape,
+            Style {
+                color: Some(*rgb),
+                ..style
+            },
+        ),
         ModelSpec::Part { name, shape } => build_profile(
             shape,
             Style {
@@ -309,15 +340,20 @@ fn profile_points(loops: &[Vec<Edge>]) -> Vec<DVec3> {
 type Bodies = Vec<(Solid, Style)>;
 
 fn build_solids(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bodies, KernelError> {
-    let Some(key) = SolidCache::key(spec, style) else {
+    let Some(key) = SolidCache::key(spec) else {
         return build_uncached(spec, style, build);
     };
-    if let Some(bodies) = build.cache.get(&key) {
-        return Ok(bodies);
-    }
-    let bodies = build_uncached(spec, style, build)?;
-    build.cache.insert(key, bodies.clone());
-    Ok(bodies)
+    // Cached unstyled, so the same shape under another color or part name
+    // (or measured bare by a script's `bounds`) is still a hit.
+    let bodies = match build.cache.get(&key) {
+        Some(bodies) => bodies,
+        None => {
+            let bodies = build_uncached(spec, &Style::default(), build)?;
+            build.cache.insert(key, bodies.clone());
+            bodies
+        }
+    };
+    Ok(bodies.into_iter().map(|(s, st)| (s, st.under(style))).collect())
 }
 
 fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bodies, KernelError> {
@@ -421,7 +457,7 @@ fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<
         ModelSpec::Color { rgb, shape } => build_solids(
             shape,
             &Style {
-                color: *rgb,
+                color: Some(*rgb),
                 ..style.clone()
             },
             build,
@@ -526,7 +562,7 @@ fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<
                 let bodies = build_solids(child, style, build)?;
                 let (min, max) = build
                     .cache
-                    .bounds(SolidCache::any_key(child, style), &bodies)?
+                    .bounds(SolidCache::any_key(child), &bodies)?
                     .ok_or_else(|| invalid("arrange child has no geometry"))?;
                 footprints.push([max.x - min.x, max.y - min.y]);
                 built.push((bodies, min));
@@ -608,7 +644,8 @@ fn tessellate_into(
 
     scene.positions.extend(mesh.vertices.iter().map(|v| to_f32(*v)));
     scene.normals.extend(mesh.normals.iter().map(|n| to_f32(*n)));
-    scene.colors.extend(std::iter::repeat_n(style.color, mesh.vertices.len()));
+    let color = style.color.unwrap_or(DEFAULT_COLOR);
+    scene.colors.extend(std::iter::repeat_n(color, mesh.vertices.len()));
     scene.indices.extend(mesh.indices.iter().map(|i| vertex_start + *i as u32));
 
     // Edge polylines, NaN-separated, into segment pairs.
@@ -712,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn booleans_are_cached_across_builds_and_views_but_not_across_styles() {
+    fn booleans_are_cached_across_builds_views_and_styles() {
         let mut kernel = OccKernel::default();
         let first = kernel.build(&fused(0.0)).unwrap();
         assert_eq!(kernel.cache_hits(), 0);
@@ -727,14 +764,32 @@ mod tests {
         kernel.build_with(&fused(0.0), MeshQuality::Draft).unwrap();
         assert_eq!(kernel.cache_hits(), 2);
 
-        // A changed operand or a different color is a different solid.
+        // A changed operand is a different solid.
         kernel.build(&fused(1.0)).unwrap();
+        assert_eq!(kernel.cache_hits(), 2);
+
+        // A color or name around it isn't, and still applies to the hit.
         let red = ModelSpec::Color {
             rgb: [255, 0, 0],
             shape: Box::new(fused(0.0)),
         };
-        assert_eq!(kernel.build(&red).unwrap().colors[0], [255, 0, 0]);
-        assert_eq!(kernel.cache_hits(), 2);
+        assert!(kernel.build(&red).unwrap().colors.iter().all(|c| *c == [255, 0, 0]));
+        assert_eq!(kernel.cache_hits(), 3);
+        let named = ModelSpec::Part {
+            name: "fused".into(),
+            shape: Box::new(fused(0.0)),
+        };
+        let scene = kernel.build(&named).unwrap();
+        assert_eq!(kernel.cache_hits(), 4);
+        assert_eq!(scene.parts.len(), 1);
+        assert_eq!(scene.parts[0].name, "fused");
+        assert!(scene.colors.iter().all(|c| *c == DEFAULT_COLOR));
+
+        // So is measuring it, as a script's `bounds` does before the build.
+        let mut kernel = OccKernel::default();
+        kernel.bounds(&fused(0.0)).unwrap();
+        kernel.build(&named).unwrap();
+        assert_eq!(kernel.cache_hits(), 1);
     }
 
     #[test]

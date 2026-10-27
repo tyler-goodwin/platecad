@@ -136,6 +136,9 @@ export type ModelSpec =
   | PartSpec
   | ArrangeSpec;
 
+/** An axis-aligned box around a shape, mm. `size` is `max - min`. */
+export type Bounds = { min: Vec3; max: Vec3; size: Vec3; center: Vec3 };
+
 /** What a model file exports: how it looks put together, and optionally how it prints. */
 export type Model = {
   assembled: ModelSpec;
@@ -408,6 +411,24 @@ export function arrange(parts: ModelSpec[], opts: { gap?: number; bed?: Bed } = 
     spec.bed = { width, depth, height };
   }
   return spec;
+}
+
+/**
+ * Measures `shape`: the box its solids fill, as tight as `arrange` measures
+ * (exact on flat faces, within 0.01 mm on curved ones). The kernel builds the
+ * shape to find out, so this is how a model fits parts to each other, e.g.
+ * sitting a lid on whatever height a body came out. What it builds is cached,
+ * so measuring a shape you then use costs no second build. A bare 2D profile
+ * measures as its 0.01 mm display plate.
+ */
+export function bounds(shape: ModelSpec): Bounds {
+  const query = (globalThis as any).rustyscript?.functions?.plate_bounds;
+  if (typeof query !== "function") {
+    throw new Error("bounds needs a kernel to measure with, and this host has none");
+  }
+  const { min, max } = query(shape) as { min: Vec3; max: Vec3 };
+  const each = (f: (i: number) => number): Vec3 => [f(0), f(1), f(2)];
+  return { min, max, size: each((i) => max[i] - min[i]), center: each((i) => (min[i] + max[i]) / 2) };
 }
 
 /**

@@ -323,6 +323,22 @@ fn booleans_handle_lined_up_faces() {
 }
 
 #[test]
+fn bounds_match_the_built_shape() {
+    let mut kernel = OccKernel::default();
+    for (name, spec, _, min, max) in cases() {
+        let b = kernel.bounds(&spec).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for i in 0..3 {
+            assert!((b.min[i] - min[i]).abs() < 0.05, "{name}: min {:?} vs {min:?}", b.min);
+            assert!((b.max[i] - max[i]).abs() < 0.05, "{name}: max {:?} vs {max:?}", b.max);
+        }
+    }
+    // Flat faces are exact, not just within the mesh tolerance.
+    let b = kernel.bounds(&cuboid([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])).unwrap();
+    assert_eq!((b.min, b.max), ([1.0, 2.0, 3.0], [5.0, 7.0, 9.0]));
+    assert!(kernel.bounds(&extrude(rect(0.0, 1.0), 1.0)).is_err());
+}
+
+#[test]
 fn bad_specs_are_rejected() {
     let bad = [
         extrude(rect(0.0, 1.0), 1.0),

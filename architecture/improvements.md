@@ -10,9 +10,9 @@ the improvement.
   `Circle` and `Cutout` (holes) exist. Add polylines with arcs.
 - **Hide seam edges.** A cylinder shows the seam edge on its side face.
   Skip edges whose two faces meet smoothly (tangent normals).
-- **Geometry queries from scripts.** Scripts can't measure anything, which
-  is why `arrange` lives in the kernel. A hybrid query op such as
-  `bounds(shape)` would let layouts and fits be written in TS.
+- **More geometry queries.** `bounds(shape)` exists. Volume, area, center
+  of mass, and edge or face listings would follow the same path
+  (`GeometryQueries` plus a registered function).
 - **Cheaper bounds.** `arrange` meshes each child at Fine an extra time
   (on top of the tessellation for display; cached across reloads). Reuse
   the display mesh when it's Fine, or ask OCCT for an optimal bounding box

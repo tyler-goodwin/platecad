@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
-use cad_ir::ModelViews;
+use cad_ir::{Bounds, ModelSpec, ModelViews};
 use rustyscript::deno_core::error::ModuleLoaderError;
 use rustyscript::deno_core::{ModuleSpecifier, RequestedModuleType, ResolutionKind};
 use rustyscript::module_loader::ImportProvider;
@@ -50,6 +50,19 @@ pub trait ScriptHost {
     /// This is what hot reload should watch.
     fn last_dependencies(&self) -> &BTreeSet<PathBuf>;
 }
+
+/// Geometry a script can ask about while it runs (the DSL's `bounds()`),
+/// answered by the host's kernel.
+pub trait GeometryQueries: Send {
+    fn bounds(&mut self, spec: &ModelSpec) -> Result<Bounds, String>;
+}
+
+/// Shared so each eval's runtime can hold it (registered functions must be
+/// `'static`) while the host keeps it across evals.
+pub type SharedQueries = Arc<Mutex<dyn GeometryQueries>>;
+
+/// The name the DSL calls through `rustyscript.functions`.
+const BOUNDS_FUNCTION: &str = "plate_bounds";
 
 /// Host-side file reads for relative TS imports (`../dsl/cad.ts`), limited to
 /// files under `root`. The JS sandbox stays closed; only the Rust loader touches disk.
@@ -119,6 +132,7 @@ pub struct RustyScriptHost {
     import_root: PathBuf,
     dependencies: BTreeSet<PathBuf>,
     timeout: Duration,
+    queries: Option<SharedQueries>,
 }
 
 impl RustyScriptHost {
@@ -133,7 +147,15 @@ impl RustyScriptHost {
             import_root,
             dependencies: BTreeSet::new(),
             timeout: DEFAULT_TIMEOUT,
+            queries: None,
         })
+    }
+
+    /// Answers the DSL's geometry queries with `queries`. Without them,
+    /// `bounds()` fails with a message saying so.
+    pub fn with_queries(mut self, queries: SharedQueries) -> Self {
+        self.queries = Some(queries);
+        self
     }
 
     /// Stops evals that run longer than `timeout` (default [`DEFAULT_TIMEOUT`]).
@@ -155,6 +177,7 @@ impl RustyScriptHost {
                 ..Default::default()
             })?;
             let watchdog = Watchdog::start(&mut runtime, self.timeout);
+            register_queries(&mut runtime, self.queries.clone(), watchdog.pauser())?;
             let result = runtime
                 .load_module(module)
                 .map_err(ScriptError::from)
@@ -169,11 +192,43 @@ impl RustyScriptHost {
     }
 }
 
-/// Terminates the runtime's V8 isolate if it is still running after the
-/// timeout. rustyscript's own `timeout` only interrupts awaits, not a
-/// synchronous `while (true) {}`. Dropping the watchdog stops it.
+/// Exposes `queries` to the DSL as `rustyscript.functions.plate_bounds`,
+/// which fails with a clear message when there are none (rustyscript's
+/// `functions` proxy can't report a missing name). The watchdog is paused
+/// while a query runs: kernel time isn't script time.
+fn register_queries(runtime: &mut Runtime, queries: Option<SharedQueries>, pauser: Pauser) -> Result<(), ScriptError> {
+    runtime.register_function(BOUNDS_FUNCTION, move |args| {
+        let Some(queries) = &queries else {
+            return Err(RsError::Runtime("bounds needs a kernel to measure with, and this host has none".into()));
+        };
+        let [arg] = args else {
+            return Err(RsError::Runtime(format!("bounds takes one shape (got {} arguments)", args.len())));
+        };
+        let spec: ModelSpec = serde_json::from_value(arg.clone())
+            .map_err(|e| RsError::Runtime(format!("bounds needs a shape: {e}")))?;
+        let _paused = pauser.pause();
+        let bounds = queries
+            .lock()
+            .map_err(|_| RsError::Runtime("geometry queries are unavailable after an earlier panic".into()))?
+            .bounds(&spec)
+            .map_err(|e| RsError::Runtime(format!("bounds: {e}")))?;
+        serde_json::to_value(bounds).map_err(|e| RsError::Runtime(e.to_string()))
+    })?;
+    Ok(())
+}
+
+enum WatchdogMessage {
+    Pause,
+    Resume,
+    Done,
+}
+
+/// Terminates the runtime's V8 isolate if the script is still running after
+/// the timeout. rustyscript's own `timeout` only interrupts awaits, not a
+/// synchronous `while (true) {}`. Time spent paused (in geometry queries)
+/// doesn't count. Dropping the watchdog stops it.
 struct Watchdog {
-    done: Option<mpsc::Sender<()>>,
+    messages: mpsc::Sender<WatchdogMessage>,
     fired: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -181,22 +236,46 @@ struct Watchdog {
 impl Watchdog {
     fn start(runtime: &mut Runtime, timeout: Duration) -> Self {
         let isolate = runtime.deno_runtime().v8_isolate().thread_safe_handle();
-        let (done, wait) = mpsc::channel::<()>();
+        let (messages, inbox) = mpsc::channel();
         let fired = Arc::new(AtomicBool::new(false));
         let thread = std::thread::spawn({
             let fired = fired.clone();
             move || {
-                if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(timeout) {
-                    fired.store(true, Ordering::SeqCst);
-                    isolate.terminate_execution();
+                let mut remaining = timeout;
+                loop {
+                    let started = Instant::now();
+                    match inbox.recv_timeout(remaining) {
+                        Ok(WatchdogMessage::Pause) => {
+                            remaining = remaining.saturating_sub(started.elapsed());
+                            // Wait out the query, however long it takes.
+                            loop {
+                                match inbox.recv() {
+                                    Ok(WatchdogMessage::Resume) => break,
+                                    Ok(WatchdogMessage::Pause) => {}
+                                    Ok(WatchdogMessage::Done) | Err(_) => return,
+                                }
+                            }
+                        }
+                        Ok(WatchdogMessage::Resume) => remaining = remaining.saturating_sub(started.elapsed()),
+                        Ok(WatchdogMessage::Done) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            fired.store(true, Ordering::SeqCst);
+                            isolate.terminate_execution();
+                            return;
+                        }
+                    }
                 }
             }
         });
         Self {
-            done: Some(done),
+            messages,
             fired,
             thread: Some(thread),
         }
+    }
+
+    fn pauser(&self) -> Pauser {
+        Pauser(self.messages.clone())
     }
 
     fn fired(&self) -> bool {
@@ -206,11 +285,27 @@ impl Watchdog {
 
 impl Drop for Watchdog {
     fn drop(&mut self) {
-        // Dropping the sender wakes the thread with `Disconnected`.
-        self.done.take();
+        // An explicit message: the runtime may still hold a `Pauser`'s sender.
+        let _ = self.messages.send(WatchdogMessage::Done);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Stops a [`Watchdog`]'s clock until the returned guard drops.
+struct Pauser(mpsc::Sender<WatchdogMessage>);
+
+impl Pauser {
+    fn pause(&self) -> impl Drop + '_ {
+        struct Paused<'a>(&'a mpsc::Sender<WatchdogMessage>);
+        impl Drop for Paused<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.send(WatchdogMessage::Resume);
+            }
+        }
+        let _ = self.0.send(WatchdogMessage::Pause);
+        Paused(&self.0)
     }
 }
 
@@ -776,6 +871,116 @@ mod tests {
             let err = eval(&source(bad)).unwrap_err().to_string();
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    /// Answers `bounds` for boxes only (an `Extrude` of a `Rect`, maybe
+    /// translated), sleeping `delay` first to stand in for kernel work.
+    struct BoxBounds {
+        delay: Duration,
+        calls: usize,
+    }
+
+    impl GeometryQueries for BoxBounds {
+        fn bounds(&mut self, spec: &ModelSpec) -> Result<Bounds, String> {
+            self.calls += 1;
+            std::thread::sleep(self.delay);
+            let (offset, shape) = match spec {
+                ModelSpec::Translate { offset, shape } => (*offset, &**shape),
+                other => ([0.0; 3], other),
+            };
+            let ModelSpec::Extrude { profile, distance, .. } = shape else {
+                return Err(format!("not a box: {shape:?}"));
+            };
+            let ModelSpec::Rect { width, height } = **profile else {
+                return Err("not a box".into());
+            };
+            let size = [width, height, *distance];
+            Ok(Bounds {
+                min: offset,
+                max: std::array::from_fn(|i| offset[i] + size[i]),
+            })
+        }
+    }
+
+    fn query_host(delay: Duration) -> (RustyScriptHost, Arc<Mutex<BoxBounds>>) {
+        let queries = Arc::new(Mutex::new(BoxBounds { delay, calls: 0 }));
+        (host().with_queries(queries.clone()), queries)
+    }
+
+    #[test]
+    fn dsl_bounds_asks_the_host() {
+        let (mut host, queries) = query_host(Duration::ZERO);
+        // Stack a second box on top of the first, using its measured height.
+        let spec = host
+            .eval_source(
+                "stack.ts",
+                r#"import { bounds, box, group, translate } from "./dsl/cad.ts";
+                const base = box({ width: 4, depth: 2, height: 3, at: [1, 1, 1] });
+                const b = bounds(base);
+                export default () => group(base, box({ width: 1, depth: 1, height: 1, at: [b.center[0], b.center[1], b.max[2]] }), box({ width: b.size[0], depth: b.size[1], height: b.size[2] }));"#,
+            )
+            .unwrap()
+            .assembled;
+        let ModelSpec::Group { children } = spec else { panic!("{spec:?}") };
+        assert!(
+            matches!(children[1], ModelSpec::Translate { offset: [3.0, 2.0, 4.0], .. }),
+            "{:?}",
+            children[1]
+        );
+        assert_eq!(
+            children[2],
+            ModelSpec::Extrude {
+                profile: Box::new(ModelSpec::Rect { width: 4.0, height: 2.0 }),
+                distance: 3.0,
+                direction: None,
+            }
+        );
+        assert_eq!(queries.lock().unwrap().calls, 1);
+
+        // Kernel errors reach the script, which can catch them.
+        let err = host
+            .eval_source(
+                "sphere.ts",
+                r#"import { bounds, sphere } from "./dsl/cad.ts";
+                export default () => { bounds(sphere(1)); return sphere(1); };"#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bounds: not a box"), "{err}");
+    }
+
+    #[test]
+    fn dsl_bounds_without_a_kernel_says_so() {
+        let err = eval(
+            r#"import { bounds, cube } from "./dsl/cad.ts";
+            export default () => { bounds(cube(1)); return cube(1); };"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bounds needs a kernel"), "{err}");
+    }
+
+    #[test]
+    fn query_time_does_not_count_toward_the_timeout() {
+        // Three 200 ms queries against a 300 ms timeout.
+        let (host, _) = query_host(Duration::from_millis(200));
+        let mut host = host.with_timeout(Duration::from_millis(300));
+        let result = host.eval_source(
+            "slow.ts",
+            r#"import { bounds, cube } from "./dsl/cad.ts";
+            export default () => { for (let i = 0; i < 3; i++) bounds(cube(1)); return cube(1); };"#,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        // The script's own time still counts, around the queries too.
+        let err = host
+            .eval_source(
+                "slow_loop.ts",
+                r#"import { bounds, cube } from "./dsl/cad.ts";
+                export default () => { bounds(cube(1)); while (true) {} };"#,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ScriptError::Timeout(_)), "{err}");
     }
 
     #[test]
