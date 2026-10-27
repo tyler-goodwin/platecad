@@ -158,8 +158,12 @@ pub fn pack(footprints: &[[f64; 2]], gap: f64, bed: Option<&Bed>) -> Packing {
     }
 }
 
-/// Checks the sizes of a primitive solid (`Sphere`, `Cylinder`, `Cone`,
-/// `Torus`); other nodes pass.
+/// How far `2 * radius` may overshoot a rounded rect's shorter side and still
+/// count as fully round, so `radius: width / 2` survives float rounding.
+pub const ROUND_END_SLACK: f64 = 1e-9;
+
+/// Checks the sizes of a primitive (`Sphere`, `Cylinder`, `Cone`, `Torus`,
+/// `RoundedRect`); other nodes pass.
 pub fn validate_primitive(spec: &ModelSpec) -> Result<(), KernelError> {
     let invalid = |why: String| Err(KernelError::Invalid(why));
     let positive = |what: &str, v: f64| if v > 0.0 && v.is_finite() { Ok(()) } else { invalid(format!("{what} must be positive")) };
@@ -183,6 +187,17 @@ pub fn validate_primitive(spec: &ModelSpec) -> Result<(), KernelError> {
             positive("torus tube", tube)?;
             if !(radius > tube && radius.is_finite()) {
                 return invalid(format!("torus radius must be larger than its tube (got {radius} and {tube})"));
+            }
+            Ok(())
+        }
+        ModelSpec::RoundedRect { width, height, radius } => {
+            positive("rounded rect width", width)?;
+            positive("rounded rect height", height)?;
+            positive("rounded rect radius", radius)?;
+            if 2.0 * radius > width.min(height) + ROUND_END_SLACK {
+                return invalid(format!(
+                    "rounded rect radius must be at most half the shorter side (got {radius} for {width} x {height})"
+                ));
             }
             Ok(())
         }
@@ -447,6 +462,8 @@ mod tests {
             ModelSpec::Cone { radius: 1.0, top: 0.0, height: 2.0 },
             ModelSpec::Cone { radius: 0.0, top: 1.0, height: 2.0 },
             ModelSpec::Torus { radius: 3.0, tube: 1.0 },
+            ModelSpec::RoundedRect { width: 4.0, height: 2.0, radius: 1.0 },
+            ModelSpec::RoundedRect { width: 0.3, height: 0.3, radius: 0.15 },
         ];
         for spec in &ok {
             assert!(validate_primitive(spec).is_ok(), "{spec:?}");
@@ -458,6 +475,8 @@ mod tests {
             (ModelSpec::Cone { radius: 0.0, top: 0.0, height: 1.0 }, "cone needs a radius"),
             (ModelSpec::Torus { radius: 1.0, tube: 1.0 }, "torus radius must be larger than its tube"),
             (ModelSpec::Sphere { radius: f64::NAN }, "sphere radius must be positive"),
+            (ModelSpec::RoundedRect { width: 4.0, height: 2.0, radius: 0.0 }, "rounded rect radius must be positive"),
+            (ModelSpec::RoundedRect { width: 4.0, height: 2.0, radius: 1.1 }, "at most half the shorter side"),
         ];
         for (spec, why) in &bad {
             let err = validate_primitive(spec).unwrap_err().to_string();

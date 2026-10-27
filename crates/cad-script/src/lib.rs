@@ -748,6 +748,37 @@ mod tests {
     }
 
     #[test]
+    fn dsl_rounded_rect_and_slot() {
+        let source = |expr: &str| {
+            format!(
+                r#"import {{ roundedRect, slot }} from "./dsl/cad.ts";
+                export default () => {expr};"#
+            )
+        };
+        let rounded = |width, height, radius| ModelSpec::RoundedRect { width, height, radius };
+        assert_eq!(
+            eval(&source("roundedRect({ width: 10, height: 4, radius: 1 })")).unwrap(),
+            rounded(10.0, 4.0, 1.0)
+        );
+        // Centered on `at`, ends fully round.
+        assert_eq!(
+            eval(&source("slot({ length: 20, width: 6, at: [5, 5] })")).unwrap(),
+            ModelSpec::Translate {
+                offset: [-5.0, 2.0, 0.0],
+                shape: Box::new(rounded(20.0, 6.0, 3.0)),
+            }
+        );
+        for (bad, why) in [
+            ("roundedRect({ width: 10, height: 4, radius: 0 })", "roundedRect radius must be positive"),
+            ("roundedRect({ width: 10, height: 4, radius: 2.5 })", "at most half the shorter side"),
+            ("slot({ length: 4, width: 6 })", "slot length must be at least its width"),
+        ] {
+            let err = eval(&source(bad)).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn endless_loops_time_out() {
         let timeout = Duration::from_millis(300);
         for (what, source) in [

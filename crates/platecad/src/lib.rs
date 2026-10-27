@@ -64,6 +64,7 @@ pub fn with_default_bed(spec: ModelSpec, bed: Bed) -> ModelSpec {
     };
     match spec {
         ModelSpec::Rect { .. }
+        | ModelSpec::RoundedRect { .. }
         | ModelSpec::Polygon { .. }
         | ModelSpec::Circle { .. }
         | ModelSpec::Sphere { .. }

@@ -25,6 +25,7 @@ export type PolygonSpec = {
 };
 
 export type CircleSpec = { kind: "Circle"; radius: number };
+export type RoundedRectSpec = { kind: "RoundedRect"; width: number; height: number; radius: number };
 export type CutoutSpec = { kind: "Cutout"; outer: ProfileSpec; holes: ProfileSpec[] };
 
 export type ExtrudeSpec = {
@@ -102,6 +103,7 @@ export type ArrangeSpec = {
 /** 2D shapes that can be swept into solids. */
 export type ProfileSpec =
   | RectSpec
+  | RoundedRectSpec
   | PolygonSpec
   | CircleSpec
   | CutoutSpec
@@ -112,6 +114,7 @@ export type ProfileSpec =
 
 export type ModelSpec =
   | RectSpec
+  | RoundedRectSpec
   | PolygonSpec
   | CircleSpec
   | CutoutSpec
@@ -151,6 +154,38 @@ export function rect(opts: { width: number; height: number }): RectSpec {
   positive("rect width", opts.width);
   positive("rect height", opts.height);
   return { kind: "Rect", width: opts.width, height: opts.height };
+}
+
+/**
+ * Rectangle in the XY plane, corner at the origin, with its corners rounded
+ * by `radius` (true arcs, so it extrudes with smooth corners and needs no
+ * fillet). `radius` can be at most half the shorter side.
+ */
+export function roundedRect(opts: { width: number; height: number; radius: number }): RoundedRectSpec {
+  positive("roundedRect width", opts.width);
+  positive("roundedRect height", opts.height);
+  positive("roundedRect radius", opts.radius);
+  if (2 * opts.radius > Math.min(opts.width, opts.height) + 1e-9) {
+    throw new Error(
+      `roundedRect radius must be at most half the shorter side (got ${opts.radius} for ${opts.width} x ${opts.height})`,
+    );
+  }
+  return { kind: "RoundedRect", width: opts.width, height: opts.height, radius: opts.radius };
+}
+
+/**
+ * Slot in the XY plane: `length` end to end along X, `width` across, with
+ * fully round ends, centered on `at` (default the origin). Cut an extruded
+ * one out of a plate for a bolt that can slide. Rotate it to run along Y.
+ */
+export function slot(opts: { length: number; width: number; at?: [number, number] }): TranslateSpec {
+  positive("slot width", opts.width);
+  if (!(opts.length >= opts.width) || !Number.isFinite(opts.length)) {
+    throw new Error(`slot length must be at least its width (got ${opts.length} and ${opts.width})`);
+  }
+  const [x, y] = opts.at ?? [0, 0];
+  const profile = roundedRect({ width: opts.length, height: opts.width, radius: opts.width / 2 });
+  return translate(profile, [x - opts.length / 2, y - opts.width / 2, 0]);
 }
 
 /**

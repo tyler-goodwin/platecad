@@ -20,6 +20,10 @@ pub enum ModelSpec {
     Polygon { points: Vec<[f64; 2]> },
     /// Planar circle in the XY plane, centered on the origin.
     Circle { radius: f64 },
+    /// Planar rectangle in the XY plane with a corner at the origin and its
+    /// corners rounded by `radius` (true arcs). `radius` is at most half the
+    /// shorter side; at exactly half, the short sides are fully round (a slot).
+    RoundedRect { width: f64, height: f64, radius: f64 },
     /// A profile with holes: `outer` minus each of `holes`, all coplanar
     /// profiles. Holes should sit inside `outer` without touching each other.
     Cutout {
@@ -359,6 +363,20 @@ mod tests {
         assert_eq!(back["kind"], "Rect");
         assert_eq!(back["width"], 10.0);
         assert_eq!(back["height"], 10.0);
+    }
+
+    #[test]
+    fn rounded_rect_matches_ts_shape() {
+        let json = r#"{"kind":"RoundedRect","width":10,"height":4,"radius":2}"#;
+        let spec: ModelSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            spec,
+            ModelSpec::RoundedRect {
+                width: 10.0,
+                height: 4.0,
+                radius: 2.0
+            }
+        );
     }
 
     #[test]

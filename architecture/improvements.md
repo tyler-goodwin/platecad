@@ -6,8 +6,8 @@ the improvement.
 
 ## Modeling
 
-- **More profiles.** `Rect`, `Polygon`, `Circle` and `Cutout` (holes)
-  exist. Add polylines with arcs, rounded rectangles, and slots.
+- **More profiles.** `Rect`, `RoundedRect` (and `slot`), `Polygon`,
+  `Circle` and `Cutout` (holes) exist. Add polylines with arcs.
 - **Hide seam edges.** A cylinder shows the seam edge on its side face.
   Skip edges whose two faces meet smoothly (tangent normals).
 - **Geometry queries from scripts.** Scripts can't measure anything, which

@@ -4,7 +4,9 @@
 //! shown as a plate `FLAT_THICKNESS` thick.
 
 use cad_ir::{DEFAULT_COLOR, MeshQuality, ModelSpec, Plate, Rgb, ScenePart, TessellatedScene};
-use cad_kernel::{EdgeShape, Kernel, KernelError, edge_selected, pack, validate_polygon, validate_primitive};
+use cad_kernel::{
+    EdgeShape, Kernel, KernelError, ROUND_END_SLACK, edge_selected, pack, validate_polygon, validate_primitive,
+};
 use cadrum::{Boolean, DVec3, Edge, Solid, Tessellation};
 
 /// Edge sampling for selection and bounds, at the finest quality whatever
@@ -211,6 +213,10 @@ fn build_profile(spec: &ModelSpec, style: Style) -> Result<(Vec<Vec<Edge>>, Styl
             }
             Ok((vec![vec![Edge::circle(*radius, DVec3::Z).map_err(occ("circle"))?]], style))
         }
+        ModelSpec::RoundedRect { width, height, radius } => {
+            validate_primitive(spec)?;
+            Ok((vec![rounded_rect_loop(*width, *height, *radius)?], style))
+        }
         ModelSpec::Cutout { outer, holes } => {
             if holes.is_empty() {
                 return Err(invalid("cutout needs at least one hole"));
@@ -245,7 +251,7 @@ fn build_profile(spec: &ModelSpec, style: Style) -> Result<(Vec<Vec<Edge>>, Styl
             },
         ),
         _ => Err(invalid(
-            "extrude profile must be a single 2D shape (rect, polygon, circle or cutout, optionally moved, colored or named)",
+            "extrude profile must be a single 2D shape (rect, rounded rect, polygon, circle or cutout, optionally moved, colored or named)",
         )),
     }
 }
@@ -253,6 +259,31 @@ fn build_profile(spec: &ModelSpec, style: Style) -> Result<(Vec<Vec<Edge>>, Styl
 fn polygon_loop(points: &[[f64; 2]]) -> Result<Vec<Edge>, KernelError> {
     let points: Vec<DVec3> = points.iter().map(|[x, y]| DVec3::new(*x, *y, 0.0)).collect();
     Edge::polygon(&points).map_err(occ("polygon"))
+}
+
+/// Counter-clockwise from the bottom edge: a side, then the corner arc after
+/// it. Sides a fully round end has used up are left out.
+fn rounded_rect_loop(width: f64, height: f64, radius: f64) -> Result<Vec<Edge>, KernelError> {
+    let r = radius.min(width / 2.0).min(height / 2.0);
+    let p = |x: f64, y: f64| DVec3::new(x, y, 0.0);
+    // (side start, side end, corner center); each arc runs from its side's
+    // end to the next side's start.
+    let sides = [
+        (p(r, 0.0), p(width - r, 0.0), p(width - r, r)),
+        (p(width, r), p(width, height - r), p(width - r, height - r)),
+        (p(width - r, height), p(r, height), p(r, height - r)),
+        (p(0.0, height - r), p(0.0, r), p(r, r)),
+    ];
+    let mut edges = Vec::new();
+    for (i, &(start, end, center)) in sides.iter().enumerate() {
+        if start.distance(end) > ROUND_END_SLACK {
+            edges.push(Edge::line(start, end).map_err(occ("rounded rect"))?);
+        }
+        let next = sides[(i + 1) % 4].0;
+        let mid = center + ((end - center) + (next - center)).normalize() * r;
+        edges.push(Edge::arc_3pts(end, mid, next).map_err(occ("rounded rect"))?);
+    }
+    Ok(edges)
 }
 
 fn map_edges(loops: Vec<Vec<Edge>>, f: impl Fn(Edge) -> Edge) -> Vec<Vec<Edge>> {
@@ -291,7 +322,11 @@ fn build_solids(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bo
 
 fn build_uncached(spec: &ModelSpec, style: &Style, build: &mut Build) -> Result<Bodies, KernelError> {
     match spec {
-        ModelSpec::Rect { .. } | ModelSpec::Polygon { .. } | ModelSpec::Circle { .. } | ModelSpec::Cutout { .. } => {
+        ModelSpec::Rect { .. }
+        | ModelSpec::RoundedRect { .. }
+        | ModelSpec::Polygon { .. }
+        | ModelSpec::Circle { .. }
+        | ModelSpec::Cutout { .. } => {
             // OCC meshes solids, not lone faces, so a profile that isn't swept
             // shows (and exports) as a plate `FLAT_THICKNESS` thick.
             let (loops, style) = build_profile(spec, style.clone())?;

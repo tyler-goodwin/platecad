@@ -68,6 +68,7 @@ kernel and renderer can each be swapped without touching the others.
 |---|---|
 | `Rect { width, height }` | Planar rectangle in XY, corner at the origin. |
 | `Circle { radius }` | Planar circle in XY, centered on the origin. It extrudes into a cylinder with smooth side normals. |
+| `RoundedRect { width, height, radius }` | A `Rect` (corner at the origin) with its corners rounded by true arcs, so extruding it needs no `\|Z` fillet. `radius` is at most half the shorter side (`validate_primitive`); at exactly half, the sides it uses up are left out, so the ends are fully round. The DSL's `slot({ length, width, at })` is one of those, centered with a `Translate`. |
 | `Cutout { outer, holes }` | A profile with holes (coplanar profiles, holes inside the outline). Hole wires are oriented against the outline using a Newell normal. No boolean is involved, so lined-up faces never fail. |
 | `Polygon { points }` | Planar simple polygon in XY from its outline. Either winding is normalized to counter-clockwise, and the closing point is implied. Fewer than 3 points, repeated points, self-intersection and zero area are rejected. Non-convex shapes (L, U) tessellate and export correctly. |
 | `Extrude { profile, distance, direction? }` | Sweeps a 2D profile `distance` mm along `direction` (normalized, default +Z) into a solid. The face is flipped to point along the sweep (every profile is wound counter-clockwise about +Z), so solids are never inside-out. A direction lying in the profile's plane is an error. |

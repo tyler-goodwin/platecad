@@ -127,6 +127,27 @@ fn cases() -> Vec<(&'static str, ModelSpec, f64, [f64; 3], [f64; 3])> {
             [-4.0 * sin, 0.0, 0.0],
             [10.0 * cos, 10.0 * sin + 4.0 * cos, 2.0],
         ),
+        (
+            "rounded rect",
+            extrude(ModelSpec::RoundedRect { width: 20.0, height: 10.0, radius: 3.0 }, 2.0),
+            (200.0 - (4.0 - PI) * 9.0) * 2.0,
+            [0.0; 3],
+            [20.0, 10.0, 2.0],
+        ),
+        (
+            "slot",
+            extrude(ModelSpec::RoundedRect { width: 20.0, height: 6.0, radius: 3.0 }, 2.0),
+            (14.0 * 6.0 + PI * 9.0) * 2.0,
+            [0.0; 3],
+            [20.0, 6.0, 2.0],
+        ),
+        (
+            "fully round rect",
+            extrude(ModelSpec::RoundedRect { width: 6.0, height: 6.0, radius: 3.0 }, 2.0),
+            PI * 9.0 * 2.0,
+            [0.0; 3],
+            [6.0, 6.0, 2.0],
+        ),
         ("cylinder", extrude(circle(10.0), 5.0), PI * 100.0 * 5.0, [-10.0, -10.0, 0.0], [10.0, 10.0, 5.0]),
         (
             "washer",
@@ -306,6 +327,7 @@ fn bad_specs_are_rejected() {
     let bad = [
         extrude(rect(0.0, 1.0), 1.0),
         extrude(rect(1.0, 1.0), 0.0),
+        extrude(ModelSpec::RoundedRect { width: 4.0, height: 2.0, radius: 1.5 }, 1.0),
         extrude_along(rect(1.0, 1.0), 1.0, [1.0, 0.0, 0.0]),
         extrude(polygon(&[[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]]), 1.0),
         revolve(translate([-1.0, 0.0, 0.0], rect(2.0, 1.0)), 360.0),
