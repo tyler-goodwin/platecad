@@ -454,3 +454,56 @@ export function box(opts: {
 export function cube(size: number): ExtrudeSpec | TranslateSpec {
   return box({ width: size, depth: size, height: size });
 }
+
+/** One process step of a {@link pipeline}: takes the shape so far, returns the next. */
+export type Step = (shape: ModelSpec) => ModelSpec;
+
+/**
+ * Runs `shape` through `steps` in order, so a chain of operations reads top
+ * to bottom instead of inside out:
+ *
+ * ```ts
+ * pipeline(
+ *   rect({ width: 200, height: 100 }),
+ *   step.extrude({ distance: 3 }),
+ *   step.fillet(3, { edges: "|Z" }),
+ *   step.cut(...holes),
+ * )
+ * ```
+ *
+ * A step is any function from shape to shape: one from {@link step}, or your
+ * own, e.g. `(s) => mirrored(s)`.
+ */
+export function pipeline(shape: ModelSpec, ...steps: Step[]): ModelSpec {
+  let current = shape;
+  steps.forEach((s, i) => {
+    if (typeof s !== "function") {
+      throw new Error(`pipeline step ${i + 1} must be a function (got ${JSON.stringify(s)})`);
+    }
+    current = s(current);
+    if (typeof current !== "object" || current === null || typeof current.kind !== "string") {
+      throw new Error(`pipeline step ${i + 1} must return a shape (got ${JSON.stringify(current)})`);
+    }
+  });
+  return current;
+}
+
+/**
+ * The DSL's operations as {@link pipeline} steps: the same arguments, minus
+ * the shape they act on. Booleans take the other shapes: `cut` subtracts them
+ * from the shape so far, `add` fuses them on, and `intersect` keeps the
+ * common volume.
+ */
+export const step = {
+  extrude: (opts: { distance: number; direction?: Vec3 }): Step => (s) => extrude(s as ProfileSpec, opts),
+  revolve: (opts: { degrees?: number } = {}): Step => (s) => revolve(s as ProfileSpec, opts),
+  translate: (offset: Vec3): Step => (s) => translate(s, offset),
+  rotate: (opts: { axis: "x" | "y" | "z" | Vec3; degrees: number; origin?: Vec3 }): Step => (s) => rotate(s, opts),
+  fillet: (radius: number, opts: { edges?: EdgeSelector | EdgeSelector[] } = {}): Step => (s) => fillet(s, radius, opts),
+  chamfer: (distance: number, opts: { edges?: EdgeSelector | EdgeSelector[] } = {}): Step => (s) => chamfer(s, distance, opts),
+  cut: (...tools: ModelSpec[]): Step => (s) => difference(s, ...tools),
+  add: (...shapes: ModelSpec[]): Step => (s) => union(s, ...shapes),
+  intersect: (...shapes: ModelSpec[]): Step => (s) => intersect(s, ...shapes),
+  color: (value: ColorInput): Step => (s) => color(s, value),
+  part: (name: string): Step => (s) => part(name, s),
+};

@@ -219,6 +219,12 @@ local use, but distributing the binary carries relinking obligations.
 - The default export (or a `model` export) is read as JSON and parsed by
   shape: `{ kind }` means a bare spec, `{ assembled }` means views. That way
   errors name the bad field.
+- **Pipelines are DSL sugar.** `pipeline(shape, ...steps)` threads a shape
+  through `(shape) => shape` functions, so `fillet(extrude(rect(...)))`
+  reads top to bottom. `step.*` (`extrude`, `revolve`, `translate`,
+  `rotate`, `fillet`, `chamfer`, `cut`, `add`, `intersect`, `color`, `part`)
+  are the ops with the shape argument removed. They emit the same specs as
+  the nested calls, so the IR and kernel don't know pipelines exist.
 
 ## App, CLI and hot reload
 

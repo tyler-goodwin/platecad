@@ -679,6 +679,49 @@ mod tests {
     }
 
     #[test]
+    fn dsl_pipeline_matches_nested_calls() {
+        let source = |expr: &str| {
+            format!(
+                r##"import {{ color, cube, difference, extrude, fillet, part, pipeline, rect, step, translate, union }} from "./dsl/cad.ts";
+                export default () => {expr};"##
+            )
+        };
+        let piped = eval(&source(
+            r##"pipeline(
+                rect({ width: 2, height: 1 }),
+                step.extrude({ distance: 3 }),
+                step.fillet(0.2, { edges: "|Z" }),
+                step.cut(cube(0.5)),
+                step.add(cube(1)),
+                step.translate([1, 2, 3]),
+                (s) => part("plate", s),
+                step.color("#ff0000"),
+            )"##,
+        ))
+        .unwrap();
+        let nested = eval(&source(
+            r##"color(part("plate", translate(union(difference(
+                fillet(extrude(rect({ width: 2, height: 1 }), { distance: 3 }), 0.2, { edges: "|Z" }),
+                cube(0.5)), cube(1)), [1, 2, 3])), "#ff0000")"##,
+        ))
+        .unwrap();
+        assert_eq!(piped, nested);
+
+        // No steps returns the shape unchanged.
+        assert_eq!(eval(&source("pipeline(cube(1))")).unwrap(), unit_cube());
+
+        for (bad, why) in [
+            ("pipeline(cube(1), 3)", "pipeline step 1 must be a function"),
+            ("pipeline(cube(1), step.translate([1, 0, 0]), () => 1)", "pipeline step 2 must return a shape"),
+            ("pipeline(cube(1), step.fillet(0))", "fillet radius must be positive"),
+            ("pipeline(cube(1), step.cut())", "difference needs at least one tool"),
+        ] {
+            let err = eval(&source(bad)).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn dsl_box_at_wraps_in_translate() {
         let spec = eval(
             r#"
