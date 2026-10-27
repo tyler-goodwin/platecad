@@ -100,8 +100,13 @@ impl ImportProvider for HostFsImports {
         _referrer: &str,
         _kind: ResolutionKind,
     ) -> Option<Result<ModuleSpecifier, ModuleLoaderError>> {
-        self.allowed_path(specifier)
-            .map(|result| result.map(|_| specifier.clone()))
+        self.allowed_path(specifier).map(|result| {
+            let path = ts_module_path(&result?);
+            // Hand back the `.ts` URL, not just its source: the loader picks
+            // the transpiler by the URL's extension.
+            ModuleSpecifier::from_file_path(&path)
+                .map_err(|()| ModuleLoaderError::generic(format!("bad import path {}", path.display())))
+        })
     }
 
     fn import(
@@ -125,6 +130,28 @@ impl ImportProvider for HostFsImports {
 /// How long one eval may run before it's stopped. Models take milliseconds;
 /// this only catches endless loops.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The file an import of `path` means, TypeScript style: the file itself if
+/// it exists, else `path.ts` (`../dsl/cad`), the `.ts` behind a `.js` name
+/// (`./parts.js`, as NodeNext projects write it), or `path/index.ts`. A
+/// missing import resolves to its `.ts` name, so the error and the watched
+/// dependency name the file to create.
+fn ts_module_path(path: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    let ext = path.extension().and_then(|e| e.to_str());
+    if matches!(ext, Some("ts" | "mts")) {
+        return path.to_path_buf();
+    }
+    let mut appended = path.as_os_str().to_owned();
+    appended.push(".ts");
+    let appended = PathBuf::from(appended);
+    let renamed = matches!(ext, Some("js" | "mjs")).then(|| path.with_extension("ts"));
+    let candidates = renamed.iter().cloned().chain([appended.clone(), path.join("index.ts")]);
+    let found = candidates.into_iter().find(|c| c.is_file());
+    found.or(renamed).unwrap_or(appended)
+}
 
 /// Evaluates model scripts with rustyscript. Each eval gets a fresh `Runtime`
 /// so edited modules are never served from V8's module map (hot reload).
@@ -1266,6 +1293,61 @@ mod tests {
         assert!(err.to_string().contains("does_not_exist"), "{err}");
         let deps = relative_deps(&host);
         assert!(deps.contains(&"models/does_not_exist.ts".to_string()), "{deps:?}");
+    }
+
+    #[test]
+    fn imports_may_leave_off_the_ts_extension() {
+        let mut host = host();
+        for import in ["./dsl/cad", "./dsl/cad.js", "./dsl/cad.ts"] {
+            let spec = host
+                .eval_source(
+                    "test_model.ts",
+                    &format!(
+                        r#"import {{ cube }} from "{import}";
+                        export default () => cube(1);"#
+                    ),
+                )
+                .unwrap_or_else(|e| panic!("{import}: {e}"))
+                .assembled;
+            assert_eq!(spec, unit_cube(), "{import}");
+            assert_eq!(relative_deps(&host), ["dsl/cad.ts"], "{import}");
+        }
+
+        // A missing one names, and watches, the .ts file to create.
+        let err = host
+            .eval_source(
+                "test_model.ts",
+                r#"import { nope } from "./models/not_yet";
+                export default () => nope;"#,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not_yet.ts"), "{err}");
+        assert_eq!(relative_deps(&host), ["models/not_yet.ts"]);
+    }
+
+    #[test]
+    fn folder_imports_load_their_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("parts")).unwrap();
+        std::fs::write(dir.path().join("parts/index.ts"), "export const size: number = 3;
+").unwrap();
+        // A file of the same name wins over the folder, as in TypeScript.
+        std::fs::create_dir(dir.path().join("lid")).unwrap();
+        std::fs::write(dir.path().join("lid/index.ts"), "export const size: number = 1;
+").unwrap();
+        std::fs::write(dir.path().join("lid.ts"), "export const size: number = 2;
+").unwrap();
+        let mut host = RustyScriptHost::new(dir.path()).unwrap();
+        let spec = host
+            .eval_source(
+                "model.ts",
+                r#"import { size } from "./parts";
+                import { size as lid } from "./lid";
+                export default () => ({ kind: "Rect", width: size, height: lid });"#,
+            )
+            .unwrap()
+            .assembled;
+        assert_eq!(spec, ModelSpec::Rect { width: 3.0, height: 2.0 });
     }
 
     #[test]

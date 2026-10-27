@@ -225,6 +225,12 @@ local use, but distributing the binary carries relinking obligations.
 - Imports are resolved and read by a host-side `ImportProvider`. Only
   `file://` paths under the project root are allowed. `http:`, `npm:`,
   `node:` and bare specifiers are rejected.
+- Imports resolve TypeScript style, so `.ts` is optional. An existing file
+  always wins; otherwise `./parts` means `parts.ts` or `parts/index.ts`,
+  and `./parts.js` means `parts.ts` (as NodeNext projects write it).
+  `resolve` returns the rewritten `.ts` URL, since rustyscript picks the
+  transpiler by the URL's extension. A missing import resolves to its `.ts`
+  name, so the error and the watched dependency name the file to create.
 - The default export (or a `model` export) is read as JSON and parsed by
   shape: `{ kind }` means a bare spec, `{ assembled }` means views. That way
   errors name the bad field.
