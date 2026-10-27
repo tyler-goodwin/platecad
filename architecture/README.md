@@ -219,6 +219,12 @@ local use, but distributing the binary carries relinking obligations.
 - The default export (or a `model` export) is read as JSON and parsed by
   shape: `{ kind }` means a bare spec, `{ assembled }` means views. That way
   errors name the bad field.
+- **Evals time out** after 10 s (`DEFAULT_TIMEOUT`, or
+  `RustyScriptHost::with_timeout`). rustyscript's own `timeout` only
+  interrupts awaits, so a watchdog thread calls V8's `terminate_execution`
+  on the isolate, which stops synchronous loops too, at the top level or in
+  the export. The eval fails with `ScriptError::Timeout`; the next eval gets
+  a fresh runtime as usual.
 - **Pipelines are DSL sugar.** `pipeline(shape, ...steps)` threads a shape
   through `(shape) => shape` functions, so `fillet(extrude(rect(...)))`
   reads top to bottom. `step.*` (`extrude`, `revolve`, `translate`,

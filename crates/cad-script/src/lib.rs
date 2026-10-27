@@ -3,6 +3,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use cad_ir::ModelViews;
 use rustyscript::deno_core::error::ModuleLoaderError;
@@ -26,6 +29,8 @@ pub enum ScriptError {
     MissingExport,
     #[error("model export is not a shape or {{ assembled, print }}: {0}")]
     BadExport(String),
+    #[error("model script ran for more than {} s and was stopped (an endless loop?)", .0.as_secs_f64())]
+    Timeout(Duration),
 }
 
 impl From<RsError> for ScriptError {
@@ -104,11 +109,16 @@ impl ImportProvider for HostFsImports {
     }
 }
 
+/// How long one eval may run before it's stopped. Models take milliseconds;
+/// this only catches endless loops.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Evaluates model scripts with rustyscript. Each eval gets a fresh `Runtime`
 /// so edited modules are never served from V8's module map (hot reload).
 pub struct RustyScriptHost {
     import_root: PathBuf,
     dependencies: BTreeSet<PathBuf>,
+    timeout: Duration,
 }
 
 impl RustyScriptHost {
@@ -122,7 +132,14 @@ impl RustyScriptHost {
         Ok(Self {
             import_root,
             dependencies: BTreeSet::new(),
+            timeout: DEFAULT_TIMEOUT,
         })
+    }
+
+    /// Stops evals that run longer than `timeout` (default [`DEFAULT_TIMEOUT`]).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Runs `module`, recording `entry` (the module's own file, if any) and every
@@ -137,11 +154,63 @@ impl RustyScriptHost {
                 })),
                 ..Default::default()
             })?;
-            let handle = runtime.load_module(module)?;
-            call_model(&mut runtime, &handle)
+            let watchdog = Watchdog::start(&mut runtime, self.timeout);
+            let result = runtime
+                .load_module(module)
+                .map_err(ScriptError::from)
+                .and_then(|handle| call_model(&mut runtime, &handle));
+            if watchdog.fired() {
+                return Err(ScriptError::Timeout(self.timeout));
+            }
+            result
         })();
         self.dependencies = requested.take();
         result
+    }
+}
+
+/// Terminates the runtime's V8 isolate if it is still running after the
+/// timeout. rustyscript's own `timeout` only interrupts awaits, not a
+/// synchronous `while (true) {}`. Dropping the watchdog stops it.
+struct Watchdog {
+    done: Option<mpsc::Sender<()>>,
+    fired: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn start(runtime: &mut Runtime, timeout: Duration) -> Self {
+        let isolate = runtime.deno_runtime().v8_isolate().thread_safe_handle();
+        let (done, wait) = mpsc::channel::<()>();
+        let fired = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let fired = fired.clone();
+            move || {
+                if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(timeout) {
+                    fired.store(true, Ordering::SeqCst);
+                    isolate.terminate_execution();
+                }
+            }
+        });
+        Self {
+            done: Some(done),
+            fired,
+            thread: Some(thread),
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        // Dropping the sender wakes the thread with `Disconnected`.
+        self.done.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -675,6 +744,23 @@ mod tests {
                 export default () => {bad};"#
             );
             assert!(eval(&source).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn endless_loops_time_out() {
+        let timeout = Duration::from_millis(300);
+        for (what, source) in [
+            ("in the export", "export default () => { while (true) {} };"),
+            ("at the top level", "while (true) {}\nexport default () => ({ kind: \"Rect\", width: 1, height: 1 });"),
+        ] {
+            let mut host = host().with_timeout(timeout);
+            let started = std::time::Instant::now();
+            let err = host.eval_source("loop.ts", source).unwrap_err();
+            assert!(matches!(err, ScriptError::Timeout(t) if t == timeout), "{what}: {err}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{what}: took {:?}", started.elapsed());
+            // The host still works afterwards.
+            assert!(host.eval_source("ok.ts", "export default () => ({ kind: \"Rect\", width: 1, height: 1 });").is_ok());
         }
     }
 

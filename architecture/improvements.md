@@ -76,8 +76,6 @@ the improvement.
   Measure it before optimizing, and consider snapshotting the DSL module.
 - **Bare imports.** Support an import map for `import { box } from "cad"`
   instead of relative `../dsl/cad.ts`.
-- **Eval timeouts.** An infinite loop in a model hangs the reload thread.
-  Run evals with a timeout or a V8 terminate.
 
 ## Viewer
 
